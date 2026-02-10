@@ -31,10 +31,18 @@ Setting up TextCorrector takes less than 5 minutes.
 - **Download**: [Windows Installer](https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe).
 - **CRITICAL**: Ensure you check the box **"Add Python to PATH"** during installation.
 
-### 3. Load the AI Engine (Model)
-The application requires a GGUF model file to function.
-- **Pre-packaged Model**: The application includes `granite-4.0-h-350m-BF16.gguf` in the main folder.
-- **Custom Models**: You can also use other GGUF models (e.g., [Gemma 3 270M](https://huggingface.co/google/gemma-3-270m-it-GGUF)). Simply place any `.gguf` file inside the main folder.
+### 3. Load the AI Engine (Models)
+The application requires a GGUF model file to function. For the best balance of speed and quality, we recommend **Unsloth Dynamic (UD)** quants.
+
+#### Recommended Models
+| Model Name | Download Link (GGUF) | VRAM Usage | Best For |
+| :--- | :--- | :--- | :--- |
+| **Ministral 3 3B** | [Unsloth Ministral 3 3B](https://huggingface.co/unsloth/Ministral-3-3B-Instruct-2512-GGUF) | ~4-6 GB | Best quality for specialized correction. |
+| **Granite 4.0 1B** | [Unsloth Granite 4.0 1B](https://huggingface.co/unsloth/granite-4.0-h-1b-GGUF) | ~1.5-2 GB | Fast and reliable for most PCs. |
+| **Granite 4.0 350M** | [Unsloth Granite 4.0 350M](https://huggingface.co/unsloth/granite-4.0-h-350m-GGUF) | ~0.5-1 GB | Extremely light for older hardware. |
+
+> [!TIP]
+> **Quantization Advice**: When choosing a file, look for **`Q8_0`** or **`XL`** (Dynamic) quants for the best quality-to-size ratio. Avoid "Thinking" models (like DeepSeek R1) as they are incompatible with the interface.
 
 ---
 
