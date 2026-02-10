@@ -23,8 +23,9 @@ TextCorrector is a high-performance, **100% private**, local AI-powered writing 
 Setting up TextCorrector takes less than 5 minutes.
 
 ### 1. Download & Extract
-- Download the project as a [ZIP file](https://github.com/AmrZriek/TextCorrector/archive/refs/heads/main.zip) (or via the **Code** button).
-- Extract the contents to a folder on your computer (e.g., `Desktop\TextCorrector`).
+- **Source Code**: Click **Code** > **Download ZIP** (or clone this repo).
+- **Backend Engine**: Go to [Releases](https://github.com/AmrZriek/TextCorrector/releases/latest) and download `TextCorrector-Backend.zip`.
+- **Setup**: Extract the backend ZIP *inside* your main `TextCorrector` folder. You should see a `llama_cpp` folder appear.
 
 ### 2. Install Python
 - **Requirement**: Python 3.12 or higher.
