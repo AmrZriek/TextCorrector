@@ -297,7 +297,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config = config_manager
         self.setWindowTitle("Text Corrector Settings")
-        self.setFixedSize(650, 650)
+        self.setMinimumSize(650, 650)
+        self.resize(700, 750)
         self.setup_ui()
         self.load_settings()
 
@@ -1171,6 +1172,7 @@ class CorrectionWindow(QWidget):
         # Keep window on top but make it frameless and draggable
         # Removed Qt.Tool flag to fix mouse event handling for dragging
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, False)
 
         # Enable window dragging
