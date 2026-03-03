@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+.vscode/
+.ruff_cache/
+*.log
+*.gguf
+server_log.txt
+app_debug.log
+added.txt
+del.txt
+git_log.txt
+status.txt
+config.json
+llama_cpp/
