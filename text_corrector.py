@@ -197,6 +197,7 @@ DEFAULT_CONFIG = {
     "gpu_layers": 99,  # Full GPU offload (CUDA)
     "recent_models": [],
     "temperature": 0.0,  # 0.0 for deterministic outputs (prevents chatty responses)
+    "top_k": 40,
     "top_p": 0.95,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
@@ -307,41 +308,43 @@ class SettingsDialog(QDialog):
         self.setStyleSheet("""
             QDialog {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0c1220, stop:0.5 #151e2e, stop:1 #1a2332);
-                color: #d4dae3;
+                    stop:0 #0f172a, stop:0.5 #1e293b, stop:1 #0f172a);
+                color: #f8fafc;
             }
             QLabel {
-                color: #d4dae3;
+                color: #e2e8f0;
                 font-size: 13px;
                 background: transparent;
             }
             QLineEdit {
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.10);
+                background-color: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.15);
                 border-radius: 8px;
                 padding: 8px 12px;
-                color: #e2e8f0;
+                color: #f8fafc;
                 font-size: 13px;
             }
             QLineEdit:focus {
-                border: 1px solid rgba(100, 160, 220, 0.45);
+                border: 1px solid rgba(56, 189, 248, 0.6);
+                background-color: rgba(15, 23, 42, 0.8);
             }
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #3b82c4, stop:1 #5b9bd5);
-                border: none;
+                    stop:0 #0ea5e9, stop:1 #38bdf8);
+                border: 1px solid rgba(255, 255, 255, 0.1);
                 border-radius: 8px;
                 padding: 8px 18px;
-                color: white;
+                color: #ffffff;
                 font-weight: 600;
                 font-size: 13px;
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4a90d2, stop:1 #6ba8e0);
+                    stop:0 #0284c7, stop:1 #0ea5e9);
+                border: 1px solid rgba(255, 255, 255, 0.3);
             }
             QCheckBox {
-                color: #d4dae3;
+                color: #e2e8f0;
                 font-size: 13px;
                 spacing: 8px;
             }
@@ -350,32 +353,32 @@ class SettingsDialog(QDialog):
                 height: 18px;
                 border-radius: 4px;
                 border: 1px solid rgba(255, 255, 255, 0.15);
-                background: rgba(255, 255, 255, 0.05);
+                background: rgba(15, 23, 42, 0.6);
             }
             QCheckBox::indicator:checked {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #3b82c4, stop:1 #5b9bd5);
-                border: 1px solid rgba(100, 160, 220, 0.45);
+                    stop:0 #0ea5e9, stop:1 #38bdf8);
+                border: 1px solid rgba(56, 189, 248, 0.5);
             }
             QComboBox {
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.10);
+                background-color: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.15);
                 border-radius: 8px;
                 padding: 6px 12px;
-                color: #e2e8f0;
+                color: #f8fafc;
                 font-size: 13px;
             }
             QComboBox:hover {
-                border: 1px solid rgba(100, 160, 220, 0.35);
+                border: 1px solid rgba(56, 189, 248, 0.5);
             }
             QComboBox::drop-down {
                 border: none;
                 padding-right: 8px;
             }
             QComboBox QAbstractItemView {
-                background-color: #1a2332;
-                color: #d4dae3;
-                selection-background-color: #3b82c4;
+                background-color: #1e293b;
+                color: #f8fafc;
+                selection-background-color: #0ea5e9;
                 selection-color: white;
                 border: 1px solid rgba(255, 255, 255, 0.10);
             }
@@ -456,12 +459,17 @@ class SettingsDialog(QDialog):
         gen_layout = QHBoxLayout()
         gen_layout.addWidget(QLabel("Temperature:"))
         self.temp_edit = QLineEdit()
-        self.temp_edit.setFixedWidth(60)
+        self.temp_edit.setFixedWidth(50)
         gen_layout.addWidget(self.temp_edit)
+
+        gen_layout.addWidget(QLabel("Top K:"))
+        self.topk_edit = QLineEdit()
+        self.topk_edit.setFixedWidth(50)
+        gen_layout.addWidget(self.topk_edit)
 
         gen_layout.addWidget(QLabel("Top P:"))
         self.topp_edit = QLineEdit()
-        self.topp_edit.setFixedWidth(60)
+        self.topp_edit.setFixedWidth(50)
         gen_layout.addWidget(self.topp_edit)
 
         gen_layout.addWidget(QLabel("Freq Pen:"))
@@ -537,6 +545,7 @@ class SettingsDialog(QDialog):
         self.gpu_layers_edit.setText(str(self.config.get("gpu_layers", 99)))
         self.timeout_edit.setText(str(self.config.get("idle_timeout_seconds", 300)))
         self.temp_edit.setText(str(self.config.get("temperature", 0.0)))
+        self.topk_edit.setText(str(self.config.get("top_k", 40)))
         self.topp_edit.setText(str(self.config.get("top_p", 0.95)))
         self.freq_edit.setText(str(self.config.get("frequency_penalty", 0.0)))
         self.pres_edit.setText(str(self.config.get("presence_penalty", 0.0)))
@@ -587,6 +596,7 @@ class SettingsDialog(QDialog):
             self.config.set("gpu_layers", int(self.gpu_layers_edit.text()))
             self.config.set("idle_timeout_seconds", int(self.timeout_edit.text()))
             self.config.set("temperature", float(self.temp_edit.text()))
+            self.config.set("top_k", int(self.topk_edit.text()))
             self.config.set("top_p", float(self.topp_edit.text()))
             self.config.set("frequency_penalty", float(self.freq_edit.text()))
             self.config.set("presence_penalty", float(self.pres_edit.text()))
@@ -908,6 +918,7 @@ class ModelManager(QObject):
                     ]
 
             temperature = self.config.get("temperature", 0.1)
+            top_k = self.config.get("top_k", 40)
             top_p = self.config.get("top_p", 0.95)
             frequency_penalty = self.config.get("frequency_penalty", 0.0)
             presence_penalty = self.config.get("presence_penalty", 0.0)
@@ -918,6 +929,7 @@ class ModelManager(QObject):
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "top_k": top_k,
                 "top_p": top_p,
                 "frequency_penalty": frequency_penalty,
                 "presence_penalty": presence_penalty,
@@ -978,6 +990,7 @@ class ModelManager(QObject):
                     "messages": retry_messages,
                     "max_tokens": max_tokens,
                     "temperature": 0.0,  # Force deterministic
+                    "top_k": 1,
                     "top_p": 0.1,  # Very focused sampling
                     "frequency_penalty": 0.0,
                     "presence_penalty": 0.0,
@@ -1039,6 +1052,7 @@ class ModelManager(QObject):
             self.status_changed.emit("Thinking...")
 
             temperature = self.config.get("temperature", 0.1)
+            top_k = self.config.get("top_k", 40)
             top_p = self.config.get("top_p", 0.95)
             frequency_penalty = self.config.get("frequency_penalty", 0.0)
             presence_penalty = self.config.get("presence_penalty", 0.0)
@@ -1047,6 +1061,7 @@ class ModelManager(QObject):
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                "top_k": top_k,
                 "top_p": top_p,
                 "frequency_penalty": frequency_penalty,
                 "presence_penalty": presence_penalty,
@@ -1154,30 +1169,31 @@ class CorrectionWindow(QWidget):
         self.setStyleSheet("""
             QWidget#mainWidget {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0c1220, stop:0.5 #151e2e, stop:1 #1a2332);
+                    stop:0 #0f172a, stop:0.5 #1e293b, stop:1 #0f172a);
+                border: 1px solid rgba(255, 255, 255, 0.12);
                 border-radius: 16px;
             }
             QWidget {
-                color: #d4dae3;
+                color: #f8fafc;
                 font-family: 'Segoe UI', system-ui, sans-serif;
                 font-size: 14px;
             }
             QTextEdit {
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.10);
+                background-color: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.15);
                 border-radius: 10px;
                 padding: 12px;
-                color: #e2e8f0;
+                color: #f8fafc;
                 font-size: 14px;
-                selection-background-color: #4a8cc7;
+                selection-background-color: rgba(56, 189, 248, 0.4);
             }
             QTextEdit:focus {
-                border: 1px solid rgba(100, 160, 220, 0.45);
+                border: 1px solid rgba(56, 189, 248, 0.6);
             }
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #3b82c4, stop:1 #5b9bd5);
-                border: none;
+                    stop:0 #0ea5e9, stop:1 #38bdf8);
+                border: 1px solid rgba(255, 255, 255, 0.1);
                 border-radius: 8px;
                 padding: 10px 20px;
                 color: white;
@@ -1186,75 +1202,79 @@ class CorrectionWindow(QWidget):
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4a90d2, stop:1 #6ba8e0);
+                    stop:0 #0284c7, stop:1 #0ea5e9);
             }
             QPushButton:pressed {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2d6eaa, stop:1 #4a8cc7);
+                    stop:0 #0369a1, stop:1 #0284c7);
             }
             QPushButton:disabled {
-                background: rgba(255, 255, 255, 0.06);
+                background: rgba(255, 255, 255, 0.04);
                 color: rgba(255, 255, 255, 0.25);
             }
             QPushButton#secondaryBtn {
-                background: rgba(255, 255, 255, 0.07);
-                border: 1px solid rgba(255, 255, 255, 0.12);
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.15);
             }
             QPushButton#secondaryBtn:hover {
-                background: rgba(255, 255, 255, 0.12);
-                border: 1px solid rgba(255, 255, 255, 0.22);
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.3);
             }
             QPushButton#dangerBtn {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #b83a3a, stop:1 #d04848);
+                    stop:0 #ef4444, stop:1 #f87171);
             }
             QPushButton#dangerBtn:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #d04848, stop:1 #e05555);
+                    stop:0 #dc2626, stop:1 #ef4444);
             }
             QLabel {
-                color: #d4dae3;
+                color: #f8fafc;
                 font-size: 13px;
                 background: transparent;
             }
             QLabel#status {
-                color: rgba(255, 255, 255, 0.45);
+                color: #cbd5e1;
                 font-size: 12px;
-                font-weight: 500;
+                font-weight: 600;
+                padding: 4px 10px;
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.05);
             }
             QLabel#header {
                 font-size: 22px;
-                font-weight: 700;
-                color: #f1f5f9;
+                font-weight: 800;
+                color: #f8fafc;
                 letter-spacing: -0.5px;
             }
             QLabel#sectionLabel {
                 font-size: 11px;
-                font-weight: 700;
-                color: rgba(120, 170, 220, 0.85);
+                font-weight: 800;
+                color: #38bdf8;
                 text-transform: uppercase;
                 letter-spacing: 1.5px;
                 padding-bottom: 2px;
             }
             QLineEdit {
-                background-color: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.10);
+                background-color: rgba(15, 23, 42, 0.6);
+                border: 1px solid rgba(255, 255, 255, 0.15);
                 border-radius: 10px;
                 padding: 10px 14px;
-                color: #e2e8f0;
+                color: #f8fafc;
                 font-size: 14px;
-                selection-background-color: #4a8cc7;
+                selection-background-color: rgba(56, 189, 248, 0.4);
             }
             QLineEdit:focus {
-                border: 1px solid rgba(100, 160, 220, 0.45);
+                border: 1px solid rgba(56, 189, 248, 0.6);
             }
             QFrame#chatFrame {
-                background-color: rgba(0, 0, 0, 0.20);
-                border: 1px solid rgba(255, 255, 255, 0.06);
+                background-color: rgba(0, 0, 0, 0.30);
+                border: 1px solid rgba(255, 255, 255, 0.08);
                 border-radius: 12px;
             }
             QFrame#separator {
-                background-color: rgba(255, 255, 255, 0.07);
+                background-color: rgba(255, 255, 255, 0.1);
                 max-height: 1px;
             }
             QScrollBar:vertical {
@@ -1839,16 +1859,24 @@ class TextCorrectorApp(QApplication):
             no_model_action.setEnabled(False)
             return
 
+        model_group = QActionGroup(self.model_menu)
+        model_group.setExclusive(True)
+
         for model_path in models:
             name = friendly_model_name(model_path)
             action = self.model_menu.addAction(name)
             action.setCheckable(True)
+            model_group.addAction(action)
             # Case-insensitive comparison on Windows
-            is_checked = (
-                os.path.normpath(model_path).lower()
-                == os.path.normpath(current_model).lower()
-            )
-            action.setChecked(is_checked)
+            if current_model:
+                is_checked = (
+                    os.path.normpath(model_path).lower()
+                    == os.path.normpath(current_model).lower()
+                )
+                action.setChecked(is_checked)
+            else:
+                action.setChecked(False)
+                
             # Use default argument to capture model_path in lambda
             action.triggered.connect(
                 lambda checked, mp=model_path: self._switch_model(mp)
@@ -2124,11 +2152,14 @@ class TextCorrectorApp(QApplication):
     def update_status(self, status):
         """Update tray status"""
         self.status_action.setText(f"Status: {status}")
-        if "error" in status.lower():
-            self.tray_icon.setIcon(self._create_icon("#f44336"))
+        if "error" in status.lower() or "failed" in status.lower():
+            self.tray_icon.setIcon(self._create_icon("#ef4444"))
+            self.tray_icon.setToolTip(f"Text Corrector — {status}")
+        elif "loading" in status.lower() or "starting" in status.lower():
+            self.tray_icon.setIcon(self._create_icon("#f59e0b"))
             self.tray_icon.setToolTip(f"Text Corrector — {status}")
         elif "ready" in status.lower() or "loaded" in status.lower():
-            self.tray_icon.setIcon(self._create_icon("#4CAF50"))
+            self.tray_icon.setIcon(self._create_icon("#10b981"))
 
     def add_to_startup(self):
         """Add application to Windows startup"""
