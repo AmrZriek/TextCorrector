@@ -199,8 +199,10 @@ DEFAULT_CONFIG = {
     "temperature": 0.0,  # 0.0 for deterministic outputs (prevents chatty responses)
     "top_k": 40,
     "top_p": 0.95,
+    "min_p": 0.05,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
+    "repeat_penalty": 1.0,
 }
 
 
@@ -456,40 +458,54 @@ class SettingsDialog(QDialog):
         layout.addLayout(behavior_layout)
 
         # Generation Parameters
-        gen_layout = QHBoxLayout()
-        gen_layout.addWidget(QLabel("Temperature:"))
+        gen_layout1 = QHBoxLayout()
+        gen_layout1.addWidget(QLabel("Temperature:"))
         self.temp_edit = QLineEdit()
         self.temp_edit.setFixedWidth(50)
-        gen_layout.addWidget(self.temp_edit)
+        gen_layout1.addWidget(self.temp_edit)
 
-        gen_layout.addWidget(QLabel("Top K:"))
+        gen_layout1.addWidget(QLabel("Top K:"))
         self.topk_edit = QLineEdit()
         self.topk_edit.setFixedWidth(50)
-        gen_layout.addWidget(self.topk_edit)
+        gen_layout1.addWidget(self.topk_edit)
 
-        gen_layout.addWidget(QLabel("Top P:"))
+        gen_layout1.addWidget(QLabel("Top P:"))
         self.topp_edit = QLineEdit()
         self.topp_edit.setFixedWidth(50)
-        gen_layout.addWidget(self.topp_edit)
+        gen_layout1.addWidget(self.topp_edit)
 
-        gen_layout.addWidget(QLabel("Freq Pen:"))
+        gen_layout1.addWidget(QLabel("Min P:"))
+        self.minp_edit = QLineEdit()
+        self.minp_edit.setFixedWidth(50)
+        gen_layout1.addWidget(self.minp_edit)
+        gen_layout1.addStretch()
+        layout.addLayout(gen_layout1)
+
+        gen_layout2 = QHBoxLayout()
+        gen_layout2.addWidget(QLabel("Repetition:"))
+        self.repeat_edit = QLineEdit()
+        self.repeat_edit.setFixedWidth(50)
+        self.repeat_edit.setToolTip("Repetition Penalty (1.0 = standard, usually 1.1 - 1.2 to penalize)")
+        gen_layout2.addWidget(self.repeat_edit)
+
+        gen_layout2.addWidget(QLabel("Freq Pen:"))
         self.freq_edit = QLineEdit()
-        self.freq_edit.setFixedWidth(60)
+        self.freq_edit.setFixedWidth(50)
         self.freq_edit.setToolTip(
             "Frequency Penalty (0.0 - 2.0). Higher values reduce repetition."
         )
-        gen_layout.addWidget(self.freq_edit)
+        gen_layout2.addWidget(self.freq_edit)
 
-        gen_layout.addWidget(QLabel("Pres Pen:"))
+        gen_layout2.addWidget(QLabel("Pres Pen:"))
         self.pres_edit = QLineEdit()
-        self.pres_edit.setFixedWidth(60)
+        self.pres_edit.setFixedWidth(50)
         self.pres_edit.setToolTip(
             "Presence Penalty (0.0 - 2.0). Higher values encourage new topics."
         )
-        gen_layout.addWidget(self.pres_edit)
+        gen_layout2.addWidget(self.pres_edit)
 
-        gen_layout.addStretch()
-        layout.addLayout(gen_layout)
+        gen_layout2.addStretch()
+        layout.addLayout(gen_layout2)
 
         # Hotkey
         hotkey_layout = QHBoxLayout()
@@ -547,6 +563,8 @@ class SettingsDialog(QDialog):
         self.temp_edit.setText(str(self.config.get("temperature", 0.0)))
         self.topk_edit.setText(str(self.config.get("top_k", 40)))
         self.topp_edit.setText(str(self.config.get("top_p", 0.95)))
+        self.minp_edit.setText(str(self.config.get("min_p", 0.05)))
+        self.repeat_edit.setText(str(self.config.get("repeat_penalty", 1.0)))
         self.freq_edit.setText(str(self.config.get("frequency_penalty", 0.0)))
         self.pres_edit.setText(str(self.config.get("presence_penalty", 0.0)))
         self.hotkey_edit.setText(self.config.get("hotkey", "alt+shift+t"))
@@ -598,6 +616,8 @@ class SettingsDialog(QDialog):
             self.config.set("temperature", float(self.temp_edit.text()))
             self.config.set("top_k", int(self.topk_edit.text()))
             self.config.set("top_p", float(self.topp_edit.text()))
+            self.config.set("min_p", float(self.minp_edit.text()))
+            self.config.set("repeat_penalty", float(self.repeat_edit.text()))
             self.config.set("frequency_penalty", float(self.freq_edit.text()))
             self.config.set("presence_penalty", float(self.pres_edit.text()))
         except ValueError:
@@ -920,8 +940,10 @@ class ModelManager(QObject):
             temperature = self.config.get("temperature", 0.1)
             top_k = self.config.get("top_k", 40)
             top_p = self.config.get("top_p", 0.95)
+            min_p = self.config.get("min_p", 0.05)
             frequency_penalty = self.config.get("frequency_penalty", 0.0)
             presence_penalty = self.config.get("presence_penalty", 0.0)
+            repeat_penalty = self.config.get("repeat_penalty", 1.0)
             # Give enough room for thinking overhead + corrections
             max_tokens = min(len(text) * 3 + 500, 4096)
 
@@ -931,8 +953,10 @@ class ModelManager(QObject):
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
+                "min_p": min_p,
                 "frequency_penalty": frequency_penalty,
                 "presence_penalty": presence_penalty,
+                "repeat_penalty": repeat_penalty,
             }
 
             url = self._get_chat_url()
@@ -992,8 +1016,10 @@ class ModelManager(QObject):
                     "temperature": 0.0,  # Force deterministic
                     "top_k": 1,
                     "top_p": 0.1,  # Very focused sampling
+                    "min_p": 0.05,
                     "frequency_penalty": 0.0,
                     "presence_penalty": 0.0,
+                    "repeat_penalty": 1.0,
                 }
 
                 retry_response = requests.post(url, json=retry_payload, timeout=120)
@@ -1054,8 +1080,10 @@ class ModelManager(QObject):
             temperature = self.config.get("temperature", 0.1)
             top_k = self.config.get("top_k", 40)
             top_p = self.config.get("top_p", 0.95)
+            min_p = self.config.get("min_p", 0.05)
             frequency_penalty = self.config.get("frequency_penalty", 0.0)
             presence_penalty = self.config.get("presence_penalty", 0.0)
+            repeat_penalty = self.config.get("repeat_penalty", 1.0)
 
             payload = {
                 "messages": messages,
@@ -1063,8 +1091,10 @@ class ModelManager(QObject):
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
+                "min_p": min_p,
                 "frequency_penalty": frequency_penalty,
                 "presence_penalty": presence_penalty,
+                "repeat_penalty": repeat_penalty,
             }
 
             url = self._get_chat_url()
