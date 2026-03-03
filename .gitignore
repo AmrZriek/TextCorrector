@@ -12,3 +12,4 @@ git_log.txt
 status.txt
 config.json
 llama_cpp/
+CONTEXT.md
