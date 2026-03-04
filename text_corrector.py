@@ -38,7 +38,11 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
 from PyQt5.QtGui import QIcon, QPixmap, QCursor
 
 # Get script directory for portable paths
-SCRIPT_DIR = Path(__file__).parent.resolve()
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = Path(sys.executable).parent.resolve()
+else:
+    SCRIPT_DIR = Path(__file__).parent.resolve()
+
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 LLAMA_CPP_DIR = SCRIPT_DIR / "llama_cpp"
 LOG_FILE = SCRIPT_DIR / "server_log.txt"
@@ -53,6 +57,23 @@ def log_debug(msg):
             f.write(f"[{timestamp}] {msg}\n")
     except:
         pass
+
+
+def _has_nvidia_gpu() -> bool:
+    """Return True if an NVIDIA GPU with a working driver is detected."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            log_debug(f"GPU detected: {result.stdout.strip().splitlines()[0]}")
+            return True
+    except Exception:
+        pass
+    log_debug("No NVIDIA GPU detected — will use CPU mode (gpu_layers=0)")
+    return False
 
 
 # Default system prompt — used when user hasn't set a custom one
@@ -965,6 +986,12 @@ class ModelManager(QObject):
             context = self.config.get("context_size", 4096)
             gpu_layers = self.config.get("gpu_layers", 99)
 
+            # Auto-detect GPU: override to CPU mode if no NVIDIA driver found
+            if gpu_layers > 0 and not _has_nvidia_gpu():
+                log_debug("No NVIDIA GPU — falling back to CPU mode (gpu_layers=0)")
+                self.status_changed.emit("No GPU found — loading in CPU mode (may be slow)...")
+                gpu_layers = 0
+
             cmd = [
                 server_path,
                 "-m",
@@ -1041,10 +1068,25 @@ class ModelManager(QObject):
             return True
 
         except Exception as e:
-            log_debug(f"load_model failed: {e}")
+            err_str = str(e)
+            log_debug(f"load_model failed: {err_str}")
             self.loading = False
             self.unload_model()
-            self.status_changed.emit(f"Load error: {str(e)[:80]}")
+
+            # If a CUDA error caused the crash and we were using GPU, retry on CPU
+            _cuda_keywords = ("cuda", "cublas", "cudart", "ggml-cuda", "out of memory", "no gpu")
+            _was_gpu = self.config.get("gpu_layers", 99) > 0
+            if _was_gpu and any(kw in err_str.lower() for kw in _cuda_keywords):
+                log_debug("CUDA error detected — retrying in CPU mode (gpu_layers=0)")
+                self.status_changed.emit("GPU error — retrying in CPU mode...")
+                # Temporarily patch config for this attempt only
+                _orig_layers = self.config.get("gpu_layers", 99)
+                self.config.config["gpu_layers"] = 0
+                result = self.load_model()
+                self.config.config["gpu_layers"] = _orig_layers
+                return result
+
+            self.status_changed.emit(f"Load error: {err_str[:80]}")
             return False
 
     def unload_model(self):
