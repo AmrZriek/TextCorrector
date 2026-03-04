@@ -190,7 +190,7 @@ DEFAULT_CONFIG = {
     "model_path": "",
     "server_host": "127.0.0.1",
     "server_port": 8080,
-    "hotkey": "alt+shift+t",
+    "hotkey": "ctrl+shift+space",
     "keep_model_loaded": True,
     "idle_timeout_seconds": 300,
     "context_size": 4096,
@@ -288,14 +288,236 @@ class ConfigManager:
         self.save_config()
 
 
+# ---------------------------------------------------------------------------
+# Qt key constant → keyboard-lib name mapping
+# ---------------------------------------------------------------------------
+_QT_KEY_NAMES = {
+    Qt.Key_Space: "space",
+    Qt.Key_Return: "enter",
+    Qt.Key_Enter: "enter",
+    Qt.Key_Tab: "tab",
+    Qt.Key_Backspace: "backspace",
+    Qt.Key_Delete: "delete",
+    Qt.Key_Escape: "escape",
+    Qt.Key_Home: "home",
+    Qt.Key_End: "end",
+    Qt.Key_PageUp: "page up",
+    Qt.Key_PageDown: "page down",
+    Qt.Key_Left: "left",
+    Qt.Key_Right: "right",
+    Qt.Key_Up: "up",
+    Qt.Key_Down: "down",
+    Qt.Key_Insert: "insert",
+    Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4",
+    Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
+    Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
+    Qt.Key_Semicolon: ";",
+    Qt.Key_Equal: "=",
+    Qt.Key_Minus: "-",
+    Qt.Key_BracketLeft: "[",
+    Qt.Key_BracketRight: "]",
+    Qt.Key_Backslash: "\\\\",
+    Qt.Key_Apostrophe: "'",
+    Qt.Key_Comma: ",",
+    Qt.Key_Period: ".",
+    Qt.Key_Slash: "/",
+    Qt.Key_QuoteLeft: "`",
+}
+
+_MODIFIER_KEYS = {
+    Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt,
+    Qt.Key_Meta, Qt.Key_AltGr, Qt.Key_Super_L, Qt.Key_Super_R,
+}
+
+
+def _combo_to_display(combo: str) -> str:
+    """Convert 'ctrl+shift+space' → 'Ctrl + Shift + Space' for display."""
+    parts = combo.split("+")
+    return " + ".join(p.capitalize() for p in parts)
+
+
+class HotkeyEdit(QLineEdit):
+    """Windows-style hotkey recorder.
+
+    Click → enters recording mode (shows 'Press keys…', border pulses blue).
+    Hold modifiers + press a key → captures the combo and exits.
+    Escape → cancels and reverts to the previous shortcut.
+    Modifier-only combos (e.g. just Ctrl) are rejected with a hint.
+    Focus-out → auto-cancels recording.
+    """
+
+    shortcut_changed = pyqtSignal(str)  # emitted with keyboard-lib string
+
+    _IDLE_STYLE = (
+        "QLineEdit {"
+        "  background-color: rgba(15, 23, 42, 0.6);"
+        "  border: 1px solid rgba(255, 255, 255, 0.15);"
+        "  border-radius: 8px;"
+        "  padding: 8px 14px;"
+        "  color: #f8fafc;"
+        "  font-size: 13px;"
+        "}"
+        "QLineEdit:hover {"
+        "  border: 1px solid rgba(56, 189, 248, 0.45);"
+        "  cursor: pointer;"
+        "}"
+    )
+    _RECORDING_STYLE = (
+        "QLineEdit {"
+        "  background-color: rgba(14, 165, 233, 0.12);"
+        "  border: 2px solid rgba(56, 189, 248, 0.8);"
+        "  border-radius: 8px;"
+        "  padding: 8px 14px;"
+        "  color: #38bdf8;"
+        "  font-size: 13px;"
+        "}"
+    )
+
+    def __init__(self, parent=None, re_register_cb=None):
+        super().__init__(parent)
+        self._combo = ""          # keyboard-lib format, e.g. 'ctrl+shift+space'
+        self._recording = False
+        self._re_register_cb = re_register_cb  # called on cancel to restore hotkey
+        self.setReadOnly(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(self._IDLE_STYLE)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._update_display()
+
+    # ------------------------------------------------------------------
+    # Public API — mirrors QLineEdit so save/load code needs no changes
+    # ------------------------------------------------------------------
+    def text(self) -> str:
+        return self._combo
+
+    def setText(self, value: str):
+        self._combo = value.lower().strip()
+        self._recording = False
+        self.setStyleSheet(self._IDLE_STYLE)
+        self._update_display()
+
+    # ------------------------------------------------------------------
+    # Display helpers
+    # ------------------------------------------------------------------
+    def _update_display(self):
+        """Refresh the visible label from self._combo."""
+        if self._combo:
+            super().setText(_combo_to_display(self._combo))
+        else:
+            super().setText("Click to record shortcut")
+
+    def _set_display(self, label: str):
+        """Update only the visible text, leaving self._combo untouched."""
+        super().setText(label)
+
+    # ------------------------------------------------------------------
+    # Recording lifecycle
+    # ------------------------------------------------------------------
+    def _start_recording(self):
+        self._recording = True
+        self.setStyleSheet(self._RECORDING_STYLE)
+        self._set_display("Press keys…")
+        # Temporarily pause the global keyboard hook so it doesn't
+        # swallow modifier+key combos before Qt sees them.
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+
+    def _cancel_recording(self):
+        self._recording = False
+        self.setStyleSheet(self._IDLE_STYLE)
+        self._update_display()
+        # Re-register the hotkey that was unhooked when recording started
+        if self._re_register_cb:
+            try:
+                self._re_register_cb()
+            except Exception:
+                pass
+
+    def _finish_recording(self, combo: str):
+        self._recording = False
+        self._combo = combo
+        self.setStyleSheet(self._IDLE_STYLE)
+        self._update_display()
+        self.shortcut_changed.emit(combo)
+
+    # ------------------------------------------------------------------
+    # Mouse / focus events
+    # ------------------------------------------------------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._recording:
+            self._start_recording()
+            self.setFocus()
+        else:
+            super().mousePressEvent(event)
+
+    def focusOutEvent(self, event):
+        if self._recording:
+            self._cancel_recording()
+        super().focusOutEvent(event)
+
+    # ------------------------------------------------------------------
+    # Key capture
+    # ------------------------------------------------------------------
+    def keyPressEvent(self, event):
+        if not self._recording:
+            return  # read-only — ignore normal typing
+
+        key = event.key()
+        mods = event.modifiers()
+
+        # Escape → cancel
+        if key == Qt.Key_Escape:
+            self._cancel_recording()
+            return
+
+        # Ignore standalone modifier presses — wait for the trigger key
+        if key in _MODIFIER_KEYS:
+            return
+
+        # Build modifier prefix
+        parts = []
+        if mods & Qt.ControlModifier:
+            parts.append("ctrl")
+        if mods & Qt.ShiftModifier:
+            parts.append("shift")
+        if mods & Qt.AltModifier:
+            parts.append("alt")
+
+        # Require at least one modifier
+        if not parts:
+            self._set_display("Add Ctrl / Shift / Alt…")
+            return
+
+        # Resolve the trigger key name
+        if key in _QT_KEY_NAMES:
+            key_name = _QT_KEY_NAMES[key]
+        else:
+            key_text = event.text().lower()
+            key_name = key_text if key_text else None
+
+        if not key_name:
+            return  # unknown key — stay in recording mode
+
+        parts.append(key_name)
+        self._finish_recording("+".join(parts))
+
+    def keyReleaseEvent(self, event):
+        # Intentionally suppressed while recording
+        if not self._recording:
+            super().keyReleaseEvent(event)
+
+
 class SettingsDialog(QDialog):
     """Settings dialog for configuring the application"""
 
     settings_changed = pyqtSignal()
 
-    def __init__(self, config_manager, parent=None):
+    def __init__(self, config_manager, parent=None, re_register_cb=None):
         super().__init__(parent)
         self.config = config_manager
+        self._re_register_cb = re_register_cb
         self.setWindowTitle("Text Corrector Settings")
         self.setMinimumSize(650, 650)
         self.resize(700, 750)
@@ -508,11 +730,14 @@ class SettingsDialog(QDialog):
         gen_layout2.addStretch()
         layout.addLayout(gen_layout2)
 
-        # Hotkey
+        # Hotkey — Windows-style live recorder
         hotkey_layout = QHBoxLayout()
         hotkey_layout.addWidget(QLabel("Hotkey:"))
-        self.hotkey_edit = QLineEdit()
-        self.hotkey_edit.setPlaceholderText("e.g., alt+shift+t")
+        self.hotkey_edit = HotkeyEdit(re_register_cb=self._re_register_cb)
+        self.hotkey_edit.setToolTip(
+            "Click, then press your desired key combination (e.g. Ctrl+Shift+Space).\n"
+            "Escape cancels. A modifier key (Ctrl/Shift/Alt) is required."
+        )
         hotkey_layout.addWidget(self.hotkey_edit)
         layout.addLayout(hotkey_layout)
 
@@ -1734,11 +1959,16 @@ class CorrectionWindow(QWidget):
         if text:
             pyperclip.copy(text)
             self.correction_accepted.emit(text)
-            self.close()
+            self.hide() # hide instead of close to prevent closeEvent from restoring old clipboard too early
             # Simulate paste
             QTimer.singleShot(200, lambda: keyboard.send("ctrl+v"))
-            # Restore old clipboard after a delay (so paste works first)
-            QTimer.singleShot(500, self._restore_old_clipboard)
+            
+            # Restore old clipboard after a delay (so paste works first), then close
+            def finish_paste():
+                self._restore_old_clipboard()
+                self.close()
+                
+            QTimer.singleShot(500, finish_paste)
 
     def _restore_old_clipboard(self):
         """Restore the original clipboard content"""
@@ -1984,7 +2214,7 @@ class TextCorrectorApp(QApplication):
 
     def show_settings(self):
         """Show settings dialog"""
-        dialog = SettingsDialog(self.config)
+        dialog = SettingsDialog(self.config, re_register_cb=self.register_hotkey)
         dialog.settings_changed.connect(self.on_settings_changed)
         dialog.exec_()
 
