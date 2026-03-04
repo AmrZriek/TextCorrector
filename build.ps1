@@ -4,11 +4,15 @@ cd "c:\Users\Amrzr\Desktop\AI Software\Other\TextCorrector"
 # Fix potential ExecutionPolicy issue temporarily for this process
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
+# Ensure the app isn't currently running so we don't get 'Permission Denied' errors
+Stop-Process -Name TextCorrector -Force -ErrorAction SilentlyContinue
+Stop-Process -Name llama-server -Force -ErrorAction SilentlyContinue
+
 # Install pyinstaller directly using the venv pip
 & .\venv\Scripts\pip.exe install pyinstaller
 
 # Build the executable using PyInstaller in --onedir mode
-& .\venv\Scripts\pyinstaller.exe --noconfirm --windowed --name TextCorrector text_corrector.py
+& .\venv\Scripts\pyinstaller.exe --noconfirm --windowed --icon=logo.ico --name TextCorrector text_corrector.py
 
 # Create final distribution folder
 $DistDir = "TextCorrector_Release"
@@ -18,6 +22,10 @@ New-Item -ItemType Directory -Path $DistDir | Out-Null
 # Copy the built app from dist
 Write-Host "Copying built executables..."
 Copy-Item -Path "dist\TextCorrector\*" -Destination $DistDir -Recurse
+
+# Copy logos
+Write-Host "Copying logos..."
+Copy-Item -Path "logo.ico", "logo.png" -Destination $DistDir -ErrorAction SilentlyContinue
 
 # Copy llama_cpp (engine)
 Write-Host "Copying llama_cpp..."

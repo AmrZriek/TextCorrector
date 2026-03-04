@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
     QAction,
     QActionGroup,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings, QThread
 from PyQt5.QtGui import QIcon, QPixmap, QCursor
 
 # Get script directory for portable paths
@@ -642,15 +642,15 @@ class SettingsDialog(QDialog):
         layout.addLayout(server_layout)
 
         # Model Path
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("Model File:"))
+        model_h_layout = QHBoxLayout()
+        model_h_layout.addWidget(QLabel("Model File:"))
         self.model_path_edit = QLineEdit()
         self.model_path_edit.setReadOnly(True)
-        model_layout.addWidget(self.model_path_edit)
+        model_h_layout.addWidget(self.model_path_edit)
         browse_model_btn = QPushButton("Browse...")
         browse_model_btn.clicked.connect(self.browse_model)
-        model_layout.addWidget(browse_model_btn)
-        layout.addLayout(model_layout)
+        model_h_layout.addWidget(browse_model_btn)
+        layout.addLayout(model_h_layout)
 
         # Recent Models
         recent_layout = QHBoxLayout()
@@ -2185,32 +2185,6 @@ class TextCorrectorApp(QApplication):
             action.triggered.connect(
                 lambda checked, mp=model_path: self._switch_model(mp)
             )
-
-    def _switch_model(self, model_path):
-        """Switch to a different model"""
-        current = self.config.get("model_path", "")
-        # Case-insensitive comparison on Windows
-        if os.path.normpath(model_path).lower() == os.path.normpath(current).lower():
-            return
-
-        self.config.set("model_path", model_path)
-        self.config.add_recent_model(model_path)
-
-        # Unload current model and reload
-        self.model_manager.unload_model()
-
-        self.tray_icon.showMessage(
-            "Text Corrector",
-            f"Switching to:\n{friendly_model_name(model_path)}",
-            QSystemTrayIcon.Information,
-            3000,
-        )
-
-        # Rebuild menu to update checkmarks
-        self._rebuild_model_menu()
-
-        # Load new model
-        QTimer.singleShot(500, self._load_model_threaded)
 
     def _create_icon(self, color):
         """Create an icon combining the logo and status color"""
