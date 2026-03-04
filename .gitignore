@@ -13,3 +13,9 @@ status.txt
 config.json
 llama_cpp/
 CONTEXT.md
+
+# Build and Release folders
+build/
+dist/
+TextCorrector_Release/
+*.spec
