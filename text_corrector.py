@@ -2171,16 +2171,34 @@ class TextCorrectorApp(QApplication):
         QTimer.singleShot(500, self._load_model_threaded)
 
     def _create_icon(self, color):
-        """Create a colored circle icon"""
+        """Create an icon combining the logo and status color"""
+        from PyQt5.QtGui import QPainter, QBrush, QColor, QPixmap, QIcon, QPen
+
         pixmap = QPixmap(32, 32)
         pixmap.fill(Qt.transparent)
-        from PyQt5.QtGui import QPainter, QBrush, QColor
 
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(QColor(color)))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(4, 4, 24, 24)
+
+        logo_path = str(SCRIPT_DIR / "logo.png")
+        import os
+        if os.path.exists(logo_path):
+            logo = QPixmap(logo_path)
+            logo = logo.scaled(32, 32, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap(0, 0, logo)
+
+            # Draw status dot
+            painter.setBrush(QBrush(QColor(color)))
+            pen = QPen(QColor("#000000"))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.drawEllipse(18, 18, 12, 12)
+        else:
+            # Fallback to plain circle
+            painter.setBrush(QBrush(QColor(color)))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(4, 4, 24, 24)
+
         painter.end()
         return QIcon(pixmap)
 
