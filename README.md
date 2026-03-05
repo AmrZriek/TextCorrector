@@ -4,74 +4,78 @@
 [![Python: 3.12](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)]()
 
-TextCorrector is a high-performance, **100% private**, local AI-powered writing assistant for Windows. Refine your grammar, spelling, and tone instantly without ever sending your data to the cloud.
+## What is this?
+
+TextCorrector sits quietly in your system tray and lets you fix grammar and spelling in **any application** instantly — email, Word, browsers, chat apps. Everything is processed 100% locally; your text never leaves your computer.
 
 ---
 
-## ✨ Features
+## How to Run
 
-- 🔒 **Total Privacy**: All processing happens locally on your machine.
-- ⚡ **Instant Correction**: Use the global `Alt + Shift + T` hotkey from any Windows application.
-- 🧠 **Smart Refinement**: Leverages quantized GGUF models via `llama.cpp` for state-of-the-art results.
-- 🎨 **Tone Control**: Easily adjust instructions to make your text more professional, casual, or creative.
-- ⚙️ **Resource Efficient**: Configurable auto-unload settings to free up GPU memory when idle.
+1. **Double-click `TextCorrector.exe`**
+2. A UAC (User Account Control) prompt may appear — click **Yes** *(required for the global hotkey to work in all apps)*
+3. A small icon will appear in your **system tray** (bottom-right, near the clock)
 
----
-
-## 🚀 Quick Start Guide
-
-Setting up TextCorrector takes less than 5 minutes.
-
-### 1. Download & Extract
-- **Source Code**: Click **Code** > **Download ZIP** (or clone this repo).
-- **Backend Engine**: Go to [Releases](https://github.com/AmrZriek/TextCorrector/releases/latest) and download `TextCorrector-Backend.zip`.
-- **Setup**: Extract the backend ZIP *inside* your main `TextCorrector` folder. You should see a `llama_cpp` folder appear.
-
-### 2. Install Python
-- **Requirement**: Python 3.12 or higher.
-- **Download**: [Windows Installer](https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe).
-- **CRITICAL**: Ensure you check the box **"Add Python to PATH"** during installation.
-
-### 3. Load the AI Engine (Models)
-The application requires a GGUF model file to function. For the best balance of speed and quality, we recommend **Unsloth Dynamic (UD)** quants.
-
-#### Recommended Models
-| Model Name | Download Link (GGUF) | VRAM Usage | Best For |
-| :--- | :--- | :--- | :--- |
-| **Ministral 3 3B** | [Unsloth Ministral 3 3B](https://huggingface.co/unsloth/Ministral-3-3B-Instruct-2512-GGUF) | ~4-6 GB | Best quality for specialized correction. |
-| **Granite 4.0 1B** | [Unsloth Granite 4.0 1B](https://huggingface.co/unsloth/granite-4.0-h-1b-GGUF) | ~1.5-2 GB | Fast and reliable for most PCs. |
-| **Granite 4.0 350M** | [Unsloth Granite 4.0 350M](https://huggingface.co/unsloth/granite-4.0-h-350m-GGUF) | ~0.5-1 GB | Extremely light for older hardware. |
-
-> [!TIP]
-> **Quantization Advice**: When choosing a file, look for **`Q8_0`** or **`XL`** (Dynamic) quants for the best quality-to-size ratio. Avoid "Thinking" models (like DeepSeek R1) as they are incompatible with the interface.
+That's it. The AI model loads automatically in the background.
 
 ---
 
-## 🛠️ Operating Instructions
+## How to Use
 
-1.  **Launch**: Double-click **`run.bat`**. 
-    > *Note: If Windows SmartScreen appears, click "More info" > "Run anyway".*
-2.  **Initialize**: Right-click the application icon in your **System Tray** and select your loaded model.
-3.  **Correct**: Highlight any text in your document/browser and press **`Alt + Shift + T`**.
-4.  **Confirm**: Review the correction and click **Accept & Paste** to replace the original text.
-
----
-
-## 📊 Technical Specifications
-
-| Requirement | Recommended | Minimum |
-| :--- | :--- | :--- |
-| **OS** | Windows 10/11 | Windows 10 |
-| **Python** | 3.12+ | 3.12 |
-| **Storage** | 1GB+ (incl. models) | 500MB+ |
-| **Graphics** | NVIDIA GPU (CUDA 12.4) | Integrated / CPU |
+1. **Select** any text in any application
+2. Press **Ctrl + Shift + Space**
+3. A window appears showing the corrected text with changes highlighted in green
+4. Press **Enter** (or click **Accept & Paste**) to replace your original text
 
 ---
 
-## ⚖️ License & Privacy
+## First-Time Startup
 
-### Privacy Commitment
-Your text data is processed exclusively on your local hardware. No logs or snippets are transmitted to external servers, and no internet connection is required after the initial setup.
+The AI model loads into memory the first time you use it. This takes **10–60 seconds** depending on your hardware. After that, corrections are near-instant.
+
+---
+
+## Included AI Model
+
+This release uses **[Qwen 3.5 2B (Q4_K_XL)](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF?show_file_info=Qwen3.5-2B-UD-Q4_K_XL.gguf)** — a compact, fast, and high-quality model specifically suited for text correction tasks.
+
+---
+
+## System Requirements
+
+| | Minimum | Recommended |
+|---|---|---|
+| **OS** | Windows 10 | Windows 11 |
+| **RAM** | 8 GB | 16 GB |
+| **GPU** | None (CPU mode) | NVIDIA with 4 GB+ VRAM |
+
+> **No NVIDIA GPU?** The app still works — it automatically runs in CPU mode. Corrections will take 15–60 seconds instead of 1–3 seconds.
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| Icon doesn't appear in tray | Wait up to 60 seconds on first launch |
+| Hotkey doesn't work in some apps | Right-click tray icon → the app must be running as Admin |
+| App crashes immediately | Install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and retry |
+| Text not being replaced | Make sure text is **selected** before pressing the hotkey |
+| Slow corrections | Expected on CPU-only machines; an NVIDIA GPU speeds this up significantly |
+
+---
+
+## Settings
+
+Right-click the tray icon → **Settings** to change:
+- Hotkey combination
+- GPU layers (set to 0 to force CPU mode, 99 for full GPU)
+- Model file (drop any `.gguf` file into this folder and it appears in the menu)
+- System prompt (advanced: customize correction style)
+
+---
+
+*All processing is 100% local. No internet connection required after setup.*
 
 ### Legal
 This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details. Unauthorized commercial resale of this software is strictly prohibited.
