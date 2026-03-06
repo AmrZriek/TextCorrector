@@ -11,6 +11,11 @@ import requests
 from datetime import datetime
 from pathlib import Path
 
+# Enforce Qt scaling environment variables BEFORE importing PyQt
+os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+
 import keyboard
 import pyperclip
 from PyQt5.QtWidgets import (
@@ -33,8 +38,9 @@ from PyQt5.QtWidgets import (
     QFrame,
     QAction,
     QActionGroup,
+    QSizeGrip,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings, QThread
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings, QThread, QPoint
 from PyQt5.QtGui import QIcon, QPixmap, QCursor
 
 # Get script directory for portable paths
@@ -539,22 +545,57 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config = config_manager
         self._re_register_cb = re_register_cb
+        
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.dragging = False
+        self.drag_position = None
+        
         self.setWindowTitle("Text Corrector Settings")
-        self.setMinimumSize(650, 650)
-        self.resize(700, 750)
+        
+        # Lower minimum size to allow shrinking on smaller scaled displays
+        self.setMinimumSize(450, 450)
+        
+        # Dynamically size to prevent being massive on smaller screens
+        cursor_pos = QCursor.pos()
+        screen = QApplication.screenAt(cursor_pos)
+        if not screen:
+            screen = QApplication.primaryScreen()
+        screen_rect = screen.geometry()
+
+        base_width = 700
+        base_height = 750
+        max_width = int(screen_rect.width() * 0.8)
+        max_height = int(screen_rect.height() * 0.85)
+        
+        window_width = min(base_width, max_width)
+        window_height = min(base_height, max_height)
+        
+        self.resize(window_width, window_height)
+        
         self.setup_ui()
         self.load_settings()
 
     def setup_ui(self):
-        layout = QVBoxLayout()
+        # We need an outer layout and a styled main widget to handle translucent corners
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        
+        main_widget = QWidget()
+        main_widget.setObjectName("settingsMainWidget")
+        outer_layout.addWidget(main_widget)
+        
+        layout = QVBoxLayout(main_widget)
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
 
         # Style - matching premium dark slate-blue theme
         self.setStyleSheet("""
-            QDialog {
+            QWidget#settingsMainWidget {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                     stop:0 #0f172a, stop:0.5 #1e293b, stop:1 #0f172a);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 16px;
                 color: #f8fafc;
             }
             QLabel {
@@ -629,6 +670,35 @@ class SettingsDialog(QDialog):
                 border: 1px solid rgba(255, 255, 255, 0.10);
             }
         """)
+
+        # Custom Title Bar
+        title_bar = QHBoxLayout()
+        title_label = QLabel("Text Corrector Settings")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #f8fafc;")
+        
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(30, 30)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                color: #94a3b8;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background: #ef4444;
+                color: white;
+                border-radius: 6px;
+            }
+        """)
+        close_btn.clicked.connect(self.reject)
+        
+        title_bar.addWidget(title_label)
+        title_bar.addStretch()
+        title_bar.addWidget(close_btn)
+        layout.addLayout(title_bar)
 
         # Llama Server Path
         server_layout = QHBoxLayout()
@@ -831,6 +901,25 @@ class SettingsDialog(QDialog):
         if text and text != "-- Select recent model --":
             self.model_path_edit.setText(text)
 
+    def mousePressEvent(self, event):
+        """Start window dragging — only when clicking on empty chrome"""
+        if event.button() == Qt.LeftButton:
+            child = self.childAt(event.pos())
+            if child is None or isinstance(child, QLabel):
+                self.dragging = True
+                self.drag_position = event.globalPos() - self.pos()
+                event.accept()
+            else:
+                super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Handle window dragging"""
+        if self.dragging and event.buttons() == Qt.LeftButton:
+            self.move(event.globalPos() - self.drag_position)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
     def browse_server(self):
         """Browse for llama-server.exe"""
         path, _ = QFileDialog.getOpenFileName(
@@ -881,6 +970,40 @@ class SettingsDialog(QDialog):
 
         self.settings_changed.emit()
         self.accept()
+
+    def nativeEvent(self, eventType, message):
+        """Handle native Windows events for true frameless window resizing"""
+        if eventType == b'windows_generic_MSG' or eventType == b'windows_dispatcher_MSG':
+            import ctypes
+            import ctypes.wintypes
+            try:
+                msg = ctypes.wintypes.MSG.from_address(message.__int__())
+                if msg.message == 0x0084: # WM_NCHITTEST
+                    # Use QCursor.pos() which Qt natively translates to logical High DPI multi-monitor coordinates
+                    pos = self.mapFromGlobal(QCursor.pos())
+                    
+                    # 10px margin around the window acts as native resize borders
+                    margin = 10
+                    left = pos.x() < margin
+                    right = pos.x() > self.width() - margin
+                    top = pos.y() < margin
+                    bottom = pos.y() > self.height() - margin
+                    
+                    res = 0
+                    if left and top: res = 13 # HTTOPLEFT
+                    elif right and top: res = 14 # HTTOPRIGHT
+                    elif left and bottom: res = 16 # HTBOTTOMLEFT
+                    elif right and bottom: res = 17 # HTBOTTOMRIGHT
+                    elif left: res = 10 # HTLEFT
+                    elif right: res = 11 # HTRIGHT
+                    elif top: res = 12 # HTTOP
+                    elif bottom: res = 15 # HTBOTTOM
+                    
+                    if res != 0:
+                        return True, res
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
 
 
 class ModelManager(QObject):
@@ -1436,8 +1559,7 @@ class CorrectionWindow(QWidget):
 
     def setup_window(self):
         """Configure window properties"""
-        # Keep window on top but make it frameless and draggable
-        # Removed Qt.Tool flag to fix mouse event handling for dragging
+        # Keep window on top, and make it frameless and draggable again
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, False)
@@ -1446,22 +1568,35 @@ class CorrectionWindow(QWidget):
         self.dragging = False
         self.drag_position = None
 
-        # Position at cursor
+        # Position at cursor relative to active screen
         cursor_pos = QCursor.pos()
-        screen = QApplication.primaryScreen().geometry()
+        screen = QApplication.screenAt(cursor_pos)
+        if not screen:
+            screen = QApplication.primaryScreen()
+        screen_rect = screen.geometry()
+
+        # Dynamically size to prevent being "massive" on smaller screens
+        base_width = 720
+        base_height = 650
+        max_width = int(screen_rect.width() * 0.8)
+        max_height = int(screen_rect.height() * 0.85)
+        
+        window_width = min(base_width, max_width)
+        window_height = min(base_height, max_height)
+        self.resize(window_width, window_height)
 
         # Ensure window stays on screen
-        x = min(cursor_pos.x() - 350, screen.width() - 750)
-        y = min(cursor_pos.y() - 250, screen.height() - 650)
-        x = max(x, 0)
-        y = max(y, 0)
+        x = min(cursor_pos.x() - window_width // 2, screen_rect.right() - window_width)
+        y = min(cursor_pos.y() - window_height // 2, screen_rect.bottom() - window_height)
+        x = max(x, screen_rect.x())
+        y = max(y, screen_rect.y())
 
         self.move(x, y)
 
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("AI Text Corrector")
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(400, 350)
         self.resize(720, 650)
 
         # Premium dark slate-blue theme
@@ -1735,6 +1870,40 @@ class CorrectionWindow(QWidget):
         outer_layout.addWidget(main_widget)
         self.setLayout(outer_layout)
 
+    def nativeEvent(self, eventType, message):
+        """Handle native Windows events for true frameless window resizing"""
+        if eventType == b'windows_generic_MSG' or eventType == b'windows_dispatcher_MSG':
+            import ctypes
+            import ctypes.wintypes
+            try:
+                msg = ctypes.wintypes.MSG.from_address(message.__int__())
+                if msg.message == 0x0084: # WM_NCHITTEST
+                    # Use QCursor.pos() which Qt natively translates to logical High DPI multi-monitor coordinates
+                    pos = self.mapFromGlobal(QCursor.pos())
+                    
+                    # 10px margin around the window acts as native resize borders
+                    margin = 10
+                    left = pos.x() < margin
+                    right = pos.x() > self.width() - margin
+                    top = pos.y() < margin
+                    bottom = pos.y() > self.height() - margin
+                    
+                    res = 0
+                    if left and top: res = 13 # HTTOPLEFT
+                    elif right and top: res = 14 # HTTOPRIGHT
+                    elif left and bottom: res = 16 # HTBOTTOMLEFT
+                    elif right and bottom: res = 17 # HTBOTTOMRIGHT
+                    elif left: res = 10 # HTLEFT
+                    elif right: res = 11 # HTRIGHT
+                    elif top: res = 12 # HTTOP
+                    elif bottom: res = 15 # HTBOTTOM
+                    
+                    if res != 0:
+                        return True, res
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts"""
         if event.key() == Qt.Key_Escape:
@@ -1753,10 +1922,9 @@ class CorrectionWindow(QWidget):
             child = self.childAt(event.pos())
             if child is None or isinstance(child, QLabel):
                 self.dragging = True
-                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+                self.drag_position = event.globalPos() - self.pos()
                 event.accept()
             else:
-                # Let the child widget handle the event (text selection, etc.)
                 super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -2533,6 +2701,11 @@ class TextCorrectorApp(QApplication):
 
 
 if __name__ == "__main__":
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     # Single instance check
     import socket
 
