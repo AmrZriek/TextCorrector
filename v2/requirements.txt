@@ -1,0 +1,10 @@
+PyQt5
+keyboard
+pyperclip
+requests
+psutil
+onnxruntime
+tokenizers
+numpy
+optimum[onnxruntime]
+transformers
