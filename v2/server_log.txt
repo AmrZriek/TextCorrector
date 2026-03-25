@@ -14,7 +14,7 @@ srv    load_model: loading model 'E:/AI/LLM/models/unsloth/Qwen3.5-2B-GGUF/Qwen3
 common_init_result: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on
 llama_params_fit_impl: no devices with dedicated memory found
 llama_params_fit: successfully fit params to free device memory
-llama_params_fit: fitting params to free memory took 0.99 seconds
+llama_params_fit: fitting params to free memory took 0.63 seconds
 llama_model_loader: loaded meta data with 46 key-value pairs and 320 tensors from E:/AI/LLM/models/unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf (version GGUF V3 (latest))
 llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
 llama_model_loader: - kv   0:                       general.architecture str              = qwen35
@@ -183,7 +183,7 @@ sched_reserve: Flash Attention was auto, set to enabled
 sched_reserve:        CPU compute buffer size =   493.00 MiB
 sched_reserve: graph nodes  = 3123 (with bs=512), 1737 (with bs=1)
 sched_reserve: graph splits = 1
-sched_reserve: reserve took 21.89 ms, sched copies = 1
+sched_reserve: reserve took 7.86 ms, sched copies = 1
 srv    load_model: initializing slots, n_slots = 4
 common_speculative_is_compat: the target context does not support partial sequence removal
 srv    load_model: speculative decoding not supported by this context
@@ -213,18 +213,3 @@ main: model loaded
 main: server is listening on http://127.0.0.1:8080
 main: starting the main loop...
 srv  update_slots: all slots are idle
-srv  params_from_: Chat format: peg-constructed
-slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
-slot launch_slot_: id  3 | task -1 | sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> ?top-p -> min-p -> ?xtc -> temp-ext -> dist 
-slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
-slot update_slots: id  3 | task 0 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 320
-slot update_slots: id  3 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
-slot init_sampler: id  3 | task 0 | init sampler, took 0.05 ms, tokens: text = 320, total = 320
-slot update_slots: id  3 | task 0 | prompt processing done, n_tokens = 320, batch.n_tokens = 320
-slot print_timing: id  3 | task 0 | 
-prompt eval time =    5161.04 ms /   320 tokens (   16.13 ms per token,    62.00 tokens per second)
-       eval time =     358.19 ms /     6 tokens (   59.70 ms per token,    16.75 tokens per second)
-      total time =    5519.23 ms /   326 tokens
-slot      release: id  3 | task 0 | stop processing: n_tokens = 325, truncated = 0
-srv  update_slots: all slots are idle
-srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
