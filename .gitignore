@@ -2,6 +2,7 @@ venv/
 __pycache__/
 .vscode/
 .ruff_cache/
+*.pyc
 *.log
 server_log.txt
 app_debug.log
@@ -9,35 +10,30 @@ added.txt
 del.txt
 git_log.txt
 status.txt
+analysis_results.md.resolved
 config.json
 
-# Development copies (root level)
+# Model folders (all locations)
 llama_cpp/
-TextCorrector_Release/
-text_corrector.py
+onnx_models/
+*.gguf
+*.onnx
+*.bin
+*.safetensors
 
-# Build artifacts
+# Build and release folders
 build/
 dist/
+TextCorrector_Release/
+v2/TextCorrector_Release/
 *.spec
 *.zip
 
-# DO NOT ignore v2 release folder (for GitHub distribution)
-!v2/TextCorrector_Release/
-
-# DO NOT ignore v2 source code
+# Keep source code tracked
 !v2/text_corrector.py
-!v2/*.bat
-!v2/*.ps1
-!v2/*.txt
-!v2/*.ico
-!v2/*.png
-
-# Ignore GGUF models EXCEPT in v2 release
-*.gguf
-!v2/TextCorrector_Release/*.gguf
-
-# Ignore llama_cpp EXCEPT in v2 release
-!v2/TextCorrector_Release/llama_cpp/
-
-# Keep CONTEXT.md tracked (removed from ignore)
+!v2/build.ps1
+!v2/run.bat
+!v2/requirements.txt
+!v2/logo.ico
+!v2/logo.png
+!v2/README.md
