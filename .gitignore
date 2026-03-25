@@ -12,6 +12,7 @@ git_log.txt
 status.txt
 analysis_results.md.resolved
 config.json
+v2/server_log.txt
 
 # Model folders (all locations)
 llama_cpp/
