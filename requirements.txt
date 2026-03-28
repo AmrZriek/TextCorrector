@@ -3,3 +3,7 @@ keyboard
 pyperclip
 requests
 psutil
+onnxruntime
+tokenizers
+numpy<2
+transformers

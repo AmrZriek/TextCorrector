@@ -100,7 +100,41 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 ---
 
-**Last Updated**: 2026-03-24 | **Version**: 2.1
+## ONNX T5 Debugging Issue - 2026-03-25/28 (RESOLVED)
+
+### Issue Description
+
+The ONNX T5 model failed during inference with a `MatMul dimension mismatch` error on the second generated token. The app was falling back to the slow LLM (~5-10 seconds) instead of using the T5 ONNX (~100ms).
+
+### Root Cause Analysis
+
+The investigation uncovered **two layered bugs** in the KV-cache handling of the autoregressive decoder loop, caused by how the merged `optimum` ONNX model was exported:
+
+1. **Bug 1: Encoder/Decoder KV-cache Swap (positional indexing mismatch)**
+   - Initial code assumed `(enc_key, enc_value, dec_key, dec_value)` ordering for decoder outputs.
+   - The actual outputs strictly follow: `decoder.key, decoder.value, encoder.key, encoder.value`.
+   - Result: decoder KVs were being fed into encoder KV inputs, failing expectations.
+
+2. **Bug 2: Encoder KV-cache Evaporation (`optimum::if` node behavior)**
+   - The merged `decoder_model.onnx` has an internal `optimum::if` branch controlled by `use_cache_branch`.
+   - **Step 0 (`use_cache_branch=False`)**: Computes encoder cross-attention KVs and outputs proper shape `(1, 8, seq_len, 64)`.
+   - **Step 1+ (`use_cache_branch=True`)**: Sub-graph caches encoder KVs internally and outputs **empty tensors** `(0, 8, 1, 64)`.
+   - Previous code blindly fed those empty tensors back to the next inference step, causing an immediate `Broadcast on dim 0` failure.
+
+### The Fix
+
+1. **Name-based Input Mapping**: Replaced fragile positional indexing with direct string matching (`present.X.decoder.key` → `past_key_values.X.decoder.key`).
+2. **Encoder KV Preservation**: Captured the valid encoder KV tensors from `step 0`, and systematically injected them manually into all subsequent steps (while updating only decoder KVs per step).
+3. **Consolidated Architecture**: Extracted a unified `_run_seq2seq()` method used by both `proofread()` and `chat()`.
+
+### Current Status
+
+- **ONNX Inference is FIXED**: The T5 model correctly decodes multiple tokens without crashing.
+- **Model Quality Limitation**: While the code pipeline works perfectly, the specific `grammar_t5` parameters are lackluster. It is highly recommended to upgrade to a modern Edge AI / SLM (like Llama-3.2-1B, Qwen-2.5-0.5B, or a better fine-tuned Flan-T5) for Samsung-like professional grammar correction.
+
+---
+
+**Last Updated**: 2026-03-26 | **Version**: 2.1
 
 ## v2.1 (T5-First Architecture) - 2026-03-24
 

@@ -161,15 +161,15 @@ def strip_meta_commentary(text, original_text=""):
     cleaned = text
     for pattern in preamble_patterns:
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-    # Strip wrapping quotes only if the original didn't start/end with quotes
+    # Strip wrapping quotes if the entire output is quoted
     cleaned = cleaned.strip()
-    original_stripped = original_text.strip()
-    if (len(cleaned) > 2 and cleaned[0] == '"' and cleaned[-1] == '"' and
-        not (original_stripped.startswith('"') and original_stripped.endswith('"'))):
-        cleaned = cleaned[1:-1]
-    if (len(cleaned) > 2 and cleaned[0] == "'" and cleaned[-1] == "'" and
-        not (original_stripped.startswith("'") and original_stripped.endswith("'"))):
-        cleaned = cleaned[1:-1]
+    # Only strip quotes if the model added them (not if original had quotes)
+    if len(cleaned) > 2 and cleaned[0] == '"' and cleaned[-1] == '"':
+        if not (original_text.startswith('"') and original_text.endswith('"')):
+            cleaned = cleaned[1:-1]
+    if len(cleaned) > 2 and cleaned[0] == "'" and cleaned[-1] == "'":
+        if not (original_text.startswith("'") and original_text.endswith("'")):
+            cleaned = cleaned[1:-1]
     # Strip markdown code blocks if wrapping the entire output
     if cleaned.startswith("```") and cleaned.endswith("```"):
         lines = cleaned.split("\n")
@@ -200,12 +200,11 @@ def contains_meta_commentary(text):
             return True
 
     # Check for multiple sentences that look like explanations
-    # Only flag if there are MANY short sentences (more aggressive threshold)
     sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-    if len(sentences) > 5:
-        # Require most sentences to be very short to flag as commentary
-        very_short_sentences = sum(1 for s in sentences if len(s.split()) < 4)
-        if very_short_sentences > len(sentences) * 0.7:
+    if len(sentences) > 3:
+        # If there are many short sentences, might be commentary
+        short_sentences = sum(1 for s in sentences if len(s.split()) < 5)
+        if short_sentences > len(sentences) / 2:
             return True
 
     return False
@@ -230,6 +229,7 @@ DEFAULT_CONFIG = {
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
     "repeat_penalty": 1.0,
+    "onnx_model_dir": "",  # ONNX model directory
 }
 
 
@@ -556,6 +556,9 @@ class SettingsDialog(QDialog):
         # Lower minimum size to allow shrinking on smaller scaled displays
         self.setMinimumSize(450, 450)
         
+        # Initialize ONNX directory edit
+        self.onnx_dir_edit = None
+        
         # Dynamically size to prevent being massive on smaller screens
         cursor_pos = QCursor.pos()
         screen = QApplication.screenAt(cursor_pos)
@@ -721,6 +724,60 @@ class SettingsDialog(QDialog):
         browse_model_btn.clicked.connect(self.browse_model)
         model_h_layout.addWidget(browse_model_btn)
         layout.addLayout(model_h_layout)
+
+        # ONNX Model Directory
+        onnx_label = QLabel("ONNX Model Directory:")
+        onnx_label.setStyleSheet("font-weight: bold; color: #ffffff;")
+        settings_layout = QHBoxLayout()
+        self.onnx_dir_edit = QLineEdit()
+        self.onnx_dir_edit.setPlaceholderText("Path to ONNX model folder (e.g., onnx_models/grammar_t5/)")
+        self.onnx_dir_edit.setStyleSheet("""
+            QLineEdit {
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 4px;
+                padding: 8px;
+                color: #ffffff;
+            }
+            QLineEdit:focus {
+                border: 1px solid rgba(100, 150, 255, 0.5);
+                background: rgba(255, 255, 255, 0.15);
+            }
+        """)
+        settings_layout.addWidget(self.onnx_dir_edit)
+
+        onnx_browse_btn = QPushButton("Browse...")
+        onnx_browse_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        onnx_browse_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4a9eff, stop:1 #0066cc);
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #5aafff, stop:1 #1077dd);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #3a8eef, stop:1 #0055bb);
+            }
+        """)
+        settings_layout.addWidget(onnx_browse_btn)
+        layout.addLayout(settings_layout)
+
+        # Connect browse button
+        onnx_browse_btn.clicked.connect(self.browse_onnx)
+
+        # Add info label
+        onnx_info = QLabel("💡 Uses T5 model for fast grammar correction. Leave empty to use LLM only.")
+        onnx_info.setWordWrap(True)
+        onnx_info.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(onnx_info)
 
         # Recent Models
         recent_layout = QHBoxLayout()
@@ -888,6 +945,10 @@ class SettingsDialog(QDialog):
         self.keep_loaded_check.setChecked(self.config.get("keep_model_loaded", False))
         self.prompt_edit.setPlainText(self.config.get("system_prompt", ""))
 
+        # Load ONNX model directory
+        if self.onnx_dir_edit:
+            self.onnx_dir_edit.setText(self.config.get("onnx_model_dir", ""))
+
         # Load recent models
         self.recent_combo.clear()
         self.recent_combo.addItem("-- Select recent model --")
@@ -938,6 +999,14 @@ class SettingsDialog(QDialog):
             self.config.add_recent_model(path)
             self.load_settings()  # Refresh recent list
 
+    def browse_onnx(self):
+        """Browse for ONNX model directory"""
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select ONNX Model Directory"
+        )
+        if dir_path:
+            self.onnx_dir_edit.setText(dir_path)
+
     def save_settings(self):
         """Save settings to config"""
         self.config.set("llama_server_path", self.server_path_edit.text())
@@ -964,6 +1033,10 @@ class SettingsDialog(QDialog):
 
         self.config.set("hotkey", self.hotkey_edit.text())
         self.config.set("system_prompt", self.prompt_edit.toPlainText().strip())
+
+        # Save ONNX model directory
+        if self.onnx_dir_edit:
+            self.config.set("onnx_model_dir", self.onnx_dir_edit.text())
 
         if self.model_path_edit.text():
             self.config.add_recent_model(self.model_path_edit.text())
@@ -1004,6 +1077,362 @@ class SettingsDialog(QDialog):
             except Exception:
                 pass
         return super().nativeEvent(eventType, message)
+
+
+class ONNXManager(QObject):
+    """Manages the ONNX model inference for fast proofreading"""
+    
+    status_changed = pyqtSignal(str, str)  # status, color
+    
+    def __init__(self, config_manager):
+        super().__init__()
+        self.config = config_manager
+        self.pipeline = None
+        self.model_dir = ""
+        self.is_loaded = False
+        self.loading = False
+        self.is_seq2seq = False
+        self._loading_lock = threading.Lock()
+        
+    def load_model(self):
+        self.model_dir = self.config.get("onnx_model_dir", "")
+        if not self.model_dir or not os.path.exists(self.model_dir):
+            self.status_changed.emit("No ONNX Model", "gray")
+            return False
+            
+        try:
+            self.loading = True
+            self.status_changed.emit("Loading ONNX...", "orange")
+            
+            import onnxruntime as ort
+            from transformers import AutoTokenizer
+            import numpy as np
+            
+            # Detect whether it's an encoder-decoder (Seq2Seq) or decoder-only (Causal LM)
+            is_seq2seq = os.path.exists(os.path.join(self.model_dir, "encoder_model.onnx"))
+            self.is_seq2seq = is_seq2seq
+            
+            log_debug(f"[ONNX] Loading model from {self.model_dir}, is_seq2seq={is_seq2seq}")
+            
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+            
+            # Try CUDA first, fall back to CPU if CUDA fails
+            cuda_available = 'CUDAExecutionProvider' in ort.get_available_providers()
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if cuda_available else ['CPUExecutionProvider']
+            log_debug(f"[ONNX] Using providers: {providers}")
+            
+            try:
+                if is_seq2seq:
+                    # Load encoder and decoder ONNX sessions directly (no PyTorch/optimum)
+                    encoder_path = os.path.join(self.model_dir, "encoder_model.onnx")
+                    decoder_path = os.path.join(self.model_dir, "decoder_model.onnx")
+                    
+                    log_debug(f"[ONNX] Loading encoder: {encoder_path}")
+                    log_debug(f"[ONNX] Loading decoder: {decoder_path}")
+                    
+                    self.encoder_session = ort.InferenceSession(encoder_path, providers=providers)
+                    self.decoder_session = ort.InferenceSession(decoder_path, providers=providers)
+                    
+                    self.tokenizer = tokenizer
+                    self.is_loaded = True
+                    self.loading = False
+                    self.status_changed.emit("ONNX Ready (T5)", "green")
+                    log_debug("[ONNX] Model loaded successfully (Seq2Seq)")
+                    return True
+                else:
+                    # Decoder-only model
+                    model_path = os.path.join(self.model_dir, "model.onnx")
+                    log_debug(f"[ONNX] Loading causal LM: {model_path}")
+                    
+                    self.decoder_session = ort.InferenceSession(model_path, providers=providers)
+                    self.tokenizer = tokenizer
+                    self.is_loaded = True
+                    self.loading = False
+                    self.status_changed.emit("ONNX Ready", "green")
+                    log_debug("[ONNX] Model loaded successfully (Causal LM)")
+                    return True
+                    
+            except Exception as load_error:
+                # CUDA failed, retry with CPU only
+                if cuda_available:
+                    log_debug(f"[ONNX] CUDA execution failed: {load_error}, falling back to CPU")
+                    self.status_changed.emit("CUDA failed, using CPU...", "orange")
+                    providers = ['CPUExecutionProvider']
+                    
+                    if is_seq2seq:
+                        encoder_path = os.path.join(self.model_dir, "encoder_model.onnx")
+                        decoder_path = os.path.join(self.model_dir, "decoder_model.onnx")
+                        self.encoder_session = ort.InferenceSession(encoder_path, providers=providers)
+                        self.decoder_session = ort.InferenceSession(decoder_path, providers=providers)
+                        self.tokenizer = tokenizer
+                        self.is_loaded = True
+                        self.loading = False
+                        self.status_changed.emit("ONNX Ready (T5)", "green")
+                        log_debug("[ONNX] Model loaded successfully with CPU (Seq2Seq)")
+                        return True
+                    else:
+                        model_path = os.path.join(self.model_dir, "model.onnx")
+                        self.decoder_session = ort.InferenceSession(model_path, providers=providers)
+                        self.tokenizer = tokenizer
+                        self.is_loaded = True
+                        self.loading = False
+                        self.status_changed.emit("ONNX Ready", "green")
+                        log_debug("[ONNX] Model loaded successfully with CPU (Causal LM)")
+                        return True
+                else:
+                    raise
+                
+        except Exception as e:
+            log_debug(f"[ONNX] Load model error: {e}")
+            self.is_loaded = False
+            self.loading = False
+            self.status_changed.emit("ONNX Load Failed", "red")
+            return False
+    
+    def proofread(self, text):
+        log_debug(f"[ONNX] Proofreading text: {text[:100]}...")
+        
+        # Use mutex to prevent race condition on concurrent calls
+        with self._loading_lock:
+            if not self.is_loaded:
+                log_debug("[ONNX] Model not loaded, loading now...")
+                if not self.load_model():
+                    self.status_changed.emit("ONNX inference failed", "red")
+                    log_debug("[ONNX] Failed to load model.")
+                    return None  # Return None so caller can handle fallback explicitly
+                    
+        try:
+            import numpy as np
+            if self.is_seq2seq:
+                result = self._run_seq2seq(text, prefix="Fix grammar: ", max_tokens=200)
+            else:
+                # Causal LM inference (not used for T5)
+                prompt = f"Fix grammar and typos in the following text:\n{text}\n\nCorrected:"
+                log_debug(f"[ONNX] Using Causal LM. Prompt: {prompt[:100]}...")
+                
+                inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=512)
+                input_ids = inputs["input_ids"].astype(np.int64)
+                attention_mask = inputs["attention_mask"].astype(np.int64)
+                
+                # Run decoder
+                outputs = self.decoder_session.run(None, {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask
+                })
+                
+                # Get generated tokens
+                output_ids = np.argmax(outputs[0], axis=-1)[0]
+                result = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                # Remove prompt from result
+                result = result.replace(prompt, "").strip()
+            
+            if result is None:
+                return None
+                
+            log_debug(f"[ONNX] Result length: {len(result)}")
+            
+            # Apply post-processing (same as LLM)
+            result = strip_thinking_tokens(result)
+            result = strip_meta_commentary(result, text)
+            
+            # Handle empty result after stripping
+            if not result.strip():
+                log_debug("[ONNX] Empty result after post-processing")
+                return None
+            
+            return result.strip()
+            
+        except Exception as e:
+            log_debug(f"ONNX Proofread Error: {e}")
+            self.status_changed.emit("ONNX inference error", "red")
+            return None
+    
+
+    def _run_seq2seq(self, text, prefix="Fix grammar: ", max_tokens=200):
+        """Run T5 seq2seq with proper KV-cache handling.
+        
+        Key details of the merged ONNX decoder model:
+        - Outputs are named 'present.X.{decoder|encoder}.{key|value}'
+        - Inputs are named 'past_key_values.X.{decoder|encoder}.{key|value}'  
+        - When use_cache_branch=False (step 0): encoder KVs are computed fresh, outputs have proper shapes
+        - When use_cache_branch=True (step 1+): encoder KVs are cached internally by the model,
+          and the model outputs EMPTY (batch=0) encoder KV tensors. We must preserve the encoder
+          KVs from step 0 and only update decoder KVs from each step's output.
+        """
+        import numpy as np
+        
+        prompt = f"{prefix}{text}"
+        log_debug(f"[ONNX] Seq2Seq prompt: {prompt[:100]}...")
+        
+        # Tokenize input
+        inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=512)
+        input_ids = inputs["input_ids"].astype(np.int64)
+        attention_mask = inputs["attention_mask"].astype(np.int64)
+        
+        # Run encoder
+        encoder_outputs = self.encoder_session.run(None, {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        })
+        
+        # Build output→input name mappings, separated by type
+        output_names = [out.name for out in self.decoder_session.get_outputs()]
+        decoder_kv_map = {}  # present.X.decoder.{key|value} → past_key_values.X.decoder.{key|value}
+        encoder_kv_map = {}  # present.X.encoder.{key|value} → past_key_values.X.encoder.{key|value}
+        for name in output_names:
+            if name.startswith("present."):
+                input_name = "past_key_values." + name[len("present."):]
+                if ".encoder." in name:
+                    encoder_kv_map[name] = input_name
+                elif ".decoder." in name:
+                    decoder_kv_map[name] = input_name
+        
+        # Get past_key_values input metadata for zero-fill shapes
+        pkv_inputs = [inp for inp in self.decoder_session.get_inputs()
+                      if inp.name.startswith("past_key_values.")]
+        
+        # Collect generated token IDs
+        generated_ids = [self.tokenizer.pad_token_id]
+        decoder_input_ids = np.array([[self.tokenizer.pad_token_id]], dtype=np.int64)
+        past_kv_feed = None
+        encoder_kv_cache = None  # Preserved from step 0
+        
+        for step in range(max_tokens):
+            decoder_inputs = {
+                "input_ids": decoder_input_ids,
+                "encoder_hidden_states": encoder_outputs[0],
+                "encoder_attention_mask": attention_mask
+            }
+            
+            if past_kv_feed is not None:
+                decoder_inputs.update(past_kv_feed)
+                decoder_inputs["use_cache_branch"] = np.array([True], dtype=np.bool_)
+            else:
+                for inp in pkv_inputs:
+                    shape = inp.shape
+                    decoder_inputs[inp.name] = np.zeros(
+                        (1, shape[1], 0, shape[3]), dtype=np.float32
+                    )
+                decoder_inputs["use_cache_branch"] = np.array([False], dtype=np.bool_)
+            
+            decoder_outputs = self.decoder_session.run(None, decoder_inputs)
+            
+            if step == 0:
+                log_debug(f"[ONNX] Step 0 output shape: {decoder_outputs[0].shape}, count: {len(decoder_outputs)}")
+                # Capture encoder KV-cache from step 0 (the only time it's valid)
+                encoder_kv_cache = {}
+                for idx, out_name in enumerate(output_names):
+                    if out_name in encoder_kv_map:
+                        encoder_kv_cache[encoder_kv_map[out_name]] = decoder_outputs[idx]
+            
+            # Get next token (greedy)
+            next_token_logits = decoder_outputs[0][:, -1, :]
+            next_token_id = int(np.argmax(next_token_logits, axis=-1)[0])
+            generated_ids.append(next_token_id)
+            
+            # Check for EOS
+            if next_token_id == self.tokenizer.eos_token_id:
+                log_debug(f"[ONNX] EOS at step {step}")
+                break
+            
+            # Next step: feed only the new token (KV-cache has the history)
+            decoder_input_ids = np.array([[next_token_id]], dtype=np.int64)
+            
+            # Build KV-cache feed: decoder KVs from this step + encoder KVs from step 0
+            past_kv_feed = {}
+            # Decoder KVs: always from current step output (they grow with each token)
+            for idx, out_name in enumerate(output_names):
+                if out_name in decoder_kv_map:
+                    past_kv_feed[decoder_kv_map[out_name]] = decoder_outputs[idx]
+            # Encoder KVs: always from step 0 (model returns empty on subsequent steps)
+            past_kv_feed.update(encoder_kv_cache)
+        
+        # Decode
+        result = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        return result
+    
+    def chat(self, messages, max_tokens=1000):
+        """Simple chat/refinement using ONNX model.
+        
+        This is a lightweight alternative to the full LLM chat.
+        It uses the same seq2seq logic as proofread() but with a different prefix.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            max_tokens: Maximum tokens to generate
+            
+        Returns:
+            str: Model response or None on failure
+        """
+        log_debug(f"[ONNX] Chat with {len(messages)} messages")
+        
+        # Use mutex to prevent race condition on concurrent calls
+        with self._loading_lock:
+            if not self.is_loaded:
+                log_debug("[ONNX] Model not loaded for chat, loading now...")
+                if not self.load_model():
+                    self.status_changed.emit("ONNX chat failed", "red")
+                    log_debug("[ONNX] Failed to load model for chat.")
+                    return None
+        
+        try:
+            import numpy as np
+            
+            # Extract the latest user message
+            user_content = ""
+            for msg in reversed(messages[-4:]):
+                if msg.get("role") == "user":
+                    user_content = msg.get("content", "")
+                    break
+            
+            if not user_content:
+                log_debug("[ONNX] No user content found in messages")
+                return None
+            
+            # Truncate if too long for ONNX model context
+            if len(user_content) > 1000:
+                user_content = user_content[-1000:]
+            
+            if self.is_seq2seq:
+                result = self._run_seq2seq(user_content, prefix="Refine text: ", max_tokens=max_tokens)
+            else:
+                # Causal LM inference (not used for T5)
+                prompt = f"Refine and improve the following text:\n{user_content}\n\nImproved:"
+                log_debug(f"[ONNX Chat] Using Causal LM. Prompt: {prompt[:100]}...")
+                
+                inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=512)
+                input_ids = inputs["input_ids"].astype(np.int64)
+                attention_mask = inputs["attention_mask"].astype(np.int64)
+                
+                outputs = self.decoder_session.run(None, {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask
+                })
+                
+                output_ids = np.argmax(outputs[0], axis=-1)[0]
+                result = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                result = result.replace(prompt, "").strip()
+            
+            if result is None:
+                return None
+                
+            log_debug(f"[ONNX Chat] Result length: {len(result)}")
+            
+            # Apply post-processing
+            result = strip_thinking_tokens(result)
+            result = strip_meta_commentary(result, user_content)
+            
+            if not result.strip():
+                log_debug("[ONNX Chat] Empty result after post-processing")
+                return None
+            
+            return result.strip()
+            
+        except Exception as e:
+            log_debug(f"ONNX Chat Error: {e}")
+            self.status_changed.emit("ONNX chat error", "red")
+            return None
 
 
 class ModelManager(QObject):
@@ -1258,7 +1687,6 @@ class ModelManager(QObject):
             self.status_changed.emit("Correcting...")
 
             # Get custom instruction or use default
-            # Get custom instruction or use default
             if custom_instruction:
                 # Custom instruction path - respecting user's manual override
                 messages = [
@@ -1348,7 +1776,6 @@ class ModelManager(QObject):
                 "frequency_penalty": frequency_penalty,
                 "presence_penalty": presence_penalty,
                 "repeat_penalty": repeat_penalty,
-                "stop": ["\n\n\n", "###", "User:", "Assistant:"],
             }
 
             url = self._get_chat_url()
@@ -1388,30 +1815,18 @@ class ModelManager(QObject):
                 )
                 self.status_changed.emit("Retrying...")
 
-                # Retry with consistent few-shot format (same structure as main prompt)
+                # Retry with ultra-strict prompt
                 retry_messages = [
                     {
                         "role": "system",
                         "content": (
-                            "You are a text correction engine. Your ONLY task is to proofread and refine text.\n\n"
-                            "CRITICAL RULES - FOLLOW EXACTLY:\n"
-                            "1. Output ONLY the corrected text - absolutely nothing else\n"
-                            "2. NEVER add: 'Here is', 'Sure', 'Corrected:', 'The corrected version', or ANY preamble\n"
-                            "3. NEVER add explanations, commentary, or questions\n"
-                            "4. NEVER wrap output in quotes, markdown, or code blocks\n"
-                            "5. If text is perfect, return it exactly as-is\n"
-                            "6. Fix only: spelling, grammar, punctuation, and minor word choice\n"
-                            "7. Maintain original meaning, tone, and style precisely\n"
-                            "8. PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines\n"
-                            "9. Maintain original formatting exactly, including multiple line breaks\n\n"
-                            "OUTPUT ONLY: The corrected text. Nothing else."
+                            "OUTPUT FORMAT: PLAIN TEXT ONLY. NO PREAMBLE. NO LABELS. NO EXPLANATIONS. "
+                            "Task: Fix spelling, grammar, and punctuation in the following text. "
+                            "PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING. "
+                            "Output the corrected text and NOTHING else."
                         ),
                     },
-                    {"role": "user", "content": "i dont know if its gona work"},
-                    {"role": "assistant", "content": "I don't know if it's going to work."},
-                    {"role": "user", "content": "The data shows that their is an increase in sales."},
-                    {"role": "assistant", "content": "The data shows that there is an increase in sales."},
-                    {"role": "user", "content": text},
+                    {"role": "user", "content": f"Text to correct:\n{text}"},
                 ]
 
                 retry_payload = {
@@ -1424,7 +1839,6 @@ class ModelManager(QObject):
                     "frequency_penalty": 0.0,
                     "presence_penalty": 0.0,
                     "repeat_penalty": 1.0,
-                    "stop": ["\n\n\n", "###", "User:", "Assistant:"],
                 }
 
                 retry_response = requests.post(url, json=retry_payload, timeout=120)
@@ -1500,7 +1914,6 @@ class ModelManager(QObject):
                 "frequency_penalty": frequency_penalty,
                 "presence_penalty": presence_penalty,
                 "repeat_penalty": repeat_penalty,
-                "stop": ["\n\n\n", "###", "User:", "Assistant:"],
             }
 
             url = self._get_chat_url()
@@ -1547,15 +1960,16 @@ class CorrectionWindow(QWidget):
     """Main correction window with chat interface"""
 
     correction_accepted = pyqtSignal(str)
-    correction_ready = pyqtSignal(str)
+    correction_ready = pyqtSignal(str, str)
     correction_failed_signal = pyqtSignal()
     chat_response_ready = pyqtSignal(str)
     chat_error_signal = pyqtSignal()
 
-    def __init__(self, original_text, model_manager, config_manager):
+    def __init__(self, original_text, model_manager, onnx_manager, config_manager):
         super().__init__()
         self.original_text = original_text
         self.model_manager = model_manager
+        self.onnx_manager = onnx_manager
         self.config = config_manager
         self.corrected_text = None
         self.chat_history = []
@@ -1761,6 +2175,11 @@ class CorrectionWindow(QWidget):
 
         header_layout.addStretch()
 
+        self.model_label = QLabel("")
+        self.model_label.setObjectName("status")
+        self.model_label.hide()
+        header_layout.addWidget(self.model_label)
+
         self.status_label = QLabel("⏳ Loading model...")
         self.status_label.setObjectName("status")
         header_layout.addWidget(self.status_label)
@@ -1959,9 +2378,35 @@ class CorrectionWindow(QWidget):
             super().mouseReleaseEvent(event)
 
     def perform_initial_correction(self):
-        """Perform the initial text correction"""
+        """Perform the initial text correction - ALWAYS uses ONNX first (T5-first architecture)"""
         log_debug("perform_initial_correction started (background thread)")
-        corrected = self.model_manager.correct_text(self.original_text)
+        
+        # ALWAYS try ONNX first for autocorrect (T5-first architecture)
+        corrected = None
+        onnx_attempted = False
+        used_model = "Unknown"
+        
+        if self.onnx_manager:
+            log_debug("ONNX manager available, using for initial correction")
+            onnx_attempted = True
+            corrected = self.onnx_manager.proofread(self.original_text)
+            
+            if corrected:
+                log_debug("ONNX correction successful")
+                used_model = "T5 (ONNX)"
+            else:
+                log_debug("ONNX correction returned None - model may not be loaded")
+        
+        # Only fall back to LLM if ONNX explicitly failed (not just "not configured")
+        if not corrected and onnx_attempted:
+            log_debug("ONNX failed, falling back to LLM for initial correction")
+            corrected = self.model_manager.correct_text(self.original_text)
+            if corrected: used_model = "LLM"
+        elif not corrected:
+            log_debug("ONNX not available, using LLM for initial correction")
+            corrected = self.model_manager.correct_text(self.original_text)
+            if corrected: used_model = "LLM"
+        
         log_debug(
             f"perform_initial_correction finished. Result len: {len(corrected) if corrected else 'None'}"
         )
@@ -1969,13 +2414,16 @@ class CorrectionWindow(QWidget):
         if corrected:
             self.corrected_text = corrected
             # Emit signal to update UI from main thread
-            self.correction_ready.emit(corrected)
+            self.correction_ready.emit(corrected, used_model)
         else:
             self.correction_failed_signal.emit()
 
-    def on_correction_done(self, corrected):
+    def on_correction_done(self, corrected, model_name="Unknown"):
         """Handle successful correction with diff highlighting"""
         log_debug("on_correction_done called (main thread)")
+
+        self.model_label.setText(f"Model: {model_name}")
+        self.model_label.show()
 
         # Check for error messages returned from correct_text
         if corrected.startswith("[Error]"):
@@ -2095,17 +2543,23 @@ class CorrectionWindow(QWidget):
         current_text = self.corrected_edit.toPlainText()
 
         # Build conversation history for context
-        # Start with system message
+        # Start with STRICT system message for chat
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a text editing assistant. The user will give you text and a modification request. "
-                    "Apply the requested changes and output ONLY the modified text. "
-                    "Do NOT add preamble, explanations, or commentary. "
-                    "Do NOT say 'Here is...' or 'Sure, ...'. Output the text only. "
-                    "PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines. "
-                    "Maintain original formatting exactly, including multiple line breaks.\n"
+                    "You are a text editing assistant. CRITICAL OUTPUT RULES - VIOLATING THESE IS AN ERROR:\n\n"
+                    "1. OUTPUT ONLY THE MODIFIED TEXT - absolutely nothing else\n"
+                    "2. NEVER add preamble like 'Here is...', 'Sure, ...', 'Certainly', 'I've made the changes', etc.\n"
+                    "3. NEVER add explanations, commentary, or questions after the output\n"
+                    "4. NEVER wrap output in quotes, markdown code blocks, or labels\n"
+                    "5. If user asks a question ABOUT the text (not to modify), answer briefly and helpfully\n"
+                    "6. PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines\n"
+                    "7. Maintain original formatting exactly, including multiple line breaks\n\n"
+                    "DETECTION RULE:\n"
+                    "- If user request is to FIX/CORRECT/MODIFY/REWRITE text → output ONLY the corrected text\n"
+                    "- If user request is a QUESTION about the text → answer briefly, then stop\n"
+                    "- NEVER say 'The corrected version is:' or similar labels\n\n"
                     "/no_think"
                 ),
             },
@@ -2126,18 +2580,120 @@ class CorrectionWindow(QWidget):
         # Store this exchange in history
         self.chat_history.append({"role": "user", "content": user_message})
 
-        # Process in background
+        # Process in background - ALWAYS use LLM for chat (user wants conversation)
         threading.Thread(
             target=self._process_chat_message,
             args=(messages, user_message),
             daemon=True,
         ).start()
 
+    def _detect_chat_output_type(self, output: str, user_message: str) -> dict:
+        """Detect whether chat output is correction or conversation.
+        
+        Returns dict with:
+            - is_correction: bool - True if output is mostly corrected text
+            - should_paste: bool - True if output should be pasted to clipboard
+            - confidence: float - 0.0 to 1.0 confidence in detection
+        """
+        if not output or not user_message:
+            return {"is_correction": False, "should_paste": False, "confidence": 0.0}
+        
+        output_lower = output.lower().strip()
+        user_lower = user_message.lower().strip()
+        
+        # Heuristic 1: Check for conversational prefixes (meta-commentary)
+        conversational_prefixes = [
+            "sure", "here's", "here is", "i've", "i have", "let me",
+            "i can", "of course", "certainly", "absolutely", "happy to",
+            "glad to", "the corrected", "corrected version", "here you",
+            "i'd be", "i will", "i would", "in response", "to answer"
+        ]
+        has_conversational_prefix = any(output_lower.startswith(p) for p in conversational_prefixes)
+        
+        # Heuristic 2: Length similarity - corrections are usually similar length to input
+        # Extract text to correct from user message if possible
+        text_to_correct = ""
+        if "current text:" in user_lower:
+            # Try to extract the original text portion
+            parts = user_message.split("\n")
+            for i, part in enumerate(parts):
+                if part.strip() and not part.lower().startswith(("current text", "user request", "please", "can you", "could you")):
+                    text_to_correct = part.strip()
+                    break
+        
+        output_len = len(output.split())
+        input_len = len(text_to_correct.split()) if text_to_correct else len(user_message.split())
+        length_ratio = output_len / max(input_len, 1)
+        is_similar_length = 0.5 <= length_ratio <= 2.0
+        
+        # Heuristic 3: Check if output contains explanations or multiple paragraphs
+        paragraph_count = output.count("\n\n") + 1
+        sentence_count = len(re.findall(r'[.!?]+', output))
+        has_explanation = paragraph_count > 2 or sentence_count > 4
+        
+        # Heuristic 4: Check for question patterns (conversation indicator)
+        has_question = "?" in output
+        
+        # Heuristic 5: Check for common correction patterns
+        # If user message contains correction-related keywords
+        correction_keywords = ["correct", "fix", "grammar", "spelling", "proofread", "improve", "rewrite", "edit"]
+        user_wants_correction = any(kw in user_lower for kw in correction_keywords)
+        
+        # Decision logic
+        confidence = 0.0
+        is_correction = False
+        should_paste = False
+        
+        if has_conversational_prefix and not is_similar_length:
+            # Clearly conversational
+            is_correction = False
+            should_paste = False
+            confidence = 0.8
+        elif has_question or has_explanation:
+            # Contains explanations or questions - likely conversation
+            is_correction = False
+            should_paste = False
+            confidence = 0.7
+        elif user_wants_correction and is_similar_length and not has_conversational_prefix:
+            # User asked for correction and output is similar length without preamble
+            is_correction = True
+            should_paste = True
+            confidence = 0.85
+        elif is_similar_length and len(output) < len(user_message) * 3:
+            # Output is concise and similar length - likely correction
+            is_correction = True
+            should_paste = True
+            confidence = 0.6
+        else:
+            # Default to conversation for safety
+            is_correction = False
+            should_paste = False
+            confidence = 0.5
+        
+        return {
+            "is_correction": is_correction,
+            "should_paste": should_paste,
+            "confidence": confidence
+        }
+
     def _process_chat_message(self, messages, user_message):
-        """Process chat message in background"""
+        """Process chat message in background - ALWAYS use LLM for chat.
+        
+        Chat is for conversation about text. Use LLM with strict guardrails.
+        """
+        response = None
+        
+        # ALWAYS use LLM for chat (user wants conversation/refinement)
+        log_debug("Using LLM for chat message processing")
         response = self.model_manager.chat_with_model(messages)
+        
         if response:
             self.corrected_text = response
+            
+            # Detect output type for proper handling
+            output_type = self._detect_chat_output_type(response, user_message)
+            log_debug(f"Chat output type detection: {output_type}")
+            
             # Store assistant response in history
             self.chat_history.append({"role": "assistant", "content": response})
             # Keep history manageable (last 10 exchanges)
@@ -2152,6 +2708,8 @@ class CorrectionWindow(QWidget):
         # Always update the corrected text with the model's response
         # This is more reliable than trying to detect if it's a conversation
         self.corrected_edit.setPlainText(response)
+        self.model_label.setText("Model: LLM")
+        self.model_label.show()
         self.add_chat_message("model", "Text updated ✓")
 
         self.send_btn.setEnabled(True)
@@ -2230,6 +2788,11 @@ class TextCorrectorApp(QApplication):
         self.model_manager.model_loaded.connect(self.on_model_loaded)
         self.model_manager.model_unloaded.connect(self.on_model_unloaded)
 
+        # Initialize ONNX manager
+        self.onnx_manager = ONNXManager(self.config)
+        # Connect ONNX status to UI for visibility
+        self.onnx_manager.status_changed.connect(self.update_status)
+
         # Create tray
         self.create_tray_icon()
 
@@ -2242,12 +2805,21 @@ class TextCorrectorApp(QApplication):
         # Register hotkey (delayed to ensure UI is ready)
         QTimer.singleShot(1000, self.register_hotkey)
 
-        # Show welcome if first run
-        if not self.config.get("model_path"):
-            QTimer.singleShot(2000, self.show_first_run_dialog)
-        else:
-            # Auto-load model on startup
+        # T5-first architecture: Preload ONNX at startup if configured
+        onnx_dir = self.config.get("onnx_model_dir", "")
+        if onnx_dir and os.path.exists(onnx_dir):
+            # Preload ONNX model at startup for fast autocorrect
+            log_debug("ONNX model dir configured, preloading at startup")
+            QTimer.singleShot(500, self._preload_onnx_model)
+            # Don't load LLM at startup if ONNX is available
+            log_debug("ONNX available, skipping LLM auto-load at startup")
+        elif self.config.get("model_path"):
+            # No ONNX, fall back to LLM
+            log_debug("No ONNX configured, loading LLM at startup")
             QTimer.singleShot(500, self._load_model_threaded)
+        else:
+            # No model configured, show welcome
+            QTimer.singleShot(2000, self.show_first_run_dialog)
 
     def create_tray_icon(self):
         """Create system tray icon and menu"""
@@ -2472,8 +3044,23 @@ class TextCorrectorApp(QApplication):
         """Load model in background thread"""
         threading.Thread(target=self.model_manager.load_model, daemon=True).start()
 
+    def _preload_onnx_model(self):
+        """Preload ONNX model at startup for fast autocorrect"""
+        log_debug("Preloading ONNX model at startup")
+        if self.onnx_manager:
+            success = self.onnx_manager.load_model()
+            if success:
+                log_debug("ONNX model preloaded successfully")
+                self.tray_icon.setIcon(self._create_icon("#4CAF50"))
+                onnx_dir = os.path.basename(self.config.get("onnx_model_dir", ""))
+                self.tray_icon.setToolTip(f"Text Corrector — ONNX Ready ({onnx_dir})")
+            else:
+                log_debug("Failed to preload ONNX model")
+                self.tray_icon.setIcon(self._create_icon("#f44336"))
+                self.tray_icon.setToolTip("Text Corrector — ONNX Load Failed")
+
     def on_model_loaded(self):
-        """Handle model loaded event"""
+        """Handle model loaded event (LLM)"""
         self.tray_icon.setIcon(self._create_icon("#4CAF50"))
         model_name = friendly_model_name(self.config.get("model_path", ""))
         self.tray_icon.setToolTip(f"Text Corrector — {model_name}")
@@ -2624,22 +3211,32 @@ class TextCorrectorApp(QApplication):
         if self.correction_window:
             self.correction_window.close()
 
-        self.correction_window = CorrectionWindow(text, self.model_manager, self.config)
+        self.correction_window = CorrectionWindow(text, self.model_manager, self.onnx_manager, self.config)
         self.correction_window.show()
         self.correction_window.raise_()
         self.correction_window.activateWindow()
 
-    def update_status(self, status):
+    def update_status(self, status, color=None):
         """Update tray status"""
+        # Handle both single arg (from ModelManager) and two args (from ONNXManager)
+        if isinstance(status, tuple):
+            status, color = status
+        
         self.status_action.setText(f"Status: {status}")
-        if "error" in status.lower() or "failed" in status.lower():
-            self.tray_icon.setIcon(self._create_icon("#ef4444"))
-            self.tray_icon.setToolTip(f"Text Corrector — {status}")
-        elif "loading" in status.lower() or "starting" in status.lower():
-            self.tray_icon.setIcon(self._create_icon("#f59e0b"))
-            self.tray_icon.setToolTip(f"Text Corrector — {status}")
-        elif "ready" in status.lower() or "loaded" in status.lower():
-            self.tray_icon.setIcon(self._create_icon("#10b981"))
+        
+        # Determine color based on status text if not provided
+        if color is None:
+            if "error" in status.lower() or "failed" in status.lower():
+                color = "#ef4444"
+            elif "loading" in status.lower() or "starting" in status.lower():
+                color = "#f59e0b"
+            elif "ready" in status.lower() or "loaded" in status.lower():
+                color = "#10b981"
+            else:
+                color = "#888"
+        
+        self.tray_icon.setIcon(self._create_icon(color))
+        self.tray_icon.setToolTip(f"Text Corrector — {status}")
 
     def add_to_startup(self):
         """Add application to Windows startup"""

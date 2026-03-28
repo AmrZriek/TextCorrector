@@ -1,4 +1,4 @@
-# TextCorrector
+# TextCorrector v2
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python: 3.12](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
@@ -6,38 +6,66 @@
 
 ## What is this?
 
-TextCorrector sits quietly in your system tray and lets you fix grammar and spelling in **any application** instantly — email, Word, browsers, chat apps. Everything is processed 100% locally; your text never leaves your computer.
+TextCorrector v2 sits quietly in your system tray and lets you fix grammar and spelling in **any application** instantly — email, Word, browsers, chat apps. Everything is processed 100% locally; your text never leaves your computer.
+
+**v2 Features:**
+- 🚀 **T5 ONNX Model** for instant autocorrect (~100ms)
+- 💬 **LLM Chat** for conversational text refinement
+- 🔒 **100% Offline** - no API calls, no data leaves your computer
+- 🎯 **Smart Detection** - knows when to correct vs. when to chat
 
 ---
 
-## How to Run
+## Quick Start
 
-1. **Double-click `TextCorrector.exe`**
-2. A UAC (User Account Control) prompt may appear — click **Yes** *(required for the global hotkey to work in all apps)*
-3. A small icon will appear in your **system tray** (bottom-right, near the clock)
-
-That's it. The AI model loads automatically in the background.
+1. **Run `TextCorrector.exe`**
+2. A UAC prompt may appear — click **Yes** (required for global hotkey)
+3. Look for the icon in your **system tray** (near the clock)
+4. Open **Settings** → **ONNX Model Directory** → Browse to `onnx_models/grammar_t5/`
+5. **Save** and restart
 
 ---
 
 ## How to Use
 
+### Autocorrect (T5 - Fast)
 1. **Select** any text in any application
-2. Press **Ctrl + Shift + Space**
+2. Press **Ctrl + Alt + C** (or your configured hotkey)
 3. A window appears showing the corrected text with changes highlighted in green
-4. Press **Enter** (or click **Accept & Paste**) to replace your original text
+4. Press **Enter** (or click **Accept & Paste**) to replace the original text
+
+### Chat Refinement (LLM - Conversational)
+1. After autocorrect, click the **Chat** button in the correction window
+2. Type your request (e.g., "Make this more formal", "Shorten this", "Explain the changes")
+3. The AI responds with suggestions
+4. If it's a correction, click **Paste**; if it's an answer, just read it
 
 ---
 
-## First-Time Startup
+## First-Time Setup
 
-The AI model loads into memory the first time you use it. This takes **10–60 seconds** depending on your hardware. After that, corrections are near-instant.
+### Step 1: Configure ONNX Model
+
+1. Right-click tray icon → **Settings**
+2. Scroll to **ONNX Model Directory**
+3. Click **Browse...**
+4. Select the `onnx_models/grammar_t5/` folder
+5. Click **Save**
+
+### Step 2: Verify Loading
+
+After restart, the tray tooltip should show:
+- **"ONNX Ready - T5 Grammar"** = T5 model loaded for autocorrect
+- **"LLM Ready"** = LLM loaded for chat (only loads when you use chat)
 
 ---
 
-## Included AI Model
+## Included Models
 
-This release uses **[Qwen 3.5 2B (Q4_K_XL)](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF?show_file_info=Qwen3.5-2B-UD-Q4_K_XL.gguf)** — a compact, fast, and high-quality model specifically suited for text correction tasks.
+| Model | Purpose | Speed | Size |
+|-------|---------|-------|------|
+| **T5 Grammar (ONNX)** | Autocorrect | ~100ms | ~300 MB |
+| **Qwen3.5-2B (GGUF)** | Chat refinement | ~2-5s | ~1.5 GB |
 
 ---
 
@@ -49,7 +77,7 @@ This release uses **[Qwen 3.5 2B (Q4_K_XL)](https://huggingface.co/unsloth/Qwen3
 | **RAM** | 8 GB | 16 GB |
 | **GPU** | None (CPU mode) | NVIDIA with 4 GB+ VRAM |
 
-> **No NVIDIA GPU?** The app still works — it automatically runs in CPU mode. Corrections will take 15–60 seconds instead of 1–3 seconds.
+> **No NVIDIA GPU?** No problem! T5 runs on CPU at full speed. LLM chat will be slower but still functional.
 
 ---
 
@@ -57,25 +85,98 @@ This release uses **[Qwen 3.5 2B (Q4_K_XL)](https://huggingface.co/unsloth/Qwen3
 
 | Problem | Solution |
 |---|---|
-| Icon doesn't appear in tray | Wait up to 60 seconds on first launch |
-| Hotkey doesn't work in some apps | Right-click tray icon → the app must be running as Admin |
-| App crashes immediately | Install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and retry |
-| Text not being replaced | Make sure text is **selected** before pressing the hotkey |
-| Slow corrections | Expected on CPU-only machines; an NVIDIA GPU speeds this up significantly |
+| Tray icon doesn't appear | Wait up to 60 seconds on first launch |
+| Hotkey doesn't work | Run as Administrator (right-click exe → Run as admin) |
+| App crashes immediately | Install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| Text not being replaced | Make sure text is **selected** before pressing hotkey |
+| "ONNX not loading" | Verify `onnx_models/grammar_t5/encoder_model.onnx` exists |
+| Chat always uses LLM | This is correct! Chat always uses LLM for conversation |
 
 ---
 
-## Settings
+## Settings Reference
 
-Right-click the tray icon → **Settings** to change:
-- Hotkey combination
-- GPU layers (set to 0 to force CPU mode, 99 for full GPU)
-- Model file (drop any `.gguf` file into this folder and it appears in the menu)
-- System prompt (advanced: customize correction style)
+| Setting | Default | Description |
+|---|---|---|
+| **ONNX Model Directory** | (empty) | Path to T5 model folder (`onnx_models/grammar_t5/`) |
+| **Hotkey** | Ctrl+Alt+C | Trigger autocorrect |
+| **System Prompt** | (editable) | Instructions for LLM chat |
+| **GPU Layers** | 99 | How many LLM layers on GPU (0 = CPU only) |
 
 ---
 
-*All processing is 100% local. No internet connection required after setup.*
+## Architecture
 
-### Legal
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details. Unauthorized commercial resale of this software is strictly prohibited.
+### How It Works
+
+```
+User selects text → presses hotkey
+         │
+         ▼
+┌─────────────────────┐
+│   T5 ONNX Model     │ ← Fast autocorrect (~100ms)
+│   (always loaded)   │
+└─────────────────────┘
+         │
+         ▼
+   Correction shown
+         │
+    ┌────┴────┐
+    │         │
+    ▼         ▼
+  Paste    Chat
+           │
+           ▼
+    ┌──────────────┐
+    │  LLM Model   │ ← Conversational refinement
+    │  (loads on   │
+    │   demand)    │
+    └──────────────┘
+```
+
+### Why Two Models?
+
+- **T5 ONNX**: Specialized for grammar correction, extremely fast, runs on any hardware
+- **LLM (Qwen3.5-2B)**: General-purpose, understands context, handles complex requests
+
+---
+
+## Privacy & Security
+
+- ✅ **100% Offline** - No internet connection required
+- ✅ **No telemetry** - Nothing is sent anywhere
+- ✅ **Local processing** - Your text never leaves your computer
+- ✅ **Open source** - Code is auditable (GPL v3)
+
+---
+
+## Building from Source
+
+```powershell
+# In v2/ directory:
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File build.ps1
+
+# Output: v2/TextCorrector_Release/
+```
+
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## Credits
+
+- **T5 Model**: HuggingFace Transformers
+- **ONNX Runtime**: Microsoft
+- **LLM**: Qwen3.5-2B by Alibaba
+- **UI**: PyQt5
+
+---
+
+*All processing is 100% local. No internet connection required.*
