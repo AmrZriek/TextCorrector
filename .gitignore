@@ -1,40 +1,34 @@
+# Python
 venv/
 __pycache__/
 .vscode/
 .ruff_cache/
 *.pyc
 *.log
-server_log.txt
-app_debug.log
-added.txt
-del.txt
-git_log.txt
-status.txt
-analysis_results.md.resolved
-config.json
-v2/server_log.txt
 
-# Model folders (all locations)
+# App state
+app_debug.log
+server_log.txt
+config.json
+.claude/settings.local.json
+.qwen/
+
+# AI agent files (not for GitHub)
+CLAUDE.md
+context.md
+
+# AI agent worktrees
+.claude/worktrees/
+
+# Model files — too large for git
 llama_cpp/
-onnx_models/
 *.gguf
 *.onnx
-*.bin
 *.safetensors
 
-# Build and release folders
+# Build artifacts
 build/
 dist/
 TextCorrector_Release/
-v2/TextCorrector_Release/
 *.spec
 *.zip
-
-# Keep source code tracked
-!v2/text_corrector.py
-!v2/build.ps1
-!v2/run.bat
-!v2/requirements.txt
-!v2/logo.ico
-!v2/logo.png
-!v2/README.md

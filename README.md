@@ -1,182 +1,160 @@
-# TextCorrector v2
+# TextCorrector v3.0
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Python: 3.12](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
-[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)]()
+**Instant AI-powered text correction — select text anywhere, press a hotkey, done.**
 
-## What is this?
-
-TextCorrector v2 sits quietly in your system tray and lets you fix grammar and spelling in **any application** instantly — email, Word, browsers, chat apps. Everything is processed 100% locally; your text never leaves your computer.
-
-**v2 Features:**
-- 🚀 **T5 ONNX Model** for instant autocorrect (~100ms)
-- 💬 **LLM Chat** for conversational text refinement
-- 🔒 **100% Offline** - no API calls, no data leaves your computer
-- 🎯 **Smart Detection** - knows when to correct vs. when to chat
+TextCorrector lives in the system tray. Select text in any app, press the hotkey, and a dark popup appears with corrections highlighted in blue. Accept to paste back. Or chat with the LLM to rewrite, shorten, or change the tone.
 
 ---
 
-## Quick Start
+## How it works
 
-1. **Run `TextCorrector.exe`**
-2. A UAC prompt may appear — click **Yes** (required for global hotkey)
-3. Look for the icon in your **system tray** (near the clock)
-4. Open **Settings** → **ONNX Model Directory** → Browse to `onnx_models/grammar_t5/`
-5. **Save** and restart
-
----
-
-## How to Use
-
-### Autocorrect (T5 - Fast)
-1. **Select** any text in any application
-2. Press **Ctrl + Alt + C** (or your configured hotkey)
-3. A window appears showing the corrected text with changes highlighted in green
-4. Press **Enter** (or click **Accept & Paste**) to replace the original text
-
-### Chat Refinement (LLM - Conversational)
-1. After autocorrect, click the **Chat** button in the correction window
-2. Type your request (e.g., "Make this more formal", "Shorten this", "Explain the changes")
-3. The AI responds with suggestions
-4. If it's a correction, click **Paste**; if it's an answer, just read it
-
----
-
-## First-Time Setup
-
-### Step 1: Configure ONNX Model
-
-1. Right-click tray icon → **Settings**
-2. Scroll to **ONNX Model Directory**
-3. Click **Browse...**
-4. Select the `onnx_models/grammar_t5/` folder
-5. Click **Save**
-
-### Step 2: Verify Loading
-
-After restart, the tray tooltip should show:
-- **"ONNX Ready - T5 Grammar"** = T5 model loaded for autocorrect
-- **"LLM Ready"** = LLM loaded for chat (only loads when you use chat)
-
----
-
-## Included Models
-
-| Model | Purpose | Speed | Size |
-|-------|---------|-------|------|
-| **T5 Grammar (ONNX)** | Autocorrect | ~100ms | ~300 MB |
-| **Qwen3.5-2B (GGUF)** | Chat refinement | ~2-5s | ~1.5 GB |
-
----
-
-## System Requirements
-
-| | Minimum | Recommended |
-|---|---|---|
-| **OS** | Windows 10 | Windows 11 |
-| **RAM** | 8 GB | 16 GB |
-| **GPU** | None (CPU mode) | NVIDIA with 4 GB+ VRAM |
-
-> **No NVIDIA GPU?** No problem! T5 runs on CPU at full speed. LLM chat will be slower but still functional.
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| Tray icon doesn't appear | Wait up to 60 seconds on first launch |
-| Hotkey doesn't work | Run as Administrator (right-click exe → Run as admin) |
-| App crashes immediately | Install [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
-| Text not being replaced | Make sure text is **selected** before pressing hotkey |
-| "ONNX not loading" | Verify `onnx_models/grammar_t5/encoder_model.onnx` exists |
-| Chat always uses LLM | This is correct! Chat always uses LLM for conversation |
-
----
-
-## Settings Reference
-
-| Setting | Default | Description |
-|---|---|---|
-| **ONNX Model Directory** | (empty) | Path to T5 model folder (`onnx_models/grammar_t5/`) |
-| **Hotkey** | Ctrl+Alt+C | Trigger autocorrect |
-| **System Prompt** | (editable) | Instructions for LLM chat |
-| **GPU Layers** | 99 | How many LLM layers on GPU (0 = CPU only) |
+1. Select text in any application.
+2. Press the hotkey (default `Ctrl + Shift + Space`).
+3. The correction popup appears instantly with grammar/spelling fixes highlighted.
+4. Press **Accept & Paste** (`Ctrl+Enter`) — corrected text is pasted back. Done.
+5. Optionally, type in the **Ask AI** box to make bigger changes with the LLM.
 
 ---
 
 ## Architecture
 
-### How It Works
+| Layer | Technology | Role |
+|---|---|---|
+| **Autocorrect** | LanguageTool (local Java server) | Primary — always instant, 10–50 ms |
+| **AI Chat** | llama.cpp (any GGUF model) | Secondary — user-initiated only |
+| GUI | PyQt6, dark navy frameless | — |
+| Hotkey | `keyboard` library (global hook) | — |
 
-```
-User selects text → presses hotkey
-         │
-         ▼
-┌─────────────────────┐
-│   T5 ONNX Model     │ ← Fast autocorrect (~100ms)
-│   (always loaded)   │
-└─────────────────────┘
-         │
-         ▼
-   Correction shown
-         │
-    ┌────┴────┐
-    │         │
-    ▼         ▼
-  Paste    Chat
-           │
-           ▼
-    ┌──────────────┐
-    │  LLM Model   │ ← Conversational refinement
-    │  (loads on   │
-    │   demand)    │
-    └──────────────┘
-```
-
-### Why Two Models?
-
-- **T5 ONNX**: Specialized for grammar correction, extremely fast, runs on any hardware
-- **LLM (Qwen3.5-2B)**: General-purpose, understands context, handles complex requests
+**Design philosophy — same as Samsung keyboard AI:**
+- LanguageTool is the autocorrect engine. It handles spelling and grammar instantly, with no GPU required.
+- The LLM is **never** run automatically. It is only activated when the user explicitly types in the Ask AI chat box.
+- Keeping these roles separate ensures the hotkey always responds fast, regardless of whether an LLM model is loaded.
 
 ---
 
-## Privacy & Security
+## Requirements
 
-- ✅ **100% Offline** - No internet connection required
-- ✅ **No telemetry** - Nothing is sent anywhere
-- ✅ **Local processing** - Your text never leaves your computer
-- ✅ **Open source** - Code is auditable (GPL v3)
+- **Python 3.11+**
+- **Java 8+** (for LanguageTool — usually pre-installed; download from https://adoptium.net if not)
+- A GGUF model file for LLM features (optional, but recommended for best accuracy)
+- The `llama_cpp/` folder with the `llama-server` binary
 
 ---
 
-## Building from Source
+## Installation
 
-```powershell
-# In v2/ directory:
+```bash
+# 1. Clone or download
+git clone https://github.com/your-repo/TextCorrector.git
+cd TextCorrector
+
+# 2. Create a venv and install dependencies
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\activate        # Windows
+# source venv/bin/activate   # macOS/Linux
 pip install -r requirements.txt
-powershell -ExecutionPolicy Bypass -File build.ps1
 
-# Output: v2/TextCorrector_Release/
+# 3. Run
+run.bat          # Windows (auto-elevates, uses venv)
+# python text_corrector.py   # macOS/Linux
 ```
+
+On first run, LanguageTool downloads its server JAR (~200 MB) to `~/.cache/language_tool_python/`. This is a one-time download.
+
+---
+
+## Setting up the LLM
+
+For the best correction quality and the AI chat feature:
+
+1. Download a GGUF model — recommended: **Qwen 2.5 3B Instruct Q4_K_M** (~2 GB).
+
+2. Download the `llama-server` binary for your OS from:
+   https://github.com/ggerganov/llama.cpp/releases
+   Place the files in `llama_cpp/`.
+
+3. Open TextCorrector → **Settings** (tray icon → Settings or ⚙ in the popup):
+   - **Server binary**: point to `llama_cpp/llama-server.exe`
+   - **Model file**: point to your `.gguf` file
+
+4. The model is loaded on demand (first hotkey press or first chat message).
+   Enable **Keep model loaded** in Settings for instant response every time.
+
+---
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+Shift+Space` | Trigger correction (configurable) |
+| `Ctrl+Enter` | Accept & Paste corrected text |
+| `Escape` | Close popup |
+| `Enter` (in chat box) | Send chat message |
+
+---
+
+## Updating dependencies
+
+```bash
+python update.py          # Update Python packages
+python update.py --all    # Also update llama-server binary
+```
+
+---
+
+## Building a release
+
+```bash
+pip install pyinstaller
+python build.py
+```
+
+Produces `dist/TextCorrector_<version>_<platform>.zip` — self-contained, no Python required on target machine.
+
+---
+
+## Configuration reference
+
+Settings are in `config.json` (same folder as the script). All values are editable via the Settings dialog.
+
+| Key | Default | Description |
+|---|---|---|
+| `lt_enabled` | `true` | Enable LanguageTool grammar correction |
+| `lt_language` | `en-US` | LanguageTool language code (e.g. `de-DE`, `fr-FR`) |
+| `lt_disabled_rules` | `""` | Comma-separated rule IDs to suppress |
+| `hotkey` | `ctrl+shift+space` | Global trigger hotkey |
+| `model_path` | `""` | Path to GGUF model file |
+| `server_port` | `8080` | llama-server HTTP port |
+| `context_size` | `4096` | LLM context window (tokens) |
+| `gpu_layers` | `99` | GPU offload layers (0 = CPU only) |
+| `keep_model_loaded` | `true` | Keep LLM in memory between uses |
+| `temperature` | `0.1` | LLM temperature |
+| `top_k` | `40` | Top-K sampling |
+| `top_p` | `0.95` | Top-P sampling |
+| `min_p` | `0.05` | Min-P sampling |
+
+---
+
+## Troubleshooting
+
+**Hotkey not working:**
+- Windows: run `run.bat` as administrator.
+- macOS: grant Accessibility in System Settings → Privacy → Accessibility.
+- Linux: may require root or adding user to the `input` group.
+
+**LLM chat shows 503 error:**
+- The model server isn't running yet. Click the chat send button once more — the app will load the model and retry automatically.
+- Make sure the server binary and model file paths are set correctly in Settings.
+
+**LanguageTool makes a wrong correction (e.g. `exactl` → `exact` instead of `exactly`):**
+- LT uses edit-distance spelling and may prefer shorter candidates. This is a known LanguageTool limitation.
+- Use the **Ask AI** chat box to fix specific words after the initial correction (e.g. type "the word 'exact' should be 'exactly'").
+
+**App crashes / disappears:**
+- Check `app_debug.log` in the TextCorrector folder — all exceptions are now logged there.
 
 ---
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
-
----
-
-## Credits
-
-- **T5 Model**: HuggingFace Transformers
-- **ONNX Runtime**: Microsoft
-- **LLM**: Qwen3.5-2B by Alibaba
-- **UI**: PyQt5
-
----
-
-*All processing is 100% local. No internet connection required.*
+GPL v3 — see [LICENSE](LICENSE).

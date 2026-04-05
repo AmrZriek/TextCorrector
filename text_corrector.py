@@ -1,50 +1,67 @@
-import sys
-import re
-import difflib
-import os
-import threading
-import time
-import winreg
-import subprocess
-import json
-import requests
+"""
+TextCorrector v4.0
+==================
+Instant AI-powered text correction with a premium dark UI.
+
+Architecture
+------------
+- Autocorrect      : lightweight LLM via llama.cpp (loaded at boot, instant)
+- Chat / rewrite   : separate LLM via llama.cpp (lazy-load, unloads after idle)
+- GUI              : PyQt6, frameless dark-navy theme
+- Hotkey           : global keyboard hook → clipboard copy → correction popup
+
+Cross-platform: Windows / macOS / Linux.
+Single-file deployment (plus llama_cpp/ binary folder and LLM model .gguf).
+"""
+
+# ── stdlib ─────────────────────────────────────────────────────────────────
+import sys, re, os, threading, time, subprocess, json, socket
 from datetime import datetime
 from pathlib import Path
 
-# Enforce Qt scaling environment variables BEFORE importing PyQt
-os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
-os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
-os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+# ── Qt HiDPI env vars must be set before importing PyQt6 ───────────────────
+os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
+# ── third-party ─────────────────────────────────────────────────────────────
 import keyboard
 import pyperclip
-from PyQt5.QtWidgets import (
+import requests
+
+from PyQt6.QtWidgets import (
     QApplication,
     QSystemTrayIcon,
     QMenu,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QTextEdit,
     QPushButton,
     QLabel,
-    QHBoxLayout,
+    QLineEdit,
     QFileDialog,
     QCheckBox,
     QDialog,
-    QLineEdit,
     QComboBox,
-    QMessageBox,
-    QSplitter,
     QFrame,
-    QAction,
-    QActionGroup,
     QSizeGrip,
+    QScrollArea,
+    QSpinBox,
+    QDoubleSpinBox,
+    QSlider,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings, QThread, QPoint
-from PyQt5.QtGui import QIcon, QPixmap, QCursor
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QPoint, QSize
+from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QCursor, QAction
 
-# Get script directory for portable paths
-if getattr(sys, 'frozen', False):
+# ── Platform detection ───────────────────────────────────────────────────────
+WINDOWS = sys.platform == "win32"
+MACOS = sys.platform == "darwin"
+if WINDOWS:
+    import winreg
+
+# ── Portable base directory ──────────────────────────────────────────────────
+if getattr(sys, "frozen", False):
     SCRIPT_DIR = Path(sys.executable).parent.resolve()
 else:
     SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -54,3192 +71,2138 @@ LLAMA_CPP_DIR = SCRIPT_DIR / "llama_cpp"
 LOG_FILE = SCRIPT_DIR / "server_log.txt"
 DEBUG_LOG = SCRIPT_DIR / "app_debug.log"
 
+SERVER_EXE = "llama-server.exe" if WINDOWS else "llama-server"
 
-def log_debug(msg):
-    """Log debug message to file"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def log(msg: str):
     try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {msg}\n")
-    except:
-        pass
-
-
-def _has_nvidia_gpu() -> bool:
-    """Return True if an NVIDIA GPU with a working driver is detected."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            log_debug(f"GPU detected: {result.stdout.strip().splitlines()[0]}")
-            return True
+            f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
-    log_debug("No NVIDIA GPU detected — will use CPU mode (gpu_layers=0)")
-    return False
 
 
-# Default system prompt — used when user hasn't set a custom one
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a text correction engine. Your ONLY task is to proofread and refine text.\n\n"
-    "CRITICAL RULES - FOLLOW EXACTLY:\n"
-    "1. Output ONLY the corrected text - absolutely nothing else\n"
-    "2. NEVER add: 'Here is', 'Sure', 'Corrected:', 'The corrected version', or ANY preamble\n"
-    "3. NEVER add explanations, commentary, or questions\n"
-    "4. NEVER wrap output in quotes, markdown, or code blocks\n"
-    "5. If text is perfect, return it exactly as-is\n"
-    "6. Fix only: spelling, grammar, punctuation, and minor word choice\n"
-    "7. Maintain original meaning, tone, and style precisely\n"
-    "8. PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines\n"
-    "9. Maintain original formatting exactly, including multiple line breaks"
-)
+def has_nvidia() -> bool:
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            **({"creationflags": 0x08000000} if WINDOWS else {}),
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
 
 
-def strip_thinking_tokens(text):
-    """Strip thinking/reasoning blocks from model output.
+def friendly_name(path: str) -> str:
+    n = os.path.basename(path).replace(".gguf", "")
+    for old, new in [
+        ("-it-", " IT "),
+        ("-F16", " F16"),
+        ("-BF16", " BF16"),
+        ("-Q4_K_M", " Q4_K_M"),
+        ("-Q8_0", " Q8"),
+        ("-Q4_K_XL", " Q4_K_XL"),
+        ("-IQ4_NL", " IQ4"),
+        ("-GGUF", ""),
+        ("-gguf", ""),
+    ]:
+        n = n.replace(old, new)
+    return n
 
-    Handles various formats:
-    - <think>...</think> (Qwen3, DeepSeek)
-    - <thinking>...</thinking> (some models)
-    - <reasoning>...</reasoning> (alternative format)
-    """
+
+def strip_think(text: str) -> str:
     if not text:
         return text
-
-    # Remove various thinking block formats (including multiline content)
-    thinking_patterns = [
-        (r"<think>.*?</think>", re.DOTALL),  # Qwen3, DeepSeek
-        (r"<thinking>.*?</thinking>", re.DOTALL),  # Alternative format
-        (r"<reasoning>.*?</reasoning>", re.DOTALL),  # Alternative format
-    ]
-
-    cleaned = text
-    for pattern, flags in thinking_patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=flags)
-
-    # Also handle unclosed thinking tags (model may not close them)
-    unclosed_patterns = [
-        r"<think>.*",
-        r"<thinking>.*",
-        r"<reasoning>.*",
-    ]
-    for pattern in unclosed_patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL)
-
-    return cleaned.strip()
+    for pat in [
+        r"<think>.*?</think>",
+        r"<thinking>.*?</thinking>",
+        r"<reasoning>.*?</reasoning>",
+    ]:
+        text = re.sub(pat, "", text, flags=re.DOTALL)
+    for pat in [r"<think>.*", r"<thinking>.*", r"<reasoning>.*"]:
+        text = re.sub(pat, "", text, flags=re.DOTALL)
+    return text
 
 
-def strip_meta_commentary(text, original_text=""):
-    """Strip common meta-commentary prefixes that models add."""
+def strip_preamble(text: str, original: str = "") -> str:
     if not text:
         return text
-    # Comprehensive list of preamble patterns models add
-    preamble_patterns = [
-        r"^(?:Here(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:Sure[,!]? [Hh]ere(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
+    patterns = [
+        r"^(?:Here(?:'s| is)(?: the)? corrected (?:text|version)[:\.]?\s*\n?)",
+        r"^(?:Sure[,!]? [Hh]ere(?:'s| is)(?: the)? corrected (?:text|version)[:\.]?\s*\n?)",
         r"^(?:Corrected (?:text|version)[:\.]?\s*\n?)",
         r"^(?:The corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I(?:\'ve| have) corrected the (?:text|text for you)[:\.]?\s*\n?)",
-        r"^(?:Below is the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:This is the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I\'ve proofread and refined the text[:\.]?\s*\n?)",
-        r"^(?:I\'ve made the following corrections[:\.]?\s*\n?)",
-        r"^\*\*Corrected(?: text)?\*\*[:\.]?\s*\n?",  # Markdown bold
-        r"^#+\s*Corrected(?: text)?[:\.]?\s*\n?",  # Markdown headers
-        r"^[-*]{3,}\s*\n?",  # Separator lines
-        r"^(?:Here are the corrections?[:\.]?\s*\n?)",
-        r"^(?:The refined (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I\'ve reviewed and corrected[:\.]?\s*\n?)",
-        r"^(?:I\'ve proofread (?:and refined )?your text[:\.]?\s*\n?)",
-        r"^(?:Here is the refined (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:The text has been corrected[:\.]?\s*\n?)",
-        r"^(?:Your text,? corrected[:\.]?\s*\n?)",
+        r"^(?:I(?:'ve| have) corrected(?: the)? (?:text|text for you)[:\.]?\s*\n?)",
+        r"^\*\*Corrected(?: text)?\*\*[:\.]?\s*\n?",
+        r"^#+\s*Corrected(?: text)?[:\.]?\s*\n?",
+        r"^[-*]{3,}\s*\n?",
     ]
     cleaned = text
-    for pattern in preamble_patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-    # Strip wrapping quotes if the entire output is quoted
+    for p in patterns:
+        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip()
-    # Only strip quotes if the model added them (not if original had quotes)
     if len(cleaned) > 2 and cleaned[0] == '"' and cleaned[-1] == '"':
-        if not (original_text.startswith('"') and original_text.endswith('"')):
+        if not (original.startswith('"') and original.endswith('"')):
             cleaned = cleaned[1:-1]
-    if len(cleaned) > 2 and cleaned[0] == "'" and cleaned[-1] == "'":
-        if not (original_text.startswith("'") and original_text.endswith("'")):
-            cleaned = cleaned[1:-1]
-    # Strip markdown code blocks if wrapping the entire output
     if cleaned.startswith("```") and cleaned.endswith("```"):
         lines = cleaned.split("\n")
-        if len(lines) >= 2:
-            # Remove first and last lines (the ``` markers)
+        if len(lines) >= 3:
             cleaned = "\n".join(lines[1:-1])
     return cleaned.strip()
 
 
-def contains_meta_commentary(text):
-    """Check if text still contains meta-commentary after stripping."""
-    if not text:
-        return False
+def _apply_patches(original: str, patches: list[dict]) -> str:
+    """Apply a list of word-level patches to the original text.
 
-    # Patterns that indicate the model is being conversational
-    conversational_patterns = [
-        r"^\s*(?:Here|Sure|Okay|Alright|So|Well|Now)[,\s]+",
-        r"^\s*(?:I\s+(?:think|believe|feel|would say)|In my (?:opinion|view))",
-        r"^\s*(?:The\s+(?:corrected|refined)\s+(?:text|version))",
-        r"^\s*(?:I\s+(?:have|ve)\s+(?:corrected|fixed|updated))",
-        r"\n\n(?:Let me know|I hope|Feel free|If you need)",
-        r"\*\*\s*(?:Note|Important|Warning)",
-        r"^\s*[:\-]+\s*",  # Lines starting with just punctuation
-    ]
+    Each patch is a dict with keys:
+      - "old": the wrong word/phrase to find
+      - "new": the corrected replacement
 
-    for pattern in conversational_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
+    Uses regex with negative lookbehind/lookahead for safe replacement.
+    Handles punctuation adjacency (e.g., "Hello,world") and multiple occurrences
+    by replacing only the first match per patch.
+    """
+    result = original
+    for patch in patches:
+        old_word = patch.get("old", "").strip()
+        new_word = patch.get("new", "").strip()
+        if not old_word or not new_word:
+            continue
+        escaped = re.escape(old_word)
+        # Use negative lookbehind/lookahead instead of \b to handle punctuation adjacency
+        # Matches word not preceded/followed by letter (allows punctuation boundaries)
+        pattern = re.compile(rf"(?<![a-zA-Z]){escaped}(?![a-zA-Z])", re.IGNORECASE)
+        if pattern.search(result):
+            result = pattern.sub(new_word, result, count=1)
+    return result
+
+
+def _extract_patches_from_response(raw: str) -> list[dict]:
+    """Extract JSON patch array from LLM response.
+
+    Handles cases where the model wraps JSON in markdown code fences
+    or adds explanatory text around it.
+    """
+    cleaned = strip_think(raw)
+    cleaned = strip_preamble(cleaned)
+
+    # Try direct JSON array parse
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find JSON array in the text
+    array_match = re.search(r"\[[\s\S]*\]", cleaned)
+    if array_match:
+        try:
+            data = json.loads(array_match.group(0))
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Try to find JSON object with "patches" key
+    obj_match = re.search(r"\{[\s\S]*\}", cleaned)
+    if obj_match:
+        try:
+            data = json.loads(obj_match.group(0))
+            if isinstance(data, dict) and "patches" in data:
+                return data["patches"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return []
+
+
+# ── Scroll-wheel ignore helper ────────────────────────────────────────────────
+class _IgnoreWheelFilter(QObject):
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+
+        if event.type() == QEvent.Type.Wheel:
+            event.ignore()
             return True
-
-    # Check for multiple sentences that look like explanations
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
-    if len(sentences) > 3:
-        # If there are many short sentences, might be commentary
-        short_sentences = sum(1 for s in sentences if len(s.split()) < 5)
-        if short_sentences > len(sentences) / 2:
-            return True
-
-    return False
+        return super().eventFilter(obj, event)
 
 
-# Default configuration
-DEFAULT_CONFIG = {
-    "llama_server_path": str(LLAMA_CPP_DIR / "llama-server.exe"),
+_IGNORE_WHEEL = _IgnoreWheelFilter()
+
+
+def no_scroll(widget):
+    widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_IGNORE_WHEEL)
+    return widget
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CONFIG: dict = {
+    # llama.cpp
+    "llama_server_path": str(LLAMA_CPP_DIR / SERVER_EXE),
     "model_path": "",
     "server_host": "127.0.0.1",
     "server_port": 8080,
-    "hotkey": "ctrl+shift+space",
-    "keep_model_loaded": True,
-    "idle_timeout_seconds": 300,
     "context_size": 4096,
-    "gpu_layers": 99,  # Full GPU offload (CUDA)
-    "recent_models": [],
-    "temperature": 0.0,  # 0.0 for deterministic outputs (prevents chatty responses)
+    "gpu_layers": 99,
+    "temperature": 0.1,
     "top_k": 40,
     "top_p": 0.95,
     "min_p": 0.05,
-    "frequency_penalty": 0.0,
-    "presence_penalty": 0.0,
-    "repeat_penalty": 1.0,
-    "onnx_model_dir": "",  # ONNX model directory
+    "keep_model_loaded": True,
+    "idle_timeout_seconds": 300,
+    "recent_models": [],
+    # Autocorrect model
+    "ac_model_path": "",
+    "ac_same_as_chat": True,
+    # Hotkey
+    "hotkey": "ctrl+shift+space",
+    # Misc
+    "system_prompt": "",
+    # Correction aggressiveness: 0=Minimal … 4=Full Rewrite
+    "correction_strength": 2,
 }
 
 
-def discover_models():
-    """Find all .gguf files in the app directory"""
-    models = []
-    for f in SCRIPT_DIR.glob("*.gguf"):
-        models.append(str(f))
-    return sorted(models)
-
-
-def friendly_model_name(path):
-    """Get a friendly display name from a GGUF filename"""
-    name = os.path.basename(path)
-    name = name.replace(".gguf", "")
-    # Common transformations
-    name = name.replace("-it-", " IT ")
-    name = name.replace("-F16", " (F16)")
-    name = name.replace("-BF16", " (BF16)")
-    name = name.replace("-Q4_K_M", " (Q4_K_M)")
-    name = name.replace("-Q8_0", " (Q8)")
-    name = name.replace("-IQ4_NL", " (IQ4)")
-    return name
-
-
 class ConfigManager:
-    """Manages application configuration with JSON file"""
-
     def __init__(self):
-        self.config = self.load_config()
-        self._auto_detect_model()
+        self.config = self._load()
+        self._auto_detect()
 
-    def _auto_detect_model(self):
-        """Auto-detect a model if none is configured or the configured one doesn't exist"""
-        model_path = self.config.get("model_path", "")
-        if not model_path or not os.path.exists(model_path):
-            models = discover_models()
-            if models:
-                self.config["model_path"] = models[0]
-                # Also populate recent_models
-                self.config["recent_models"] = models
-                self.save_config()
-
-    def load_config(self):
-        """Load configuration from file or create default"""
+    def _load(self) -> dict:
+        cfg = DEFAULT_CONFIG.copy()
         if CONFIG_FILE.exists():
             try:
-                with open(CONFIG_FILE, "r") as f:
-                    config = json.load(f)
-                    # Merge with defaults to ensure all keys exist
-                    for key, value in DEFAULT_CONFIG.items():
-                        if key not in config:
-                            config[key] = value
-                    return config
+                with open(CONFIG_FILE) as f:
+                    saved = json.load(f)
+                cfg.update(saved)
             except Exception as e:
-                print(f"Error loading config: {e}")
-                return DEFAULT_CONFIG.copy()
-        return DEFAULT_CONFIG.copy()
+                log(f"Config load error: {e}")
+        return cfg
 
-    def save_config(self):
-        """Save configuration to file"""
+    def save(self):
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(self.config, f, indent=2)
         except Exception as e:
-            print(f"Error saving config: {e}")
+            log(f"Config save error: {e}")
+
+    def _auto_detect(self):
+        path = self.config.get("model_path", "")
+        if not path or not Path(path).exists():
+            gguf = sorted(SCRIPT_DIR.glob("*.gguf"))
+            if gguf:
+                self.config["model_path"] = str(gguf[0])
+                self.config["recent_models"] = [str(p) for p in gguf]
+                self.save()
+        if self.config.get("ac_same_as_chat", True):
+            self.config["ac_model_path"] = self.config.get("model_path", "")
 
     def get(self, key, default=None):
         return self.config.get(key, default)
 
     def set(self, key, value):
         self.config[key] = value
-        self.save_config()
+        self.save()
 
-    def add_recent_model(self, model_path):
-        """Add a model to recent models list"""
-        recent = self.config.get("recent_models", [])
-        if model_path in recent:
-            recent.remove(model_path)
-        recent.insert(0, model_path)
-        # Keep only last 10
-        self.config["recent_models"] = recent[:10]
-        self.save_config()
+    def add_recent(self, path: str):
+        r = self.config.get("recent_models", [])
+        if path in r:
+            r.remove(path)
+        r.insert(0, path)
+        self.config["recent_models"] = r[:10]
+        self.save()
 
 
-# ---------------------------------------------------------------------------
-# Qt key constant → keyboard-lib name mapping
-# ---------------------------------------------------------------------------
-_QT_KEY_NAMES = {
-    Qt.Key_Space: "space",
-    Qt.Key_Return: "enter",
-    Qt.Key_Enter: "enter",
-    Qt.Key_Tab: "tab",
-    Qt.Key_Backspace: "backspace",
-    Qt.Key_Delete: "delete",
-    Qt.Key_Escape: "escape",
-    Qt.Key_Home: "home",
-    Qt.Key_End: "end",
-    Qt.Key_PageUp: "page up",
-    Qt.Key_PageDown: "page down",
-    Qt.Key_Left: "left",
-    Qt.Key_Right: "right",
-    Qt.Key_Up: "up",
-    Qt.Key_Down: "down",
-    Qt.Key_Insert: "insert",
-    Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4",
-    Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
-    Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
-    Qt.Key_Semicolon: ";",
-    Qt.Key_Equal: "=",
-    Qt.Key_Minus: "-",
-    Qt.Key_BracketLeft: "[",
-    Qt.Key_BracketRight: "]",
-    Qt.Key_Backslash: "\\\\",
-    Qt.Key_Apostrophe: "'",
-    Qt.Key_Comma: ",",
-    Qt.Key_Period: ".",
-    Qt.Key_Slash: "/",
-    Qt.Key_QuoteLeft: "`",
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hotkey recorder widget
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_QT_KEYS = {
+    Qt.Key.Key_Space: "space",
+    Qt.Key.Key_Return: "enter",
+    Qt.Key.Key_Enter: "enter",
+    Qt.Key.Key_Tab: "tab",
+    Qt.Key.Key_Backspace: "backspace",
+    Qt.Key.Key_Delete: "delete",
+    Qt.Key.Key_Escape: "escape",
+    Qt.Key.Key_Home: "home",
+    Qt.Key.Key_End: "end",
+    Qt.Key.Key_PageUp: "page up",
+    Qt.Key.Key_PageDown: "page down",
+    Qt.Key.Key_Left: "left",
+    Qt.Key.Key_Right: "right",
+    Qt.Key.Key_Up: "up",
+    Qt.Key.Key_Down: "down",
+    Qt.Key.Key_F1: "f1",
+    Qt.Key.Key_F2: "f2",
+    Qt.Key.Key_F3: "f3",
+    Qt.Key.Key_F4: "f4",
+    Qt.Key.Key_F5: "f5",
+    Qt.Key.Key_F6: "f6",
+    Qt.Key.Key_F7: "f7",
+    Qt.Key.Key_F8: "f8",
+    Qt.Key.Key_F9: "f9",
+    Qt.Key.Key_F10: "f10",
+    Qt.Key.Key_F11: "f11",
+    Qt.Key.Key_F12: "f12",
 }
-
-_MODIFIER_KEYS = {
-    Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt,
-    Qt.Key_Meta, Qt.Key_AltGr, Qt.Key_Super_L, Qt.Key_Super_R,
+_MOD_KEYS = {
+    Qt.Key.Key_Control,
+    Qt.Key.Key_Shift,
+    Qt.Key.Key_Alt,
+    Qt.Key.Key_Meta,
+    Qt.Key.Key_AltGr,
 }
-
-
-def _combo_to_display(combo: str) -> str:
-    """Convert 'ctrl+shift+space' → 'Ctrl + Shift + Space' for display."""
-    parts = combo.split("+")
-    return " + ".join(p.capitalize() for p in parts)
 
 
 class HotkeyEdit(QLineEdit):
-    """Windows-style hotkey recorder.
+    shortcut_changed = pyqtSignal(str)
 
-    Click → enters recording mode (shows 'Press keys…', border pulses blue).
-    Hold modifiers + press a key → captures the combo and exits.
-    Escape → cancels and reverts to the previous shortcut.
-    Modifier-only combos (e.g. just Ctrl) are rejected with a hint.
-    Focus-out → auto-cancels recording.
+    _IDLE = """
+        QLineEdit { background: rgba(5,14,40,0.7); border: 1px solid rgba(59,130,246,0.25);
+                    border-radius: 8px; padding: 8px 14px; color: #e2e8f0; font-size: 13px; }
+        QLineEdit:hover { border: 1px solid rgba(59,130,246,0.5); }
     """
-
-    shortcut_changed = pyqtSignal(str)  # emitted with keyboard-lib string
-
-    _IDLE_STYLE = (
-        "QLineEdit {"
-        "  background-color: rgba(15, 23, 42, 0.6);"
-        "  border: 1px solid rgba(255, 255, 255, 0.15);"
-        "  border-radius: 8px;"
-        "  padding: 8px 14px;"
-        "  color: #f8fafc;"
-        "  font-size: 13px;"
-        "}"
-        "QLineEdit:hover {"
-        "  border: 1px solid rgba(56, 189, 248, 0.45);"
-        "  cursor: pointer;"
-        "}"
-    )
-    _RECORDING_STYLE = (
-        "QLineEdit {"
-        "  background-color: rgba(14, 165, 233, 0.12);"
-        "  border: 2px solid rgba(56, 189, 248, 0.8);"
-        "  border-radius: 8px;"
-        "  padding: 8px 14px;"
-        "  color: #38bdf8;"
-        "  font-size: 13px;"
-        "}"
-    )
+    _REC = """
+        QLineEdit { background: rgba(37,99,235,0.15); border: 2px solid rgba(96,165,250,0.8);
+                    border-radius: 8px; padding: 8px 14px; color: #93c5fd; font-size: 13px; }
+    """
 
     def __init__(self, parent=None, re_register_cb=None):
         super().__init__(parent)
-        self._combo = ""          # keyboard-lib format, e.g. 'ctrl+shift+space'
+        self._combo = ""
         self._recording = False
-        self._re_register_cb = re_register_cb  # called on cancel to restore hotkey
+        self._re_register_cb = re_register_cb
         self.setReadOnly(True)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet(self._IDLE_STYLE)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self._update_display()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(self._IDLE)
+        self._refresh()
 
-    # ------------------------------------------------------------------
-    # Public API — mirrors QLineEdit so save/load code needs no changes
-    # ------------------------------------------------------------------
     def text(self) -> str:
         return self._combo
 
-    def setText(self, value: str):
-        self._combo = value.lower().strip()
+    def setText(self, val: str):
+        self._combo = val.lower().strip()
         self._recording = False
-        self.setStyleSheet(self._IDLE_STYLE)
-        self._update_display()
+        self.setStyleSheet(self._IDLE)
+        self._refresh()
 
-    # ------------------------------------------------------------------
-    # Display helpers
-    # ------------------------------------------------------------------
-    def _update_display(self):
-        """Refresh the visible label from self._combo."""
-        if self._combo:
-            super().setText(_combo_to_display(self._combo))
-        else:
-            super().setText("Click to record shortcut")
+    def _refresh(self):
+        display = (
+            " + ".join(p.capitalize() for p in self._combo.split("+"))
+            if self._combo
+            else "Click to record"
+        )
+        super().setText(display)
 
-    def _set_display(self, label: str):
-        """Update only the visible text, leaving self._combo untouched."""
-        super().setText(label)
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and not self._recording:
+            self._recording = True
+            self.setStyleSheet(self._REC)
+            super().setText("Press keys…")
+            try:
+                keyboard.unhook_all_hotkeys()
+            except Exception:
+                pass
 
-    # ------------------------------------------------------------------
-    # Recording lifecycle
-    # ------------------------------------------------------------------
-    def _start_recording(self):
-        self._recording = True
-        self.setStyleSheet(self._RECORDING_STYLE)
-        self._set_display("Press keys…")
-        # Temporarily pause the global keyboard hook so it doesn't
-        # swallow modifier+key combos before Qt sees them.
-        try:
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
+    def focusOutEvent(self, e):
+        if self._recording:
+            self._recording = False
+            self.setStyleSheet(self._IDLE)
+            self._refresh()
+            if self._re_register_cb:
+                try:
+                    self._re_register_cb()
+                except Exception:
+                    pass
+        super().focusOutEvent(e)
 
-    def _cancel_recording(self):
+    def keyPressEvent(self, e):
+        if not self._recording:
+            return
+        key = e.key()
+        mods = e.modifiers()
+        if key == Qt.Key.Key_Escape:
+            self._recording = False
+            self.setStyleSheet(self._IDLE)
+            self._refresh()
+            if self._re_register_cb:
+                try:
+                    self._re_register_cb()
+                except Exception:
+                    pass
+            return
+        if key in _MOD_KEYS:
+            return
+        parts = []
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("ctrl")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("shift")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("alt")
+        if not parts:
+            super().setText("Add Ctrl / Shift / Alt…")
+            return
+        kn = _QT_KEYS.get(key) or (e.text().lower() or None)
+        if not kn:
+            return
+        parts.append(kn)
+        combo = "+".join(parts)
         self._recording = False
-        self.setStyleSheet(self._IDLE_STYLE)
-        self._update_display()
-        # Re-register the hotkey that was unhooked when recording started
+        self._combo = combo
+        self.setStyleSheet(self._IDLE)
+        self._refresh()
+        self.shortcut_changed.emit(combo)
         if self._re_register_cb:
             try:
                 self._re_register_cb()
             except Exception:
                 pass
 
-    def _finish_recording(self, combo: str):
-        self._recording = False
-        self._combo = combo
-        self.setStyleSheet(self._IDLE_STYLE)
-        self._update_display()
-        self.shortcut_changed.emit(combo)
 
-    # ------------------------------------------------------------------
-    # Mouse / focus events
-    # ------------------------------------------------------------------
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self._recording:
-            self._start_recording()
-            self.setFocus()
-        else:
-            super().mousePressEvent(event)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Streaming worker  (llama.cpp SSE)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    def focusOutEvent(self, event):
-        if self._recording:
-            self._cancel_recording()
-        super().focusOutEvent(event)
 
-    # ------------------------------------------------------------------
-    # Key capture
-    # ------------------------------------------------------------------
-    def keyPressEvent(self, event):
-        if not self._recording:
-            return  # read-only — ignore normal typing
+class StreamWorker(QThread):
+    token = pyqtSignal(str)
+    done = pyqtSignal(str)
+    error = pyqtSignal(str)
 
-        key = event.key()
-        mods = event.modifiers()
-
-        # Escape → cancel
-        if key == Qt.Key_Escape:
-            self._cancel_recording()
-            return
-
-        # Ignore standalone modifier presses — wait for the trigger key
-        if key in _MODIFIER_KEYS:
-            return
-
-        # Build modifier prefix
-        parts = []
-        if mods & Qt.ControlModifier:
-            parts.append("ctrl")
-        if mods & Qt.ShiftModifier:
-            parts.append("shift")
-        if mods & Qt.AltModifier:
-            parts.append("alt")
-
-        # Require at least one modifier
-        if not parts:
-            self._set_display("Add Ctrl / Shift / Alt…")
-            return
-
-        # Resolve the trigger key name
-        if key in _QT_KEY_NAMES:
-            key_name = _QT_KEY_NAMES[key]
-        else:
-            key_text = event.text().lower()
-            key_name = key_text if key_text else None
-
-        if not key_name:
-            return  # unknown key — stay in recording mode
-
-        parts.append(key_name)
-        self._finish_recording("+".join(parts))
-
-    def keyReleaseEvent(self, event):
-        # Intentionally suppressed while recording
-        if not self._recording:
-            super().keyReleaseEvent(event)
-
-
-class SettingsDialog(QDialog):
-    """Settings dialog for configuring the application"""
-
-    settings_changed = pyqtSignal()
-
-    def __init__(self, config_manager, parent=None, re_register_cb=None):
-        super().__init__(parent)
-        self.config = config_manager
-        self._re_register_cb = re_register_cb
-        
-        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.dragging = False
-        self.drag_position = None
-        
-        self.setWindowTitle("Text Corrector Settings")
-        
-        # Lower minimum size to allow shrinking on smaller scaled displays
-        self.setMinimumSize(450, 450)
-        
-        # Initialize ONNX directory edit
-        self.onnx_dir_edit = None
-        
-        # Dynamically size to prevent being massive on smaller screens
-        cursor_pos = QCursor.pos()
-        screen = QApplication.screenAt(cursor_pos)
-        if not screen:
-            screen = QApplication.primaryScreen()
-        screen_rect = screen.geometry()
-
-        base_width = 700
-        base_height = 750
-        max_width = int(screen_rect.width() * 0.8)
-        max_height = int(screen_rect.height() * 0.85)
-        
-        window_width = min(base_width, max_width)
-        window_height = min(base_height, max_height)
-        
-        self.resize(window_width, window_height)
-        
-        self.setup_ui()
-        self.load_settings()
-
-    def setup_ui(self):
-        # We need an outer layout and a styled main widget to handle translucent corners
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        
-        main_widget = QWidget()
-        main_widget.setObjectName("settingsMainWidget")
-        outer_layout.addWidget(main_widget)
-        
-        layout = QVBoxLayout(main_widget)
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        # Style - matching premium dark slate-blue theme
-        self.setStyleSheet("""
-            QWidget#settingsMainWidget {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0f172a, stop:0.5 #1e293b, stop:1 #0f172a);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 16px;
-                color: #f8fafc;
-            }
-            QLabel {
-                color: #e2e8f0;
-                font-size: 13px;
-                background: transparent;
-            }
-            QLineEdit {
-                background-color: rgba(15, 23, 42, 0.6);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 8px;
-                padding: 8px 12px;
-                color: #f8fafc;
-                font-size: 13px;
-            }
-            QLineEdit:focus {
-                border: 1px solid rgba(56, 189, 248, 0.6);
-                background-color: rgba(15, 23, 42, 0.8);
-            }
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0ea5e9, stop:1 #38bdf8);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 8px;
-                padding: 8px 18px;
-                color: #ffffff;
-                font-weight: 600;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0284c7, stop:1 #0ea5e9);
-                border: 1px solid rgba(255, 255, 255, 0.3);
-            }
-            QCheckBox {
-                color: #e2e8f0;
-                font-size: 13px;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 4px;
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                background: rgba(15, 23, 42, 0.6);
-            }
-            QCheckBox::indicator:checked {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0ea5e9, stop:1 #38bdf8);
-                border: 1px solid rgba(56, 189, 248, 0.5);
-            }
-            QComboBox {
-                background-color: rgba(15, 23, 42, 0.6);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 8px;
-                padding: 6px 12px;
-                color: #f8fafc;
-                font-size: 13px;
-            }
-            QComboBox:hover {
-                border: 1px solid rgba(56, 189, 248, 0.5);
-            }
-            QComboBox::drop-down {
-                border: none;
-                padding-right: 8px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #1e293b;
-                color: #f8fafc;
-                selection-background-color: #0ea5e9;
-                selection-color: white;
-                border: 1px solid rgba(255, 255, 255, 0.10);
-            }
-        """)
-
-        # Custom Title Bar
-        title_bar = QHBoxLayout()
-        title_label = QLabel("Text Corrector Settings")
-        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #f8fafc;")
-        
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(30, 30)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: none;
-                color: #94a3b8;
-                font-size: 16px;
-                font-weight: bold;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background: #ef4444;
-                color: white;
-                border-radius: 6px;
-            }
-        """)
-        close_btn.clicked.connect(self.reject)
-        
-        title_bar.addWidget(title_label)
-        title_bar.addStretch()
-        title_bar.addWidget(close_btn)
-        layout.addLayout(title_bar)
-
-        # Llama Server Path
-        server_layout = QHBoxLayout()
-        server_layout.addWidget(QLabel("Llama Server:"))
-        self.server_path_edit = QLineEdit()
-        self.server_path_edit.setReadOnly(True)
-        server_layout.addWidget(self.server_path_edit)
-        browse_server_btn = QPushButton("Browse...")
-        browse_server_btn.clicked.connect(self.browse_server)
-        server_layout.addWidget(browse_server_btn)
-        layout.addLayout(server_layout)
-
-        # Model Path
-        model_h_layout = QHBoxLayout()
-        model_h_layout.addWidget(QLabel("Model File:"))
-        self.model_path_edit = QLineEdit()
-        self.model_path_edit.setReadOnly(True)
-        model_h_layout.addWidget(self.model_path_edit)
-        browse_model_btn = QPushButton("Browse...")
-        browse_model_btn.clicked.connect(self.browse_model)
-        model_h_layout.addWidget(browse_model_btn)
-        layout.addLayout(model_h_layout)
-
-        # ONNX Model Directory
-        onnx_label = QLabel("ONNX Model Directory:")
-        onnx_label.setStyleSheet("font-weight: bold; color: #ffffff;")
-        settings_layout = QHBoxLayout()
-        self.onnx_dir_edit = QLineEdit()
-        self.onnx_dir_edit.setPlaceholderText("Path to ONNX model folder (e.g., onnx_models/grammar_t5/)")
-        self.onnx_dir_edit.setStyleSheet("""
-            QLineEdit {
-                background: rgba(255, 255, 255, 0.1);
-                border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 4px;
-                padding: 8px;
-                color: #ffffff;
-            }
-            QLineEdit:focus {
-                border: 1px solid rgba(100, 150, 255, 0.5);
-                background: rgba(255, 255, 255, 0.15);
-            }
-        """)
-        settings_layout.addWidget(self.onnx_dir_edit)
-
-        onnx_browse_btn = QPushButton("Browse...")
-        onnx_browse_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        onnx_browse_btn.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4a9eff, stop:1 #0066cc);
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                color: white;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #5aafff, stop:1 #1077dd);
-            }
-            QPushButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #3a8eef, stop:1 #0055bb);
-            }
-        """)
-        settings_layout.addWidget(onnx_browse_btn)
-        layout.addLayout(settings_layout)
-
-        # Connect browse button
-        onnx_browse_btn.clicked.connect(self.browse_onnx)
-
-        # Add info label
-        onnx_info = QLabel("💡 Uses T5 model for fast grammar correction. Leave empty to use LLM only.")
-        onnx_info.setWordWrap(True)
-        onnx_info.setStyleSheet("color: #888888; font-size: 11px;")
-        layout.addWidget(onnx_info)
-
-        # Recent Models
-        recent_layout = QHBoxLayout()
-        recent_layout.addWidget(QLabel("Recent Models:"))
-        self.recent_combo = QComboBox()
-        self.recent_combo.setMinimumWidth(300)
-        self.recent_combo.currentTextChanged.connect(self.on_recent_selected)
-        recent_layout.addWidget(self.recent_combo)
-        layout.addLayout(recent_layout)
-
-        # Server Settings
-        settings_layout = QHBoxLayout()
-
-        settings_layout.addWidget(QLabel("Port:"))
-        self.port_edit = QLineEdit()
-        self.port_edit.setFixedWidth(80)
-        settings_layout.addWidget(self.port_edit)
-
-        settings_layout.addWidget(QLabel("Context:"))
-        self.context_edit = QLineEdit()
-        self.context_edit.setFixedWidth(80)
-        settings_layout.addWidget(self.context_edit)
-
-        settings_layout.addWidget(QLabel("GPU Layers:"))
-        self.gpu_layers_edit = QLineEdit()
-        self.gpu_layers_edit.setFixedWidth(80)
-        settings_layout.addWidget(self.gpu_layers_edit)
-
-        settings_layout.addStretch()
-        layout.addLayout(settings_layout)
-
-        # Model Behavior
-        behavior_layout = QVBoxLayout()
-
-        self.keep_loaded_check = QCheckBox("Keep model loaded (disable auto-unload)")
-        self.keep_loaded_check.setToolTip(
-            "If checked, model stays in VRAM until you manually unload it"
-        )
-        behavior_layout.addWidget(self.keep_loaded_check)
-
-        timeout_layout = QHBoxLayout()
-        timeout_layout.addWidget(QLabel("Auto-unload after (seconds):"))
-        self.timeout_edit = QLineEdit()
-        self.timeout_edit.setFixedWidth(100)
-        timeout_layout.addWidget(self.timeout_edit)
-        timeout_layout.addStretch()
-        behavior_layout.addLayout(timeout_layout)
-
-        layout.addLayout(behavior_layout)
-
-        # Generation Parameters
-        gen_layout1 = QHBoxLayout()
-        gen_layout1.addWidget(QLabel("Temperature:"))
-        self.temp_edit = QLineEdit()
-        self.temp_edit.setFixedWidth(50)
-        gen_layout1.addWidget(self.temp_edit)
-
-        gen_layout1.addWidget(QLabel("Top K:"))
-        self.topk_edit = QLineEdit()
-        self.topk_edit.setFixedWidth(50)
-        gen_layout1.addWidget(self.topk_edit)
-
-        gen_layout1.addWidget(QLabel("Top P:"))
-        self.topp_edit = QLineEdit()
-        self.topp_edit.setFixedWidth(50)
-        gen_layout1.addWidget(self.topp_edit)
-
-        gen_layout1.addWidget(QLabel("Min P:"))
-        self.minp_edit = QLineEdit()
-        self.minp_edit.setFixedWidth(50)
-        gen_layout1.addWidget(self.minp_edit)
-        gen_layout1.addStretch()
-        layout.addLayout(gen_layout1)
-
-        gen_layout2 = QHBoxLayout()
-        gen_layout2.addWidget(QLabel("Repetition:"))
-        self.repeat_edit = QLineEdit()
-        self.repeat_edit.setFixedWidth(50)
-        self.repeat_edit.setToolTip("Repetition Penalty (1.0 = standard, usually 1.1 - 1.2 to penalize)")
-        gen_layout2.addWidget(self.repeat_edit)
-
-        gen_layout2.addWidget(QLabel("Freq Pen:"))
-        self.freq_edit = QLineEdit()
-        self.freq_edit.setFixedWidth(50)
-        self.freq_edit.setToolTip(
-            "Frequency Penalty (0.0 - 2.0). Higher values reduce repetition."
-        )
-        gen_layout2.addWidget(self.freq_edit)
-
-        gen_layout2.addWidget(QLabel("Pres Pen:"))
-        self.pres_edit = QLineEdit()
-        self.pres_edit.setFixedWidth(50)
-        self.pres_edit.setToolTip(
-            "Presence Penalty (0.0 - 2.0). Higher values encourage new topics."
-        )
-        gen_layout2.addWidget(self.pres_edit)
-
-        gen_layout2.addStretch()
-        layout.addLayout(gen_layout2)
-
-        # Hotkey — Windows-style live recorder
-        hotkey_layout = QHBoxLayout()
-        hotkey_layout.addWidget(QLabel("Hotkey:"))
-        self.hotkey_edit = HotkeyEdit(re_register_cb=self._re_register_cb)
-        self.hotkey_edit.setToolTip(
-            "Click, then press your desired key combination (e.g. Ctrl+Shift+Space).\n"
-            "Escape cancels. A modifier key (Ctrl/Shift/Alt) is required."
-        )
-        hotkey_layout.addWidget(self.hotkey_edit)
-        layout.addLayout(hotkey_layout)
-
-        # System Prompt
-        prompt_label = QLabel("System Prompt:")
-        prompt_label.setToolTip(
-            "Customize the instruction sent to the model. Leave empty for default."
-        )
-        layout.addWidget(prompt_label)
-
-        self.prompt_edit = QTextEdit()
-        self.prompt_edit.setPlaceholderText(
-            "Leave empty to use default prompt. Custom prompt overrides the built-in instruction."
-        )
-        self.prompt_edit.setMaximumHeight(90)
-        layout.addWidget(self.prompt_edit)
-
-        # Info
-        info_label = QLabel("Note: Changes take effect after restart")
-        info_label.setStyleSheet("color: rgba(255, 255, 255, 0.4); font-size: 11px;")
-        layout.addWidget(info_label)
-
-        layout.addStretch()
-
-        # Buttons
-        button_layout = QHBoxLayout()
-        save_btn = QPushButton("Save")
-        save_btn.clicked.connect(self.save_settings)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet(
-            "background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15);"
-        )
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addStretch()
-        button_layout.addWidget(save_btn)
-        button_layout.addWidget(cancel_btn)
-        layout.addLayout(button_layout)
-
-        self.setLayout(layout)
-
-    def load_settings(self):
-        """Load current settings into UI"""
-        self.server_path_edit.setText(self.config.get("llama_server_path", ""))
-        self.model_path_edit.setText(self.config.get("model_path", ""))
-        self.port_edit.setText(str(self.config.get("server_port", 8080)))
-        self.context_edit.setText(str(self.config.get("context_size", 4096)))
-        self.gpu_layers_edit.setText(str(self.config.get("gpu_layers", 99)))
-        self.timeout_edit.setText(str(self.config.get("idle_timeout_seconds", 300)))
-        self.temp_edit.setText(str(self.config.get("temperature", 0.0)))
-        self.topk_edit.setText(str(self.config.get("top_k", 40)))
-        self.topp_edit.setText(str(self.config.get("top_p", 0.95)))
-        self.minp_edit.setText(str(self.config.get("min_p", 0.05)))
-        self.repeat_edit.setText(str(self.config.get("repeat_penalty", 1.0)))
-        self.freq_edit.setText(str(self.config.get("frequency_penalty", 0.0)))
-        self.pres_edit.setText(str(self.config.get("presence_penalty", 0.0)))
-        self.hotkey_edit.setText(self.config.get("hotkey", "alt+shift+t"))
-        self.keep_loaded_check.setChecked(self.config.get("keep_model_loaded", False))
-        self.prompt_edit.setPlainText(self.config.get("system_prompt", ""))
-
-        # Load ONNX model directory
-        if self.onnx_dir_edit:
-            self.onnx_dir_edit.setText(self.config.get("onnx_model_dir", ""))
-
-        # Load recent models
-        self.recent_combo.clear()
-        self.recent_combo.addItem("-- Select recent model --")
-        recent = self.config.get("recent_models", [])
-        for model in recent:
-            if os.path.exists(model):
-                self.recent_combo.addItem(model)
-
-    def on_recent_selected(self, text):
-        """Handle selection from recent models dropdown"""
-        if text and text != "-- Select recent model --":
-            self.model_path_edit.setText(text)
-
-    def mousePressEvent(self, event):
-        """Start window dragging — only when clicking on empty chrome"""
-        if event.button() == Qt.LeftButton:
-            child = self.childAt(event.pos())
-            if child is None or isinstance(child, QLabel):
-                self.dragging = True
-                self.drag_position = event.globalPos() - self.pos()
-                event.accept()
-            else:
-                super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        """Handle window dragging"""
-        if self.dragging and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPos() - self.drag_position)
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def browse_server(self):
-        """Browse for llama-server.exe"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select llama-server.exe", "", "Executable (*.exe)"
-        )
-        if path:
-            self.server_path_edit.setText(path)
-
-    def browse_model(self):
-        """Browse for model file"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select GGUF Model", "", "GGUF Models (*.gguf)"
-        )
-        if path:
-            self.model_path_edit.setText(path)
-            self.config.add_recent_model(path)
-            self.load_settings()  # Refresh recent list
-
-    def browse_onnx(self):
-        """Browse for ONNX model directory"""
-        dir_path = QFileDialog.getExistingDirectory(
-            self, "Select ONNX Model Directory"
-        )
-        if dir_path:
-            self.onnx_dir_edit.setText(dir_path)
-
-    def save_settings(self):
-        """Save settings to config"""
-        self.config.set("llama_server_path", self.server_path_edit.text())
-        self.config.set("model_path", self.model_path_edit.text())
-        self.config.set("keep_model_loaded", self.keep_loaded_check.isChecked())
-
-        try:
-            self.config.set("server_port", int(self.port_edit.text()))
-            self.config.set("context_size", int(self.context_edit.text()))
-            self.config.set("gpu_layers", int(self.gpu_layers_edit.text()))
-            self.config.set("idle_timeout_seconds", int(self.timeout_edit.text()))
-            self.config.set("temperature", float(self.temp_edit.text()))
-            self.config.set("top_k", int(self.topk_edit.text()))
-            self.config.set("top_p", float(self.topp_edit.text()))
-            self.config.set("min_p", float(self.minp_edit.text()))
-            self.config.set("repeat_penalty", float(self.repeat_edit.text()))
-            self.config.set("frequency_penalty", float(self.freq_edit.text()))
-            self.config.set("presence_penalty", float(self.pres_edit.text()))
-        except ValueError:
-            QMessageBox.warning(
-                self, "Invalid Value", "Please enter valid numbers for numeric fields"
-            )
-            return
-
-        self.config.set("hotkey", self.hotkey_edit.text())
-        self.config.set("system_prompt", self.prompt_edit.toPlainText().strip())
-
-        # Save ONNX model directory
-        if self.onnx_dir_edit:
-            self.config.set("onnx_model_dir", self.onnx_dir_edit.text())
-
-        if self.model_path_edit.text():
-            self.config.add_recent_model(self.model_path_edit.text())
-
-        self.settings_changed.emit()
-        self.accept()
-
-    def nativeEvent(self, eventType, message):
-        """Handle native Windows events for true frameless window resizing"""
-        if eventType == b'windows_generic_MSG' or eventType == b'windows_dispatcher_MSG':
-            import ctypes
-            import ctypes.wintypes
-            try:
-                msg = ctypes.wintypes.MSG.from_address(message.__int__())
-                if msg.message == 0x0084: # WM_NCHITTEST
-                    # Use QCursor.pos() which Qt natively translates to logical High DPI multi-monitor coordinates
-                    pos = self.mapFromGlobal(QCursor.pos())
-                    
-                    # 10px margin around the window acts as native resize borders
-                    margin = 10
-                    left = pos.x() < margin
-                    right = pos.x() > self.width() - margin
-                    top = pos.y() < margin
-                    bottom = pos.y() > self.height() - margin
-                    
-                    res = 0
-                    if left and top: res = 13 # HTTOPLEFT
-                    elif right and top: res = 14 # HTTOPRIGHT
-                    elif left and bottom: res = 16 # HTBOTTOMLEFT
-                    elif right and bottom: res = 17 # HTBOTTOMRIGHT
-                    elif left: res = 10 # HTLEFT
-                    elif right: res = 11 # HTRIGHT
-                    elif top: res = 12 # HTTOP
-                    elif bottom: res = 15 # HTBOTTOM
-                    
-                    if res != 0:
-                        return True, res
-            except Exception:
-                pass
-        return super().nativeEvent(eventType, message)
-
-
-class ONNXManager(QObject):
-    """Manages the ONNX model inference for fast proofreading"""
-    
-    status_changed = pyqtSignal(str, str)  # status, color
-    
-    def __init__(self, config_manager):
+    def __init__(self, url: str, payload: dict):
         super().__init__()
-        self.config = config_manager
-        self.pipeline = None
-        self.model_dir = ""
-        self.is_loaded = False
-        self.loading = False
-        self.is_seq2seq = False
-        self._loading_lock = threading.Lock()
-        
-    def load_model(self):
-        self.model_dir = self.config.get("onnx_model_dir", "")
-        if not self.model_dir or not os.path.exists(self.model_dir):
-            self.status_changed.emit("No ONNX Model", "gray")
-            return False
-            
-        try:
-            self.loading = True
-            self.status_changed.emit("Loading ONNX...", "orange")
-            
-            import onnxruntime as ort
-            from transformers import AutoTokenizer
-            import numpy as np
-            
-            # Detect whether it's an encoder-decoder (Seq2Seq) or decoder-only (Causal LM)
-            is_seq2seq = os.path.exists(os.path.join(self.model_dir, "encoder_model.onnx"))
-            self.is_seq2seq = is_seq2seq
-            
-            log_debug(f"[ONNX] Loading model from {self.model_dir}, is_seq2seq={is_seq2seq}")
-            
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
-            
-            # Try CUDA first, fall back to CPU if CUDA fails
-            cuda_available = 'CUDAExecutionProvider' in ort.get_available_providers()
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if cuda_available else ['CPUExecutionProvider']
-            log_debug(f"[ONNX] Using providers: {providers}")
-            
-            try:
-                if is_seq2seq:
-                    # Load encoder and decoder ONNX sessions directly (no PyTorch/optimum)
-                    encoder_path = os.path.join(self.model_dir, "encoder_model.onnx")
-                    decoder_path = os.path.join(self.model_dir, "decoder_model.onnx")
-                    
-                    log_debug(f"[ONNX] Loading encoder: {encoder_path}")
-                    log_debug(f"[ONNX] Loading decoder: {decoder_path}")
-                    
-                    self.encoder_session = ort.InferenceSession(encoder_path, providers=providers)
-                    self.decoder_session = ort.InferenceSession(decoder_path, providers=providers)
-                    
-                    self.tokenizer = tokenizer
-                    self.is_loaded = True
-                    self.loading = False
-                    self.status_changed.emit("ONNX Ready (T5)", "green")
-                    log_debug("[ONNX] Model loaded successfully (Seq2Seq)")
-                    return True
-                else:
-                    # Decoder-only model
-                    model_path = os.path.join(self.model_dir, "model.onnx")
-                    log_debug(f"[ONNX] Loading causal LM: {model_path}")
-                    
-                    self.decoder_session = ort.InferenceSession(model_path, providers=providers)
-                    self.tokenizer = tokenizer
-                    self.is_loaded = True
-                    self.loading = False
-                    self.status_changed.emit("ONNX Ready", "green")
-                    log_debug("[ONNX] Model loaded successfully (Causal LM)")
-                    return True
-                    
-            except Exception as load_error:
-                # CUDA failed, retry with CPU only
-                if cuda_available:
-                    log_debug(f"[ONNX] CUDA execution failed: {load_error}, falling back to CPU")
-                    self.status_changed.emit("CUDA failed, using CPU...", "orange")
-                    providers = ['CPUExecutionProvider']
-                    
-                    if is_seq2seq:
-                        encoder_path = os.path.join(self.model_dir, "encoder_model.onnx")
-                        decoder_path = os.path.join(self.model_dir, "decoder_model.onnx")
-                        self.encoder_session = ort.InferenceSession(encoder_path, providers=providers)
-                        self.decoder_session = ort.InferenceSession(decoder_path, providers=providers)
-                        self.tokenizer = tokenizer
-                        self.is_loaded = True
-                        self.loading = False
-                        self.status_changed.emit("ONNX Ready (T5)", "green")
-                        log_debug("[ONNX] Model loaded successfully with CPU (Seq2Seq)")
-                        return True
-                    else:
-                        model_path = os.path.join(self.model_dir, "model.onnx")
-                        self.decoder_session = ort.InferenceSession(model_path, providers=providers)
-                        self.tokenizer = tokenizer
-                        self.is_loaded = True
-                        self.loading = False
-                        self.status_changed.emit("ONNX Ready", "green")
-                        log_debug("[ONNX] Model loaded successfully with CPU (Causal LM)")
-                        return True
-                else:
-                    raise
-                
-        except Exception as e:
-            log_debug(f"[ONNX] Load model error: {e}")
-            self.is_loaded = False
-            self.loading = False
-            self.status_changed.emit("ONNX Load Failed", "red")
-            return False
-    
-    def proofread(self, text):
-        log_debug(f"[ONNX] Proofreading text: {text[:100]}...")
-        
-        # Use mutex to prevent race condition on concurrent calls
-        with self._loading_lock:
-            if not self.is_loaded:
-                log_debug("[ONNX] Model not loaded, loading now...")
-                if not self.load_model():
-                    self.status_changed.emit("ONNX inference failed", "red")
-                    log_debug("[ONNX] Failed to load model.")
-                    return None  # Return None so caller can handle fallback explicitly
-                    
-        try:
-            import numpy as np
-            if self.is_seq2seq:
-                result = self._run_seq2seq(text, prefix="Fix grammar: ", max_tokens=200)
-            else:
-                # Causal LM inference (not used for T5)
-                prompt = f"Fix grammar and typos in the following text:\n{text}\n\nCorrected:"
-                log_debug(f"[ONNX] Using Causal LM. Prompt: {prompt[:100]}...")
-                
-                inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=512)
-                input_ids = inputs["input_ids"].astype(np.int64)
-                attention_mask = inputs["attention_mask"].astype(np.int64)
-                
-                # Run decoder
-                outputs = self.decoder_session.run(None, {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask
-                })
-                
-                # Get generated tokens
-                output_ids = np.argmax(outputs[0], axis=-1)[0]
-                result = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-                # Remove prompt from result
-                result = result.replace(prompt, "").strip()
-            
-            if result is None:
-                return None
-                
-            log_debug(f"[ONNX] Result length: {len(result)}")
-            
-            # Apply post-processing (same as LLM)
-            result = strip_thinking_tokens(result)
-            result = strip_meta_commentary(result, text)
-            
-            # Handle empty result after stripping
-            if not result.strip():
-                log_debug("[ONNX] Empty result after post-processing")
-                return None
-            
-            return result.strip()
-            
-        except Exception as e:
-            log_debug(f"ONNX Proofread Error: {e}")
-            self.status_changed.emit("ONNX inference error", "red")
-            return None
-    
+        self.url = url
+        self.payload = {**payload, "stream": True}
+        self._stop = False
 
-    def _run_seq2seq(self, text, prefix="Fix grammar: ", max_tokens=200):
-        """Run T5 seq2seq with proper KV-cache handling.
-        
-        Key details of the merged ONNX decoder model:
-        - Outputs are named 'present.X.{decoder|encoder}.{key|value}'
-        - Inputs are named 'past_key_values.X.{decoder|encoder}.{key|value}'  
-        - When use_cache_branch=False (step 0): encoder KVs are computed fresh, outputs have proper shapes
-        - When use_cache_branch=True (step 1+): encoder KVs are cached internally by the model,
-          and the model outputs EMPTY (batch=0) encoder KV tensors. We must preserve the encoder
-          KVs from step 0 and only update decoder KVs from each step's output.
-        """
-        import numpy as np
-        
-        prompt = f"{prefix}{text}"
-        log_debug(f"[ONNX] Seq2Seq prompt: {prompt[:100]}...")
-        
-        # Tokenize input
-        inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=512)
-        input_ids = inputs["input_ids"].astype(np.int64)
-        attention_mask = inputs["attention_mask"].astype(np.int64)
-        
-        # Run encoder
-        encoder_outputs = self.encoder_session.run(None, {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        })
-        
-        # Build output→input name mappings, separated by type
-        output_names = [out.name for out in self.decoder_session.get_outputs()]
-        decoder_kv_map = {}  # present.X.decoder.{key|value} → past_key_values.X.decoder.{key|value}
-        encoder_kv_map = {}  # present.X.encoder.{key|value} → past_key_values.X.encoder.{key|value}
-        for name in output_names:
-            if name.startswith("present."):
-                input_name = "past_key_values." + name[len("present."):]
-                if ".encoder." in name:
-                    encoder_kv_map[name] = input_name
-                elif ".decoder." in name:
-                    decoder_kv_map[name] = input_name
-        
-        # Get past_key_values input metadata for zero-fill shapes
-        pkv_inputs = [inp for inp in self.decoder_session.get_inputs()
-                      if inp.name.startswith("past_key_values.")]
-        
-        # Collect generated token IDs
-        generated_ids = [self.tokenizer.pad_token_id]
-        decoder_input_ids = np.array([[self.tokenizer.pad_token_id]], dtype=np.int64)
-        past_kv_feed = None
-        encoder_kv_cache = None  # Preserved from step 0
-        
-        for step in range(max_tokens):
-            decoder_inputs = {
-                "input_ids": decoder_input_ids,
-                "encoder_hidden_states": encoder_outputs[0],
-                "encoder_attention_mask": attention_mask
-            }
-            
-            if past_kv_feed is not None:
-                decoder_inputs.update(past_kv_feed)
-                decoder_inputs["use_cache_branch"] = np.array([True], dtype=np.bool_)
-            else:
-                for inp in pkv_inputs:
-                    shape = inp.shape
-                    decoder_inputs[inp.name] = np.zeros(
-                        (1, shape[1], 0, shape[3]), dtype=np.float32
-                    )
-                decoder_inputs["use_cache_branch"] = np.array([False], dtype=np.bool_)
-            
-            decoder_outputs = self.decoder_session.run(None, decoder_inputs)
-            
-            if step == 0:
-                log_debug(f"[ONNX] Step 0 output shape: {decoder_outputs[0].shape}, count: {len(decoder_outputs)}")
-                # Capture encoder KV-cache from step 0 (the only time it's valid)
-                encoder_kv_cache = {}
-                for idx, out_name in enumerate(output_names):
-                    if out_name in encoder_kv_map:
-                        encoder_kv_cache[encoder_kv_map[out_name]] = decoder_outputs[idx]
-            
-            # Get next token (greedy)
-            next_token_logits = decoder_outputs[0][:, -1, :]
-            next_token_id = int(np.argmax(next_token_logits, axis=-1)[0])
-            generated_ids.append(next_token_id)
-            
-            # Check for EOS
-            if next_token_id == self.tokenizer.eos_token_id:
-                log_debug(f"[ONNX] EOS at step {step}")
-                break
-            
-            # Next step: feed only the new token (KV-cache has the history)
-            decoder_input_ids = np.array([[next_token_id]], dtype=np.int64)
-            
-            # Build KV-cache feed: decoder KVs from this step + encoder KVs from step 0
-            past_kv_feed = {}
-            # Decoder KVs: always from current step output (they grow with each token)
-            for idx, out_name in enumerate(output_names):
-                if out_name in decoder_kv_map:
-                    past_kv_feed[decoder_kv_map[out_name]] = decoder_outputs[idx]
-            # Encoder KVs: always from step 0 (model returns empty on subsequent steps)
-            past_kv_feed.update(encoder_kv_cache)
-        
-        # Decode
-        result = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        return result
-    
-    def chat(self, messages, max_tokens=1000):
-        """Simple chat/refinement using ONNX model.
-        
-        This is a lightweight alternative to the full LLM chat.
-        It uses the same seq2seq logic as proofread() but with a different prefix.
-        
-        Args:
-            messages: List of message dicts with 'role' and 'content'
-            max_tokens: Maximum tokens to generate
-            
-        Returns:
-            str: Model response or None on failure
-        """
-        log_debug(f"[ONNX] Chat with {len(messages)} messages")
-        
-        # Use mutex to prevent race condition on concurrent calls
-        with self._loading_lock:
-            if not self.is_loaded:
-                log_debug("[ONNX] Model not loaded for chat, loading now...")
-                if not self.load_model():
-                    self.status_changed.emit("ONNX chat failed", "red")
-                    log_debug("[ONNX] Failed to load model for chat.")
-                    return None
-        
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        full = ""
         try:
-            import numpy as np
-            
-            # Extract the latest user message
-            user_content = ""
-            for msg in reversed(messages[-4:]):
-                if msg.get("role") == "user":
-                    user_content = msg.get("content", "")
-                    break
-            
-            if not user_content:
-                log_debug("[ONNX] No user content found in messages")
-                return None
-            
-            # Truncate if too long for ONNX model context
-            if len(user_content) > 1000:
-                user_content = user_content[-1000:]
-            
-            if self.is_seq2seq:
-                result = self._run_seq2seq(user_content, prefix="Refine text: ", max_tokens=max_tokens)
-            else:
-                # Causal LM inference (not used for T5)
-                prompt = f"Refine and improve the following text:\n{user_content}\n\nImproved:"
-                log_debug(f"[ONNX Chat] Using Causal LM. Prompt: {prompt[:100]}...")
-                
-                inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=512)
-                input_ids = inputs["input_ids"].astype(np.int64)
-                attention_mask = inputs["attention_mask"].astype(np.int64)
-                
-                outputs = self.decoder_session.run(None, {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask
-                })
-                
-                output_ids = np.argmax(outputs[0], axis=-1)[0]
-                result = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-                result = result.replace(prompt, "").strip()
-            
-            if result is None:
-                return None
-                
-            log_debug(f"[ONNX Chat] Result length: {len(result)}")
-            
-            # Apply post-processing
-            result = strip_thinking_tokens(result)
-            result = strip_meta_commentary(result, user_content)
-            
-            if not result.strip():
-                log_debug("[ONNX Chat] Empty result after post-processing")
-                return None
-            
-            return result.strip()
-            
+            with requests.post(
+                self.url, json=self.payload, stream=True, timeout=120
+            ) as r:
+                r.raise_for_status()
+                for raw in r.iter_lines():
+                    if self._stop:
+                        break
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        t = chunk["choices"][0]["delta"].get("content", "")
+                        if t:
+                            t = strip_think(t)
+                            full += t
+                            self.token.emit(t)
+                    except Exception:
+                        pass
+            self.done.emit(full)
         except Exception as e:
-            log_debug(f"ONNX Chat Error: {e}")
-            self.status_changed.emit("ONNX chat error", "red")
-            return None
+            self.error.emit(str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# llama.cpp ModelManager — handles one llama-server instance
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class ModelManager(QObject):
-    """Manages the llama.cpp server and model inference"""
-
     status_changed = pyqtSignal(str)
     model_loaded = pyqtSignal()
     model_unloaded = pyqtSignal()
-    correction_done = pyqtSignal(str)
 
-    def __init__(self, config_manager):
+    def __init__(
+        self,
+        cfg: ConfigManager,
+        model_path_key: str = "model_path",
+        label: str = "LLM",
+        keep_loaded_key: str = "keep_model_loaded",
+        idle_timeout_key: str = "idle_timeout_seconds",
+    ):
         super().__init__()
-        self.config = config_manager
+        self.cfg = cfg
+        self.model_path_key = model_path_key
+        self.label = label
+        self.keep_loaded_key = keep_loaded_key
+        self.idle_timeout_key = idle_timeout_key
         self.server_process = None
+        self.log_file = None
         self.last_used = None
         self.loading = False
-        self.lock = threading.Lock()
-        self.log_file = None
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._check_idle)
-        self.timer.start(10000)  # Check every 10 seconds
+        self._lock = threading.Lock()
 
-    def _get_chat_url(self):
-        """Get the OpenAI-compatible chat completions URL"""
-        host = self.config.get("server_host", "127.0.0.1")
-        port = self.config.get("server_port", 8080)
-        return f"http://{host}:{port}/v1/chat/completions"
+    # ── internal helpers ──────────────────────────────────────────────────
+    def _base_url(self) -> str:
+        h = self.cfg.get("server_host", "127.0.0.1")
+        p = self.cfg.get("server_port", 8080)
+        return f"http://{h}:{p}"
 
-    def _get_health_url(self):
-        """Get the health check URL"""
-        host = self.config.get("server_host", "127.0.0.1")
-        port = self.config.get("server_port", 8080)
-        return f"http://{host}:{port}/health"
+    def _health_url(self) -> str:
+        return self._base_url() + "/health"
 
-    def _check_idle(self):
-        """Check if model should be auto-unloaded"""
-        if self.config.get("keep_model_loaded", False):
-            return
+    def _chat_url(self) -> str:
+        return self._base_url() + "/v1/chat/completions"
 
-        if self.server_process is not None and self.last_used is not None:
-            idle_timeout = self.config.get("idle_timeout_seconds", 300)
-            idle_time = (datetime.now() - self.last_used).total_seconds()
-            remaining = idle_timeout - idle_time
+    def is_loaded(self) -> bool:
+        return self.server_process is not None and self.server_process.poll() is None
 
-            if remaining <= 0:
-                self.unload_model()
-            elif remaining <= 60:
-                self.status_changed.emit(f"Unloading in {int(remaining)}s")
-
-    def _kill_existing_servers(self):
-        """Kill any existing llama-server processes to prevent port conflicts"""
-        try:
-            import psutil
-
-            for proc in psutil.process_iter(["pid", "name"]):
-                if proc.info["name"] and "llama-server" in proc.info["name"].lower():
-                    try:
-                        log_debug(
-                            f"Killing existing llama-server process (PID: {proc.info['pid']})"
-                        )
-                        proc.terminate()
-                        proc.wait(timeout=3)
-                    except:
-                        try:
-                            proc.kill()
-                        except:
-                            pass
-        except Exception as e:
-            log_debug(f"Could not kill existing servers: {e}")
-
-    def load_model(self):
-        """Load the model by starting llama-server"""
-        log_debug("load_model called")
-
-        # Kill any existing server processes first
-        self._kill_existing_servers()
-
-        with self.lock:
-            if self.server_process is not None:
-                log_debug("Model already loaded (lock check)")
-                self.status_changed.emit("Model already loaded")
-                return True
+    # ── load ──────────────────────────────────────────────────────────────
+    def load_model(self) -> bool:
+        with self._lock:
             if self.loading:
-                log_debug("Model loading already in progress")
                 return False
             self.loading = True
 
+        model_path = self.cfg.get(self.model_path_key, "")
+        if not model_path or not Path(model_path).exists():
+            self.loading = False
+            self.status_changed.emit("No model file configured")
+            return False
+
+        self.status_changed.emit("Starting server…")
+        log(f"[{self.label}] Loading model: {model_path}")
+
+        server_path = self.cfg.get("llama_server_path", str(LLAMA_CPP_DIR / SERVER_EXE))
+        if not Path(server_path).exists():
+            for name in [SERVER_EXE, "llama-server"]:
+                candidate = LLAMA_CPP_DIR / name
+                if candidate.exists():
+                    server_path = str(candidate)
+                    break
+            else:
+                self.loading = False
+                self.status_changed.emit("llama-server not found")
+                return False
+
+        gpu_layers = self.cfg.get("gpu_layers", 99) if has_nvidia() else 0
+        ctx = self.cfg.get("context_size", 4096)
+        host = self.cfg.get("server_host", "127.0.0.1")
+        port = self.cfg.get("server_port", 8080)
+
+        cmd = [
+            server_path,
+            "--model",
+            model_path,
+            "--ctx-size",
+            str(ctx),
+            "--n-gpu-layers",
+            str(gpu_layers),
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--log-disable",
+        ]
+
         try:
-            log_debug("Starting inference server process...")
-            self.status_changed.emit("Starting inference server...")
-
-            server_path = self.config.get("llama_server_path")
-            model_path = self.config.get("model_path")
-
-            if not server_path or not os.path.exists(server_path):
-                raise Exception(f"llama-server.exe not found at: {server_path}")
-
-            if not model_path or not os.path.exists(model_path):
-                raise Exception(f"Model not found at: {model_path}")
-
-            host = self.config.get("server_host", "127.0.0.1")
-            port = self.config.get("server_port", 8080)
-            context = self.config.get("context_size", 4096)
-            gpu_layers = self.config.get("gpu_layers", 99)
-
-            # Auto-detect GPU: override to CPU mode if no NVIDIA driver found
-            if gpu_layers > 0 and not _has_nvidia_gpu():
-                log_debug("No NVIDIA GPU — falling back to CPU mode (gpu_layers=0)")
-                self.status_changed.emit("No GPU found — loading in CPU mode (may be slow)...")
-                gpu_layers = 0
-
-            cmd = [
-                server_path,
-                "-m",
-                model_path,
-                "-c",
-                str(context),
-                "-ngl",
-                str(gpu_layers),
-                "--port",
-                str(port),
-                "--host",
-                host,
-                "--no-warmup",  # Skip warmup to speed up startup
-                "--reasoning-format",
-                "none",  # Disable thinking mode (Qwen3)
-            ]
-
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-            # Open log file
-            self.log_file = open(LOG_FILE, "w")
-
-            # Set cwd to the server directory so it finds DLLs
-            server_dir = os.path.dirname(server_path)
-
+            kwargs: dict = {}
+            if WINDOWS:
+                kwargs["creationflags"] = 0x08000000
+            self.log_file = open(LOG_FILE, "w", encoding="utf-8")
             self.server_process = subprocess.Popen(
-                cmd,
-                cwd=server_dir,
-                startupinfo=startupinfo,
-                stdout=self.log_file,
-                stderr=subprocess.STDOUT,
+                cmd, stdout=self.log_file, stderr=self.log_file, **kwargs
             )
 
-            # Wait for server to be ready (with fast failure detection)
-            # CUDA fitting + model loading can take 30-90s on first launch
-            max_wait = 180
-            for i in range(max_wait):
-                # Check if server process died (fast fail)
+            for i in range(180):
                 if self.server_process.poll() is not None:
-                    # Read the log to show the actual error
-                    try:
-                        self.log_file.flush()
-                        with open(LOG_FILE, "r") as lf:
-                            log_content = lf.read()
-                        # Extract the error line
-                        for line in log_content.splitlines():
-                            if "error" in line.lower() or "failed" in line.lower():
-                                raise Exception(f"Server failed: {line.strip()[:80]}")
-                    except Exception as read_err:
-                        if "Server failed" in str(read_err):
-                            raise
-                    raise Exception("Server exited immediately. Check server_log.txt")
+                    raise RuntimeError("Server exited immediately — see server_log.txt")
                 try:
-                    response = requests.get(self._get_health_url(), timeout=1)
-                    if response.status_code == 200:
+                    if requests.get(self._health_url(), timeout=1).status_code == 200:
                         break
                 except requests.RequestException:
                     pass
-
-                # Show progress every 10 seconds
-                if i > 0 and i % 10 == 0:
-                    self.status_changed.emit(f"Loading model... ({i}s)")
+                if i and i % 15 == 0:
+                    self.status_changed.emit(f"Loading… ({i}s)")
                 time.sleep(1)
             else:
-                raise Exception(f"Server failed to start after {max_wait}s")
+                raise RuntimeError("Server did not start within 180 s")
 
             self.last_used = datetime.now()
             self.loading = False
-            model_name = friendly_model_name(model_path)
-            log_debug(f"Model loaded successfully: {model_name}")
-            self.status_changed.emit(f"Ready — {model_name}")
+            name = friendly_name(model_path)
+            self.status_changed.emit(f"Ready — {name}")
             self.model_loaded.emit()
+            log(f"[{self.label}] Model ready: {name}")
             return True
 
         except Exception as e:
-            err_str = str(e)
-            log_debug(f"load_model failed: {err_str}")
+            log(f"[{self.label}] load_model failed: {e}")
             self.loading = False
             self.unload_model()
-
-            # If a CUDA error caused the crash and we were using GPU, retry on CPU
-            _cuda_keywords = ("cuda", "cublas", "cudart", "ggml-cuda", "out of memory", "no gpu")
-            _was_gpu = self.config.get("gpu_layers", 99) > 0
-            if _was_gpu and any(kw in err_str.lower() for kw in _cuda_keywords):
-                log_debug("CUDA error detected — retrying in CPU mode (gpu_layers=0)")
-                self.status_changed.emit("GPU error — retrying in CPU mode...")
-                # Temporarily patch config for this attempt only
-                _orig_layers = self.config.get("gpu_layers", 99)
-                self.config.config["gpu_layers"] = 0
+            if gpu_layers > 0 and any(
+                kw in str(e).lower() for kw in ("cuda", "oom", "gpu")
+            ):
+                log(f"[{self.label}] CUDA error — retrying CPU-only")
+                self.status_changed.emit("GPU error — retrying CPU…")
+                orig = self.cfg.get("gpu_layers", 99)
+                self.cfg.config["gpu_layers"] = 0
                 result = self.load_model()
-                self.config.config["gpu_layers"] = _orig_layers
+                self.cfg.config["gpu_layers"] = orig
                 return result
-
-            self.status_changed.emit(f"Load error: {err_str[:80]}")
+            self.status_changed.emit(f"Load error: {str(e)[:70]}")
             return False
 
     def unload_model(self):
-        """Unload the model by stopping the server"""
-        with self.lock:
-            if self.server_process is not None:
-                self.status_changed.emit("Stopping server...")
+        with self._lock:
+            if self.server_process:
                 try:
                     self.server_process.terminate()
                     self.server_process.wait(timeout=5)
-                except:
+                except Exception:
                     try:
                         self.server_process.kill()
-                    except:
+                    except Exception:
                         pass
-
                 self.server_process = None
-                if self.log_file:
-                    try:
-                        self.log_file.close()
-                    except:
-                        pass
-                    self.log_file = None
+            if self.log_file:
+                try:
+                    self.log_file.close()
+                except Exception:
+                    pass
+                self.log_file = None
+            self.last_used = None
+        self.status_changed.emit("Model unloaded")
+        self.model_unloaded.emit()
 
-                self.last_used = None
-                self.status_changed.emit("Model unloaded")
-                self.model_unloaded.emit()
-
-    def is_loaded(self):
-        """Check if model is currently loaded"""
-        return self.server_process is not None and self.server_process.poll() is None
-
-    def correct_text(self, text, custom_instruction=None):
-        """Correct text using the model via chat completions API"""
-        log_debug(f"correct_text called with length: {len(text)}")
-
-        if not self.is_loaded():
-            log_debug("Model not loaded, loading now...")
-            if not self.load_model():
-                log_debug("Failed to load model")
-                return None
-
-        self.last_used = datetime.now()
-
-        try:
-            self.status_changed.emit("Correcting...")
-
-            # Get custom instruction or use default
-            if custom_instruction:
-                # Custom instruction path - respecting user's manual override
-                messages = [
-                    {"role": "user", "content": f"{custom_instruction}\n\n{text}"}
-                ]
-            else:
-                custom_prompt = self.config.get("system_prompt", "").strip()
-                if custom_prompt:
-                    # User-defined system prompt from Settings
-                    messages = [
-                        {"role": "system", "content": custom_prompt},
-                        {"role": "user", "content": text},
-                    ]
-                else:
-                    # Enhanced Few-Shot Prompting Strategy
-                    # Uses strict system prompt + multiple diverse examples + forces completion
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a text correction engine. Your task is to proofread and refine text.\n"
-                                "CRITICAL RULES - VIOLATING THESE IS AN ERROR:\n"
-                                "1. Output ONLY the corrected text - no explanations, no labels, no greetings\n"
-                                "2. NEVER start with phrases like 'Here is', 'Sure', 'Corrected', 'The corrected'\n"
-                                "3. NEVER wrap output in quotes or markdown\n"
-                                "4. If text is perfect, return it unchanged\n"
-                                "5. Fix spelling, grammar, punctuation while preserving meaning and tone\n"
-                                "6. PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines\n"
-                                "7. Maintain original formatting exactly, including multiple line breaks"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": "the project were delayed because of bad wether",
-                        },
-                        {
-                            "role": "assistant",
-                            "content": "The project was delayed because of bad weather.",
-                        },
-                        {"role": "user", "content": "i dont know if its gona work"},
-                        {
-                            "role": "assistant",
-                            "content": "I don't know if it's going to work.",
-                        },
-                        {"role": "user", "content": "Hello, how are you doing today?"},
-                        {
-                            "role": "assistant",
-                            "content": "Hello, how are you doing today?",
-                        },
-                        {
-                            "role": "user",
-                            "content": "The data shows that their is an increase in sales.",
-                        },
-                        {
-                            "role": "assistant",
-                            "content": "The data shows that there is an increase in sales.",
-                        },
-                        {
-                            "role": "user",
-                            "content": "Dear John,\n\nHow are you?\n\nI hope your doing well.",
-                        },
-                        {
-                            "role": "assistant",
-                            "content": "Dear John,\n\nHow are you?\n\nI hope you're doing well.",
-                        },
-                        {"role": "user", "content": text},
-                        {"role": "assistant", "content": ""},
-                    ]
-
-            temperature = self.config.get("temperature", 0.1)
-            top_k = self.config.get("top_k", 40)
-            top_p = self.config.get("top_p", 0.95)
-            min_p = self.config.get("min_p", 0.05)
-            frequency_penalty = self.config.get("frequency_penalty", 0.0)
-            presence_penalty = self.config.get("presence_penalty", 0.0)
-            repeat_penalty = self.config.get("repeat_penalty", 1.0)
-            # Give enough room for thinking overhead + corrections
-            max_tokens = min(len(text) * 3 + 500, 4096)
-
-            payload = {
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "min_p": min_p,
-                "frequency_penalty": frequency_penalty,
-                "presence_penalty": presence_penalty,
-                "repeat_penalty": repeat_penalty,
-            }
-
-            url = self._get_chat_url()
-            log_debug(f"Sending POST to {url}")
-
-            response = requests.post(url, json=payload, timeout=120)
-            log_debug(f"Response received. Status: {response.status_code}")
-
-            if response.status_code == 400:
-                error_body = response.text.lower()
-                if "context" in error_body or "too long" in error_body:
-                    self.status_changed.emit("Error: text too long")
-                    return "[Error] Text exceeds the model's context limit. Try shorter text or increase context size in Settings."
-                response.raise_for_status()
-
-            response.raise_for_status()
-
-            result = response.json()
-            log_debug("JSON parsed successfully")
-
-            corrected = (
-                result.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-
-            # Strip thinking tokens (Qwen3 thinking mode)
-            corrected = strip_thinking_tokens(corrected)
-            # Strip meta-commentary ("Here is the corrected text:")
-            corrected = strip_meta_commentary(corrected, text)
-
-            # Check if output still contains conversational elements and retry if needed
-            if contains_meta_commentary(corrected):
-                log_debug(
-                    "Detected conversational output, retrying with stronger prompt..."
-                )
-                self.status_changed.emit("Retrying...")
-
-                # Retry with ultra-strict prompt
-                retry_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "OUTPUT FORMAT: PLAIN TEXT ONLY. NO PREAMBLE. NO LABELS. NO EXPLANATIONS. "
-                            "Task: Fix spelling, grammar, and punctuation in the following text. "
-                            "PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING. "
-                            "Output the corrected text and NOTHING else."
-                        ),
-                    },
-                    {"role": "user", "content": f"Text to correct:\n{text}"},
-                ]
-
-                retry_payload = {
-                    "messages": retry_messages,
-                    "max_tokens": max_tokens,
-                    "temperature": 0.0,  # Force deterministic
-                    "top_k": 1,
-                    "top_p": 0.1,  # Very focused sampling
-                    "min_p": 0.05,
-                    "frequency_penalty": 0.0,
-                    "presence_penalty": 0.0,
-                    "repeat_penalty": 1.0,
-                }
-
-                retry_response = requests.post(url, json=retry_payload, timeout=120)
-                retry_response.raise_for_status()
-
-                retry_result = retry_response.json()
-                corrected = (
-                    retry_result.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-
-                # Strip again
-                corrected = strip_thinking_tokens(corrected)
-                corrected = strip_meta_commentary(corrected, text)
-                log_debug(f"Retry correction length: {len(corrected)}")
-
-            log_debug(f"Correction length (after strip): {len(corrected)}")
-
-            self.last_used = datetime.now()
-            self.status_changed.emit("Ready")
-            return corrected if corrected else text
-
-        except requests.exceptions.ConnectionError:
-            log_debug("Connection error in correct_text")
-            self.status_changed.emit("Error: server unreachable")
-            return (
-                "[Error] Cannot reach inference server. Make sure the model is loaded."
-            )
-        except requests.exceptions.Timeout:
-            log_debug("Timeout in correct_text")
-            self.status_changed.emit("Error: timeout")
-            return "[Error] Server took too long to respond. The model may be too large for your GPU."
-        except Exception as e:
-            log_debug(f"Error in correct_text: {e}")
-            error_msg = str(e)
-            if "500" in error_msg:
-                self.status_changed.emit("Error: server error")
-                return "[Error] Server error (500). The model may not support this input. Check server_log.txt."
-            self.status_changed.emit(f"Error: {error_msg[:50]}")
-            return None
-
-    def chat_with_model(self, messages, max_tokens=1000):
-        """Chat with the model for text refinement via chat completions API"""
-        log_debug(f"chat_with_model called with {len(messages)} messages")
-
+    # ── correction (non-streaming, single method for all models) ──────────
+    def correct_text(self, text: str, instruction: str | None = None) -> str | None:
         if not self.is_loaded():
             if not self.load_model():
-                log_debug("chat_with_model: failed to load model")
                 return None
-
         self.last_used = datetime.now()
+        self.status_changed.emit("Correcting…")
+
+        system = self.cfg.get("system_prompt", "").strip() or (
+            "You are a text correction engine.\n"
+            "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
+            "Preserve all formatting, line breaks, and original tone.\n"
+            "If the text is already correct, return it unchanged."
+        )
+
+        if instruction:
+            system = f"{system}\n\n{instruction}"
+
+        # Always include few-shot examples so the model knows what to do
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": "the project were delayed because of bad wether",
+            },
+            {
+                "role": "assistant",
+                "content": "The project was delayed because of bad weather.",
+            },
+            {"role": "user", "content": "i dont know if its gona work"},
+            {"role": "assistant", "content": "I don't know if it's going to work."},
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": ""},
+        ]
+
+        payload = {
+            "messages": messages,
+            "max_tokens": min(max(len(text.split()) * 2 + 30, 60), 512),
+            "temperature": 0.0,
+            "top_k": self.cfg.get("top_k", 40),
+            "top_p": self.cfg.get("top_p", 0.95),
+            "stream": False,
+        }
 
         try:
-            self.status_changed.emit("Thinking...")
-
-            temperature = self.config.get("temperature", 0.1)
-            top_k = self.config.get("top_k", 40)
-            top_p = self.config.get("top_p", 0.95)
-            min_p = self.config.get("min_p", 0.05)
-            frequency_penalty = self.config.get("frequency_penalty", 0.0)
-            presence_penalty = self.config.get("presence_penalty", 0.0)
-            repeat_penalty = self.config.get("repeat_penalty", 1.0)
-
-            payload = {
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "min_p": min_p,
-                "frequency_penalty": frequency_penalty,
-                "presence_penalty": presence_penalty,
-                "repeat_penalty": repeat_penalty,
-            }
-
-            url = self._get_chat_url()
-            log_debug(f"chat_with_model: Sending POST to {url}")
-
-            response = requests.post(url, json=payload, timeout=120)
-            log_debug(f"chat_with_model: Response {response.status_code}")
-
-            response.raise_for_status()
-
-            result = response.json()
-            reply = (
-                result.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-
-            # Strip thinking tokens (Qwen3 thinking mode)
-            reply = strip_thinking_tokens(reply)
-            # Strip meta-commentary
-            reply = strip_meta_commentary(reply, "")
-            log_debug(f"chat_with_model: Reply length (after strip) {len(reply)}")
-
+            r = requests.post(self._chat_url(), json=payload, timeout=120)
+            r.raise_for_status()
+            resp = r.json()
+            log(f"[{self.label}] Raw API response: {json.dumps(resp)[:500]}")
+            raw = resp["choices"][0]["message"]["content"]
+            log(f"[{self.label}] Raw content before strip: {repr(raw[:200])}")
+            raw = raw.strip()
+            raw = strip_think(raw)
+            raw = strip_preamble(raw, text)
+            log(f"[{self.label}] After strip: {repr(raw[:200])}")
             self.last_used = datetime.now()
             self.status_changed.emit("Ready")
-            return reply
-
-        except requests.exceptions.ConnectionError:
-            log_debug("Connection error in chat_with_model")
-            self.status_changed.emit("Error: server unreachable")
-            return None
-        except requests.exceptions.Timeout:
-            log_debug("Timeout in chat_with_model")
-            self.status_changed.emit("Error: timeout")
-            return None
+            return raw or text
         except Exception as e:
-            log_debug(f"Error in chat_with_model: {e}")
+            log(f"[{self.label}] correct_text error: {e}")
             self.status_changed.emit(f"Error: {str(e)[:50]}")
             return None
 
+    # ── patch-based correction (structured JSON output) ──────────────────
+    def correct_text_patch(
+        self, text: str, instruction: str | None = None
+    ) -> str | None:
+        """Return corrected text by asking the LLM for a JSON patch list.
+
+        The LLM outputs only the words that need changing, dramatically reducing
+        output tokens. Falls back to None on any parsing error so the caller
+        can use correct_text() instead.
+        """
+        if not self.is_loaded():
+            if not self.load_model():
+                return None
+        self.last_used = datetime.now()
+        self.status_changed.emit("Correcting…")
+
+        system = (
+            "You are a text correction engine. You output ONLY a JSON array of patches.\n"
+            "Each patch object has exactly two keys:\n"
+            '  "old" — the wrong word or short phrase as it appears in the text\n'
+            '  "new" — the corrected replacement\n\n'
+            "Rules:\n"
+            "- Only include words that are actually wrong\n"
+            "- Preserve correct words exactly as-is — do NOT include them in patches\n"
+            "- Include fixes for: typos, spelling, grammar, capitalization, apostrophes, punctuation\n"
+            "- Keep each patch short: 1-3 words max for old/new\n"
+            "- If the text is already perfect, output an empty array []\n"
+            "- Output ONLY the JSON array, nothing else\n"
+        )
+
+        if instruction:
+            system = f"{system}\n\nAdditional instructions: {instruction}"
+
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": "the project were delayed because of bad wether",
+            },
+            {
+                "role": "assistant",
+                "content": '[{"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
+            },
+            {"role": "user", "content": "i dont know if its gona work"},
+            {
+                "role": "assistant",
+                "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]',
+            },
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": ""},
+        ]
+
+        # Enough tokens for the JSON to complete. The model outputs far fewer
+        # tokens than full-text regeneration because it only lists wrong words.
+        payload = {
+            "messages": messages,
+            "max_tokens": min(max(len(text.split()) * 2 + 30, 60), 512),
+            "temperature": 0.0,
+            "top_k": self.cfg.get("top_k", 40),
+            "top_p": self.cfg.get("top_p", 0.95),
+            "stream": False,
+        }
+
+        try:
+            r = requests.post(self._chat_url(), json=payload, timeout=120)
+            r.raise_for_status()
+            resp = r.json()
+            log(f"[{self.label}] Patch raw response: {json.dumps(resp)[:500]}")
+            raw = resp["choices"][0]["message"]["content"]
+            log(f"[{self.label}] Patch raw content: {repr(raw[:300])}")
+
+            patches = _extract_patches_from_response(raw)
+            if not patches:
+                log(f"[{self.label}] No valid patches extracted from response")
+                return None
+
+            # Filter out no-op patches where old == new
+            real_patches = [
+                p
+                for p in patches
+                if p.get("old", "").strip() != p.get("new", "").strip()
+            ]
+            if not real_patches:
+                log(f"[{self.label}] All patches were no-ops — text is already correct")
+                return text
+
+            log(
+                f"[{self.label}] Extracted {len(real_patches)} real patches (out of {len(patches)} total): {real_patches}"
+            )
+            result = _apply_patches(text, real_patches)
+            log(f"[{self.label}] Patch result: {repr(result[:200])}")
+            self.last_used = datetime.now()
+            self.status_changed.emit("Ready")
+            return result
+        except Exception as e:
+            log(f"[{self.label}] correct_text_patch error: {e}")
+            self.status_changed.emit(f"Error: {str(e)[:50]}")
+            return None
+
+    # ── streaming chat ─────────────────────────────────────────────────────
+    def make_stream_worker(
+        self, messages: list, max_tokens: int = 1024
+    ) -> StreamWorker:
+        payload = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": self.cfg.get("temperature", 0.3),
+            "top_k": self.cfg.get("top_k", 40),
+            "top_p": self.cfg.get("top_p", 0.95),
+        }
+        return StreamWorker(self._chat_url(), payload)
+
+    # ── idle check ─────────────────────────────────────────────────────────
+    def check_idle(self):
+        if self.cfg.get(self.keep_loaded_key, True):
+            return
+        if not self.is_loaded() or not self.last_used:
+            return
+        idle = (datetime.now() - self.last_used).total_seconds()
+        timeout = self.cfg.get(self.idle_timeout_key, 300)
+        if idle >= timeout:
+            log(f"[{self.label}] Idle {idle:.0f}s — unloading")
+            self.unload_model()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Theme
+# ═══════════════════════════════════════════════════════════════════════════════
+
+THEME = """
+/* ── Global ─────────────────────────────────────────────────────────── */
+QWidget {
+    font-family: 'Segoe UI', 'SF Pro Display', 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    color: #e2e8f0;
+}
+/* ── Main window card ───────────────────────────────────────────────── */
+QWidget#card {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #060d1f, stop:0.6 #0a1628, stop:1 #060d1f);
+    border: 1px solid rgba(59,130,246,0.18);
+    border-radius: 14px;
+}
+/* ── Text areas ─────────────────────────────────────────────────────── */
+QTextEdit {
+    background: rgba(4,10,28,0.75);
+    border: 1px solid rgba(59,130,246,0.18);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: #e2e8f0;
+    selection-background-color: rgba(59,130,246,0.35);
+    line-height: 1.5;
+}
+QTextEdit:focus {
+    border: 1px solid rgba(96,165,250,0.55);
+    background: rgba(4,10,28,0.9);
+}
+/* ── Line edit ──────────────────────────────────────────────────────── */
+QLineEdit {
+    background: rgba(4,10,28,0.75);
+    border: 1px solid rgba(59,130,246,0.18);
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: #e2e8f0;
+}
+QLineEdit:focus { border: 1px solid rgba(96,165,250,0.55); }
+/* ── Primary button ─────────────────────────────────────────────────── */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #1d4ed8, stop:1 #3b82f6);
+    border: 1px solid rgba(96,165,250,0.3);
+    border-radius: 8px;
+    padding: 9px 18px;
+    color: #fff;
+    font-weight: 600;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #1e40af, stop:1 #2563eb);
+    border: 1px solid rgba(96,165,250,0.5);
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #1e3a8a, stop:1 #1d4ed8);
+}
+QPushButton:disabled {
+    background: rgba(255,255,255,0.04);
+    color: rgba(255,255,255,0.22);
+    border: 1px solid rgba(255,255,255,0.06);
+}
+/* ── Secondary / ghost button ───────────────────────────────────────── */
+QPushButton#ghost {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #94a3b8;
+}
+QPushButton#ghost:hover {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.2);
+    color: #e2e8f0;
+}
+/* ── Danger button ──────────────────────────────────────────────────── */
+QPushButton#danger {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #991b1b,stop:1 #dc2626);
+    border: 1px solid rgba(248,113,113,0.3);
+}
+QPushButton#danger:hover {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #7f1d1d,stop:1 #b91c1c);
+}
+/* ── Labels ─────────────────────────────────────────────────────────── */
+QLabel { color: #e2e8f0; background: transparent; }
+QLabel#title { font-size: 20px; font-weight: 700; color: #f1f5f9; letter-spacing: -0.3px; }
+QLabel#tag   { font-size: 10px; font-weight: 700; color: #60a5fa;
+               letter-spacing: 1.8px; text-transform: uppercase; }
+QLabel#dim   { color: #64748b; font-size: 12px; }
+QLabel#status { color: #94a3b8; font-size: 11px; padding: 3px 10px;
+                background: rgba(255,255,255,0.04); border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.06); }
+/* ── Separator ──────────────────────────────────────────────────────── */
+QFrame#sep { background: rgba(59,130,246,0.12); max-height: 1px; }
+/* ── Chat bubble area ───────────────────────────────────────────────── */
+QWidget#chatPanel {
+    background: rgba(3,7,20,0.6);
+    border: 1px solid rgba(59,130,246,0.12);
+    border-radius: 10px;
+}
+/* ── Combo box ──────────────────────────────────────────────────────── */
+QComboBox {
+    background: rgba(4,10,28,0.75);
+    border: 1px solid rgba(59,130,246,0.18);
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: #e2e8f0;
+}
+QComboBox:hover { border: 1px solid rgba(96,165,250,0.4); }
+QComboBox QAbstractItemView {
+    background: #0a1628;
+    color: #e2e8f0;
+    selection-background-color: #1d4ed8;
+    border: 1px solid rgba(59,130,246,0.3);
+}
+/* ── Checkbox ───────────────────────────────────────────────────────── */
+QCheckBox { color: #cbd5e1; spacing: 8px; }
+QCheckBox::indicator { width: 17px; height: 17px; border-radius: 4px;
+                        border: 1px solid rgba(255,255,255,0.15);
+                        background: rgba(4,10,28,0.75); }
+QCheckBox::indicator:checked {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #1d4ed8,stop:1 #3b82f6);
+    border: 1px solid rgba(96,165,250,0.4);
+}
+/* ── Spin box ───────────────────────────────────────────────────────── */
+QSpinBox, QDoubleSpinBox {
+    background: rgba(4,10,28,0.75);
+    border: 1px solid rgba(59,130,246,0.18);
+    border-radius: 8px;
+    padding: 6px 10px;
+    color: #e2e8f0;
+}
+/* ── Scrollbar ──────────────────────────────────────────────────────── */
+QScrollBar:vertical { background: transparent; width: 5px; border-radius: 3px; }
+QScrollBar::handle:vertical { background: rgba(96,165,250,0.2); border-radius: 3px; min-height: 20px; }
+QScrollBar::handle:vertical:hover { background: rgba(96,165,250,0.4); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { height: 0; }
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Settings dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SettingsDialog(QDialog):
+    saved = pyqtSignal()
+
+    def __init__(self, cfg: ConfigManager, parent=None, re_register_cb=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self._re_register_cb = re_register_cb
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self._drag_pos = None
+        self.setMinimumSize(580, 680)
+        self.resize(680, 820)
+        self._build_ui()
+        self._load()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(e.pos())
+            if child is None or isinstance(child, QLabel):
+                self._drag_pos = e.globalPosition().toPoint() - self.pos()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+    def _row(self, label: str, widget) -> QHBoxLayout:
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        lbl.setFixedWidth(130)
+        lbl.setStyleSheet("color:#94a3b8;")
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        return row
+
+    def _browse_file(self, edit: QLineEdit, caption: str, filt: str):
+        path, _ = QFileDialog.getOpenFileName(self, caption, "", filt)
+        if path:
+            edit.setText(path)
+
+    def _build_ui(self):
+        # Solid background so no click-through on Windows
+        self.setStyleSheet(
+            THEME
+            + "\nSettingsDialog { background: #060d1f; border: 1px solid rgba(59,130,246,0.18); }"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 24)
+        lay.setSpacing(16)
+
+        tb = QHBoxLayout()
+        title = QLabel("Settings")
+        title.setObjectName("title")
+        tb.addWidget(title)
+        tb.addStretch()
+        close = QPushButton("✕")
+        close.setObjectName("ghost")
+        close.setFixedSize(30, 30)
+        close.setStyleSheet(
+            "QPushButton{background:transparent;border:none;color:#64748b;font-size:16px;}"
+            "QPushButton:hover{background:#7f1d1d;color:white;border-radius:6px;}"
+        )
+        close.clicked.connect(self.reject)
+        tb.addWidget(close)
+        lay.addLayout(tb)
+
+        sep = QFrame()
+        sep.setObjectName("sep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea{background:#060d1f;border:none;}"
+            "QScrollArea>QWidget>QWidget{background:#060d1f;}"
+        )
+        inner = QWidget()
+        inner.setStyleSheet("QWidget{background:#060d1f;}")
+        form = QVBoxLayout(inner)
+        form.setSpacing(12)
+        form.setContentsMargins(0, 0, 0, 0)
+
+        def section(title_txt):
+            lbl = QLabel(title_txt)
+            lbl.setObjectName("tag")
+            lbl.setStyleSheet(
+                "QLabel{color:#60a5fa;font-size:10px;font-weight:700;"
+                "letter-spacing:1.8px;margin-top:6px;}"
+            )
+            form.addWidget(lbl)
+
+        # LLM Server ─────────────────────────────────────────────────────
+        section("LLM SERVER")
+        self.server_edit = QLineEdit()
+        self.server_edit.setReadOnly(True)
+        btn_s = QPushButton("Browse")
+        btn_s.setObjectName("ghost")
+        btn_s.setFixedWidth(80)
+        btn_s.clicked.connect(
+            lambda: self._browse_file(
+                self.server_edit,
+                "Select llama-server",
+                "Executable (llama-server*);;All (*)",
+            )
+        )
+        srv_row = QHBoxLayout()
+        srv_row.addWidget(self.server_edit, 1)
+        srv_row.addWidget(btn_s)
+        srv_w = QWidget()
+        srv_w.setLayout(srv_row)
+        form.addLayout(self._row("Server binary", srv_w))
+
+        # Chat model ─────────────────────────────────────────────────────
+        self.model_edit = QLineEdit()
+        self.model_edit.setReadOnly(True)
+        btn_m = QPushButton("Browse")
+        btn_m.setObjectName("ghost")
+        btn_m.setFixedWidth(80)
+        btn_m.clicked.connect(
+            lambda: self._browse_file(
+                self.model_edit, "Select GGUF model", "GGUF (*.gguf)"
+            )
+        )
+        mod_row = QHBoxLayout()
+        mod_row.addWidget(self.model_edit, 1)
+        mod_row.addWidget(btn_m)
+        mod_w = QWidget()
+        mod_w.setLayout(mod_row)
+        form.addLayout(self._row("Chat model", mod_w))
+
+        self.recent_combo = QComboBox()
+        self.recent_combo.currentTextChanged.connect(
+            lambda t: self.model_edit.setText(t) if t else None
+        )
+        form.addLayout(self._row("Recent models", self.recent_combo))
+
+        # Autocorrect model ──────────────────────────────────────────────
+        self.ac_same_cb = QCheckBox("Same model as chat")
+        self.ac_same_cb.setStyleSheet("color:#cbd5e1; spacing:8px;")
+        form.addWidget(self.ac_same_cb)
+
+        self.ac_model_edit = QLineEdit()
+        self.ac_model_edit.setReadOnly(True)
+        btn_ac = QPushButton("Browse")
+        btn_ac.setObjectName("ghost")
+        btn_ac.setFixedWidth(80)
+        btn_ac.clicked.connect(
+            lambda: self._browse_file(
+                self.ac_model_edit, "Select autocorrect model", "GGUF (*.gguf)"
+            )
+        )
+        ac_row = QHBoxLayout()
+        ac_row.addWidget(self.ac_model_edit, 1)
+        ac_row.addWidget(btn_ac)
+        self.ac_row_w = QWidget()
+        self.ac_row_w.setLayout(ac_row)
+        form.addLayout(self._row("Autocorrect model", self.ac_row_w))
+
+        self.port_spin = no_scroll(QSpinBox())
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setFixedWidth(100)
+        form.addLayout(self._row("Port", self.port_spin))
+
+        self.ctx_spin = no_scroll(QSpinBox())
+        self.ctx_spin.setRange(512, 131072)
+        self.ctx_spin.setSingleStep(512)
+        self.ctx_spin.setFixedWidth(100)
+        form.addLayout(self._row("Context size", self.ctx_spin))
+
+        self.gpu_spin = no_scroll(QSpinBox())
+        self.gpu_spin.setRange(0, 999)
+        self.gpu_spin.setFixedWidth(100)
+        form.addLayout(self._row("GPU layers", self.gpu_spin))
+
+        self.temp_spin = no_scroll(QDoubleSpinBox())
+        self.temp_spin.setRange(0.0, 2.0)
+        self.temp_spin.setSingleStep(0.05)
+        self.temp_spin.setDecimals(2)
+        self.temp_spin.setFixedWidth(100)
+        form.addLayout(self._row("Temperature", self.temp_spin))
+
+        self.topk_spin = no_scroll(QSpinBox())
+        self.topk_spin.setRange(0, 1000)
+        self.topk_spin.setFixedWidth(100)
+        form.addLayout(self._row("Top-K", self.topk_spin))
+
+        self.topp_spin = no_scroll(QDoubleSpinBox())
+        self.topp_spin.setRange(0.0, 1.0)
+        self.topp_spin.setSingleStep(0.05)
+        self.topp_spin.setDecimals(2)
+        self.topp_spin.setFixedWidth(100)
+        form.addLayout(self._row("Top-P", self.topp_spin))
+
+        self.minp_spin = no_scroll(QDoubleSpinBox())
+        self.minp_spin.setRange(0.0, 1.0)
+        self.minp_spin.setSingleStep(0.01)
+        self.minp_spin.setDecimals(2)
+        self.minp_spin.setFixedWidth(100)
+        form.addLayout(self._row("Min-P", self.minp_spin))
+
+        self.keep_cb = QCheckBox("Keep chat model loaded in memory")
+        form.addWidget(self.keep_cb)
+
+        self.idle_spin = no_scroll(QSpinBox())
+        self.idle_spin.setRange(30, 3600)
+        self.idle_spin.setSingleStep(30)
+        self.idle_spin.setFixedWidth(100)
+        form.addLayout(self._row("Idle timeout (s)", self.idle_spin))
+
+        # Hotkey ──────────────────────────────────────────────────────────
+        section("HOTKEY")
+        self.hotkey_edit = HotkeyEdit(re_register_cb=self._re_register_cb)
+        form.addLayout(self._row("Trigger hotkey", self.hotkey_edit))
+
+        # System prompt ───────────────────────────────────────────────────
+        section("SYSTEM PROMPT  (override)")
+        self.sysprompt_edit = QTextEdit()
+        self.sysprompt_edit.setPlaceholderText(
+            "Leave blank to use the built-in correction prompt."
+        )
+        self.sysprompt_edit.setFixedHeight(90)
+        form.addWidget(self.sysprompt_edit)
+
+        # Correction strength ─────────────────────────────────────────────
+        section("CORRECTION STRENGTH")
+        _strength_labels = [
+            "0 — Minimal  (typos + capitalisation only)",
+            "1 — Light    (typos + grammar, preserve wording)",
+            "2 — Standard (grammar + spelling, light clarity)",
+            "3 — Thorough (grammar + structure + word choice)",
+            "4 — Full Rewrite (maximum clarity, restructure)",
+        ]
+        self.strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.strength_slider.setRange(0, 4)
+        self.strength_slider.setSingleStep(1)
+        self.strength_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.strength_slider.setTickInterval(1)
+        self.strength_slider.setStyleSheet(
+            "QSlider::groove:horizontal{height:4px;background:rgba(59,130,246,0.2);border-radius:2px;}"
+            "QSlider::handle:horizontal{width:16px;height:16px;margin:-6px 0;"
+            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #1d4ed8,stop:1 #3b82f6);"
+            "border-radius:8px;}"
+            "QSlider::sub-page:horizontal{background:rgba(59,130,246,0.5);border-radius:2px;}"
+        )
+        self.strength_label = QLabel(_strength_labels[2])
+        self.strength_label.setStyleSheet(
+            "color:#94a3b8;font-size:11px;margin-left:4px;"
+        )
+        self.strength_slider.valueChanged.connect(
+            lambda v: self.strength_label.setText(_strength_labels[v])
+        )
+        form.addLayout(self._row("Strength", self.strength_slider))
+        form.addWidget(self.strength_label)
+
+        form.addStretch()
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("sep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        btns.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save settings")
+        save.clicked.connect(self._save)
+        btns.addWidget(cancel)
+        btns.addWidget(save)
+        lay.addLayout(btns)
+
+        grip_row = QHBoxLayout()
+        grip_row.addStretch()
+        grip = QSizeGrip(self)
+        grip.setFixedSize(16, 16)
+        grip.setStyleSheet("QSizeGrip{background:transparent;}")
+        grip_row.addWidget(grip)
+        lay.addLayout(grip_row)
+
+        # Wire up the "same as chat" toggle
+        self.ac_same_cb.toggled.connect(self._on_ac_same_toggled)
+
+    def _on_ac_same_toggled(self, checked: bool):
+        self.ac_row_w.setEnabled(not checked)
+
+    def _load(self):
+        self.server_edit.setText(self.cfg.get("llama_server_path", ""))
+        self.model_edit.setText(self.cfg.get("model_path", ""))
+        recents = self.cfg.get("recent_models", [])
+        self.recent_combo.addItems(recents)
+        self.ac_same_cb.setChecked(self.cfg.get("ac_same_as_chat", True))
+        self.ac_model_edit.setText(self.cfg.get("ac_model_path", ""))
+        self.port_spin.setValue(self.cfg.get("server_port", 8080))
+        self.ctx_spin.setValue(self.cfg.get("context_size", 4096))
+        self.gpu_spin.setValue(self.cfg.get("gpu_layers", 99))
+        self.temp_spin.setValue(self.cfg.get("temperature", 0.1))
+        self.topk_spin.setValue(self.cfg.get("top_k", 40))
+        self.topp_spin.setValue(self.cfg.get("top_p", 0.95))
+        self.minp_spin.setValue(self.cfg.get("min_p", 0.05))
+        self.keep_cb.setChecked(self.cfg.get("keep_model_loaded", True))
+        self.idle_spin.setValue(self.cfg.get("idle_timeout_seconds", 300))
+        self.hotkey_edit.setText(self.cfg.get("hotkey", "ctrl+shift+space"))
+        self.sysprompt_edit.setPlainText(self.cfg.get("system_prompt", ""))
+        self.strength_slider.setValue(self.cfg.get("correction_strength", 2))
+        self._on_ac_same_toggled(self.ac_same_cb.isChecked())
+
+    def _save(self):
+        self.cfg.set("llama_server_path", self.server_edit.text())
+        self.cfg.set("model_path", self.model_edit.text())
+        self.cfg.set("ac_same_as_chat", self.ac_same_cb.isChecked())
+        if self.ac_same_cb.isChecked():
+            self.cfg.set("ac_model_path", self.model_edit.text())
+        else:
+            self.cfg.set("ac_model_path", self.ac_model_edit.text())
+        self.cfg.set("server_port", self.port_spin.value())
+        self.cfg.set("context_size", self.ctx_spin.value())
+        self.cfg.set("gpu_layers", self.gpu_spin.value())
+        self.cfg.set("temperature", self.temp_spin.value())
+        self.cfg.set("top_k", self.topk_spin.value())
+        self.cfg.set("top_p", self.topp_spin.value())
+        self.cfg.set("min_p", self.minp_spin.value())
+        self.cfg.set("keep_model_loaded", self.keep_cb.isChecked())
+        self.cfg.set("idle_timeout_seconds", self.idle_spin.value())
+        self.cfg.set("hotkey", self.hotkey_edit.text())
+        self.cfg.set("system_prompt", self.sysprompt_edit.toPlainText().strip())
+        self.cfg.set("correction_strength", self.strength_slider.value())
+        model = self.model_edit.text()
+        if model:
+            self.cfg.add_recent(model)
+        self.saved.emit()
+        self.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Correction window
+# ═══════════════════════════════════════════════════════════════════════════════
+
 
 class CorrectionWindow(QWidget):
-    """Main correction window with chat interface"""
+    """Main floating popup shown when the hotkey fires."""
 
-    correction_accepted = pyqtSignal(str)
-    correction_ready = pyqtSignal(str, str)
-    correction_failed_signal = pyqtSignal()
-    chat_response_ready = pyqtSignal(str)
-    chat_error_signal = pyqtSignal()
+    accepted = pyqtSignal(str)
+    _correction_ready = pyqtSignal(str, str)
+    _correction_failed = pyqtSignal()
+    _chat_token = pyqtSignal(str)
+    _chat_done = pyqtSignal(str)
+    _chat_error = pyqtSignal(str)
 
-    def __init__(self, original_text, model_manager, onnx_manager, config_manager):
+    def __init__(
+        self,
+        original: str,
+        ac_model: ModelManager,
+        chat_model: ModelManager,
+        cfg: ConfigManager,
+        re_register_cb=None,
+    ):
+        log("[CW] CorrectionWindow.__init__ start")
         super().__init__()
-        self.original_text = original_text
-        self.model_manager = model_manager
-        self.onnx_manager = onnx_manager
-        self.config = config_manager
-        self.corrected_text = None
-        self.chat_history = []
+        self.original = original
+        self.corrected = original
+        self.ac_model = ac_model
+        self.chat_model = chat_model
+        self.cfg = cfg
+        self._re_register_cb = re_register_cb or (lambda: None)
+        self.chat_history: list[dict] = []
+        self._stream_worker: StreamWorker | None = None
+        self._stream_buf = ""
+        self._drag_pos = None
 
-        self.init_ui()
-        self.setup_window()
+        log("[CW] Building UI…")
+        self._build_ui()
+        log("[CW] Positioning window…")
+        self._position_window()
+        log("[CW] Connecting signals…")
+        self._connect_signals()
+        self._setup_shortcuts()
 
-        # Connect signals for cross-thread communication
-        self.correction_ready.connect(self.on_correction_done)
-        self.correction_failed_signal.connect(self.on_correction_failed)
-        self.chat_response_ready.connect(self.on_chat_response)
-        self.chat_error_signal.connect(self.on_chat_error)
+        log("[CW] Starting correction thread…")
+        threading.Thread(target=self._do_correction, daemon=True).start()
+        log("[CW] __init__ complete")
 
-        # Start correction in background
-        threading.Thread(target=self.perform_initial_correction, daemon=True).start()
-
-    def setup_window(self):
-        """Configure window properties"""
-        # Keep window on top, and make it frameless and draggable again
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_ShowWithoutActivating, False)
-
-        # Enable window dragging
-        self.dragging = False
-        self.drag_position = None
-
-        # Position at cursor relative to active screen
-        cursor_pos = QCursor.pos()
-        screen = QApplication.screenAt(cursor_pos)
-        if not screen:
-            screen = QApplication.primaryScreen()
-        screen_rect = screen.geometry()
-
-        # Dynamically size to prevent being "massive" on smaller screens
-        base_width = 720
-        base_height = 650
-        max_width = int(screen_rect.width() * 0.8)
-        max_height = int(screen_rect.height() * 0.85)
-        
-        window_width = min(base_width, max_width)
-        window_height = min(base_height, max_height)
-        self.resize(window_width, window_height)
-
-        # Ensure window stays on screen
-        x = min(cursor_pos.x() - window_width // 2, screen_rect.right() - window_width)
-        y = min(cursor_pos.y() - window_height // 2, screen_rect.bottom() - window_height)
-        x = max(x, screen_rect.x())
-        y = max(y, screen_rect.y())
-
+    def _position_window(self):
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        sr = screen.geometry()
+        w, h = min(740, int(sr.width() * 0.8)), min(680, int(sr.height() * 0.85))
+        self.resize(w, h)
+        cx, cy = QCursor.pos().x(), QCursor.pos().y()
+        x = max(sr.x(), min(cx - w // 2, sr.right() - w))
+        y = max(sr.y(), min(cy - h // 2, sr.bottom() - h))
         self.move(x, y)
 
-    def init_ui(self):
-        """Initialize the user interface"""
-        self.setWindowTitle("AI Text Corrector")
-        self.setMinimumSize(400, 350)
-        self.resize(720, 650)
+    def _connect_signals(self):
+        self._correction_ready.connect(self._on_correction_ready)
+        self._correction_failed.connect(self._on_correction_failed)
+        self._chat_token.connect(self._on_chat_token)
+        self._chat_done.connect(self._on_chat_done)
+        self._chat_error.connect(self._on_chat_error)
 
-        # Premium dark slate-blue theme
-        self.setStyleSheet("""
-            QWidget#mainWidget {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0f172a, stop:0.5 #1e293b, stop:1 #0f172a);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 16px;
-            }
-            QWidget {
-                color: #f8fafc;
-                font-family: 'Segoe UI', system-ui, sans-serif;
-                font-size: 14px;
-            }
-            QTextEdit {
-                background-color: rgba(15, 23, 42, 0.6);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 10px;
-                padding: 12px;
-                color: #f8fafc;
-                font-size: 14px;
-                selection-background-color: rgba(56, 189, 248, 0.4);
-            }
-            QTextEdit:focus {
-                border: 1px solid rgba(56, 189, 248, 0.6);
-            }
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0ea5e9, stop:1 #38bdf8);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 8px;
-                padding: 10px 20px;
-                color: white;
-                font-weight: 600;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0284c7, stop:1 #0ea5e9);
-            }
-            QPushButton:pressed {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0369a1, stop:1 #0284c7);
-            }
-            QPushButton:disabled {
-                background: rgba(255, 255, 255, 0.04);
-                color: rgba(255, 255, 255, 0.25);
-            }
-            QPushButton#secondaryBtn {
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-            }
-            QPushButton#secondaryBtn:hover {
-                background: rgba(255, 255, 255, 0.1);
-                border: 1px solid rgba(255, 255, 255, 0.3);
-            }
-            QPushButton#dangerBtn {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #ef4444, stop:1 #f87171);
-            }
-            QPushButton#dangerBtn:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #dc2626, stop:1 #ef4444);
-            }
-            QLabel {
-                color: #f8fafc;
-                font-size: 13px;
-                background: transparent;
-            }
-            QLabel#status {
-                color: #cbd5e1;
-                font-size: 12px;
-                font-weight: 600;
-                padding: 4px 10px;
-                background: rgba(255, 255, 255, 0.05);
-                border-radius: 12px;
-                border: 1px solid rgba(255, 255, 255, 0.05);
-            }
-            QLabel#header {
-                font-size: 22px;
-                font-weight: 800;
-                color: #f8fafc;
-                letter-spacing: -0.5px;
-            }
-            QLabel#sectionLabel {
-                font-size: 11px;
-                font-weight: 800;
-                color: #38bdf8;
-                text-transform: uppercase;
-                letter-spacing: 1.5px;
-                padding-bottom: 2px;
-            }
-            QLineEdit {
-                background-color: rgba(15, 23, 42, 0.6);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 10px;
-                padding: 10px 14px;
-                color: #f8fafc;
-                font-size: 14px;
-                selection-background-color: rgba(56, 189, 248, 0.4);
-            }
-            QLineEdit:focus {
-                border: 1px solid rgba(56, 189, 248, 0.6);
-            }
-            QFrame#chatFrame {
-                background-color: rgba(0, 0, 0, 0.30);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 12px;
-            }
-            QFrame#separator {
-                background-color: rgba(255, 255, 255, 0.1);
-                max-height: 1px;
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 6px;
-                border-radius: 3px;
-            }
-            QScrollBar::handle:vertical {
-                background: rgba(255, 255, 255, 0.15);
-                border-radius: 3px;
-                min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: rgba(255, 255, 255, 0.30);
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-        """)
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            ch = self.childAt(e.pos())
+            if ch is None or isinstance(ch, QLabel):
+                self._drag_pos = e.globalPosition().toPoint() - self.pos()
 
-        # Main widget with background
-        main_widget = QWidget()
-        main_widget.setObjectName("mainWidget")
-        main_layout = QVBoxLayout(main_widget)
-        main_layout.setContentsMargins(24, 20, 24, 20)
-        main_layout.setSpacing(14)
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and e.buttons() == Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
 
-        # Header row
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(12)
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
 
-        title = QLabel("✦ Text Corrector")
-        title.setObjectName("header")
-        header_layout.addWidget(title)
+    def _setup_shortcuts(self):
+        from PyQt6.QtGui import QShortcut, QKeySequence
 
-        header_layout.addStretch()
+        sc_accept = QShortcut(QKeySequence("Ctrl+Return"), self)
+        sc_accept.activated.connect(self._accept_if_ready)
+        sc_esc = QShortcut(QKeySequence("Escape"), self)
+        sc_esc.activated.connect(self.close)
 
-        self.model_label = QLabel("")
-        self.model_label.setObjectName("status")
-        self.model_label.hide()
-        header_layout.addWidget(self.model_label)
+    def _accept_if_ready(self):
+        if self.accept_btn.isEnabled():
+            self._accept()
 
-        self.status_label = QLabel("⏳ Loading model...")
-        self.status_label.setObjectName("status")
-        header_layout.addWidget(self.status_label)
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.chat_input.hasFocus():
+                self._send_chat()
+                return
+            elif not self.corr_edit.hasFocus() and self.accept_btn.isEnabled():
+                self._accept()
+                return
+        super().keyPressEvent(e)
+
+    def _make_sep(self):
+        f = QFrame()
+        f.setObjectName("sep")
+        f.setFrameShape(QFrame.Shape.HLine)
+        return f
+
+    def _build_ui(self):
+        self.setWindowTitle("TextCorrector")
+        self.setMinimumSize(420, 380)
+        self.setStyleSheet(THEME)
+
+        card = QWidget()
+        card.setObjectName("card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(12)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(10)
+        title = QLabel("TextCorrector")
+        title.setObjectName("title")
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        self.method_badge = QLabel("")
+        self.method_badge.setObjectName("status")
+        self.method_badge.hide()
+        hdr.addWidget(self.method_badge)
+
+        self.status_lbl = QLabel("⏳  Correcting…")
+        self.status_lbl.setObjectName("status")
+        hdr.addWidget(self.status_lbl)
 
         settings_btn = QPushButton("⚙")
-        settings_btn.setObjectName("secondaryBtn")
-        settings_btn.setFixedSize(32, 32)
-        settings_btn.setToolTip("Settings")
-        settings_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(255, 255, 255, 0.07);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 6px;
-                font-size: 16px;
-                padding: 0;
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.15);
-            }
-        """)
-        settings_btn.clicked.connect(self.open_settings)
-        header_layout.addWidget(settings_btn)
-        main_layout.addLayout(header_layout)
+        settings_btn.setObjectName("ghost")
+        settings_btn.setFixedSize(30, 30)
+        settings_btn.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,0.04);"
+            "border:1px solid rgba(255,255,255,0.08);border-radius:8px;font-size:15px;padding:0;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.1);}"
+        )
+        settings_btn.clicked.connect(self._open_settings)
+        hdr.addWidget(settings_btn)
+        lay.addLayout(hdr)
+        lay.addWidget(self._make_sep())
 
-        # Separator
-        sep1 = QFrame()
-        sep1.setObjectName("separator")
-        sep1.setFrameShape(QFrame.HLine)
-        main_layout.addWidget(sep1)
+        orig_lbl = QLabel("ORIGINAL")
+        orig_lbl.setObjectName("tag")
+        lay.addWidget(orig_lbl)
+        self.orig_edit = QTextEdit()
+        self.orig_edit.setPlainText(self.original)
+        self.orig_edit.setReadOnly(True)
+        self.orig_edit.setMinimumHeight(65)
+        self.orig_edit.setMaximumHeight(120)
+        lay.addWidget(self.orig_edit)
 
-        # Original text section
-        orig_label = QLabel("ORIGINAL")
-        orig_label.setObjectName("sectionLabel")
-        main_layout.addWidget(orig_label)
+        corr_lbl = QLabel("CORRECTED")
+        corr_lbl.setObjectName("tag")
+        lay.addWidget(corr_lbl)
+        self.corr_edit = QTextEdit()
+        self.corr_edit.setPlaceholderText("Processing…")
+        self.corr_edit.setMinimumHeight(80)
+        lay.addWidget(self.corr_edit, 1)
 
-        self.original_edit = QTextEdit()
-        self.original_edit.setPlainText(self.original_text)
-        self.original_edit.setReadOnly(True)
-        self.original_edit.setMinimumHeight(60)
-        main_layout.addWidget(self.original_edit)
+        lay.addWidget(self._make_sep())
 
-        # Corrected text section
-        corrected_label = QLabel("CORRECTED")
-        corrected_label.setObjectName("sectionLabel")
-        main_layout.addWidget(corrected_label)
+        chat_panel = QWidget()
+        chat_panel.setObjectName("chatPanel")
+        cp_lay = QVBoxLayout(chat_panel)
+        cp_lay.setContentsMargins(14, 10, 14, 10)
+        cp_lay.setSpacing(8)
 
-        self.corrected_edit = QTextEdit()
-        self.corrected_edit.setPlaceholderText("Processing...")
-        self.corrected_edit.setMinimumHeight(60)
-        main_layout.addWidget(self.corrected_edit)
+        chat_lbl = QLabel("ASK AI")
+        chat_lbl.setObjectName("tag")
+        cp_lay.addWidget(chat_lbl)
 
-        # Chat section
-        chat_frame = QFrame()
-        chat_frame.setObjectName("chatFrame")
-        chat_layout = QVBoxLayout(chat_frame)
-        chat_layout.setContentsMargins(14, 12, 14, 12)
-        chat_layout.setSpacing(8)
-
-        chat_header = QLabel("REFINE")
-        chat_header.setObjectName("sectionLabel")
-        chat_layout.addWidget(chat_header)
-
-        # Chat history display
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
-        self.chat_display.setPlaceholderText("Ask the AI for further changes...")
-        self.chat_display.setMinimumHeight(50)
-        self.chat_display.setMaximumHeight(120)
-        chat_layout.addWidget(self.chat_display)
+        self.chat_display.setPlaceholderText("Chat with the AI for further changes…")
+        self.chat_display.setMinimumHeight(45)
+        self.chat_display.setMaximumHeight(130)
+        self.chat_display.setStyleSheet(
+            "QTextEdit{background:rgba(2,6,18,0.6);border:none;border-radius:8px;padding:8px;}"
+        )
+        cp_lay.addWidget(self.chat_display)
 
-        # Chat input
-        chat_input_layout = QHBoxLayout()
-        chat_input_layout.setSpacing(8)
+        ci_row = QHBoxLayout()
+        ci_row.setSpacing(8)
         self.chat_input = QLineEdit()
         self.chat_input.setPlaceholderText(
-            "e.g. 'Make it more formal', 'Shorter please'..."
+            "e.g. 'Make it more formal', 'Shorter', 'Fix only spelling'…"
         )
-        self.chat_input.returnPressed.connect(self.send_chat_message)
-        chat_input_layout.addWidget(self.chat_input)
-
+        self.chat_input.returnPressed.connect(self._send_chat)
+        ci_row.addWidget(self.chat_input, 1)
         self.send_btn = QPushButton("Send")
-        self.send_btn.clicked.connect(self.send_chat_message)
+        self.send_btn.setFixedWidth(72)
         self.send_btn.setEnabled(False)
-        self.send_btn.setFixedWidth(80)
-        chat_input_layout.addWidget(self.send_btn)
+        self.send_btn.clicked.connect(self._send_chat)
+        ci_row.addWidget(self.send_btn)
+        cp_lay.addLayout(ci_row)
 
-        chat_layout.addLayout(chat_input_layout)
-        main_layout.addWidget(chat_frame)
+        lay.addWidget(chat_panel)
 
-        main_layout.addStretch()
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
 
-        # Action buttons
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(8)
-
-        self.accept_btn = QPushButton("✓  Accept && Paste")
-        self.accept_btn.clicked.connect(self.accept_correction)
+        self.accept_btn = QPushButton("✓  Accept & Paste")
         self.accept_btn.setEnabled(False)
-        button_layout.addWidget(self.accept_btn)
+        self.accept_btn.clicked.connect(self._accept)
+        btn_row.addWidget(self.accept_btn, 2)
 
         self.copy_btn = QPushButton("Copy")
-        self.copy_btn.setObjectName("secondaryBtn")
-        self.copy_btn.clicked.connect(self.copy_corrected)
+        self.copy_btn.setObjectName("ghost")
         self.copy_btn.setEnabled(False)
-        button_layout.addWidget(self.copy_btn)
+        self.copy_btn.clicked.connect(self._copy)
+        btn_row.addWidget(self.copy_btn)
 
         reset_btn = QPushButton("Reset")
-        reset_btn.setObjectName("secondaryBtn")
-        reset_btn.clicked.connect(self.reset_text)
-        button_layout.addWidget(reset_btn)
+        reset_btn.setObjectName("ghost")
+        reset_btn.clicked.connect(self._reset)
+        btn_row.addWidget(reset_btn)
 
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("dangerBtn")
+        cancel_btn.setObjectName("danger")
         cancel_btn.clicked.connect(self.close)
-        button_layout.addWidget(cancel_btn)
+        btn_row.addWidget(cancel_btn)
 
-        main_layout.addLayout(button_layout)
+        lay.addLayout(btn_row)
 
-        # Set the main widget as the layout
-        outer_layout = QVBoxLayout()
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.addWidget(main_widget)
-        self.setLayout(outer_layout)
+    # ── correction logic ──────────────────────────────────────────────────
+    def _do_correction(self):
+        """Autocorrect using the LLM (autocorrect model).
 
-    def nativeEvent(self, eventType, message):
-        """Handle native Windows events for true frameless window resizing"""
-        if eventType == b'windows_generic_MSG' or eventType == b'windows_dispatcher_MSG':
-            import ctypes
-            import ctypes.wintypes
-            try:
-                msg = ctypes.wintypes.MSG.from_address(message.__int__())
-                if msg.message == 0x0084: # WM_NCHITTEST
-                    # Use QCursor.pos() which Qt natively translates to logical High DPI multi-monitor coordinates
-                    pos = self.mapFromGlobal(QCursor.pos())
-                    
-                    # 10px margin around the window acts as native resize borders
-                    margin = 10
-                    left = pos.x() < margin
-                    right = pos.x() > self.width() - margin
-                    top = pos.y() < margin
-                    bottom = pos.y() > self.height() - margin
-                    
-                    res = 0
-                    if left and top: res = 13 # HTTOPLEFT
-                    elif right and top: res = 14 # HTTOPRIGHT
-                    elif left and bottom: res = 16 # HTBOTTOMLEFT
-                    elif right and bottom: res = 17 # HTBOTTOMRIGHT
-                    elif left: res = 10 # HTLEFT
-                    elif right: res = 11 # HTRIGHT
-                    elif top: res = 12 # HTTOP
-                    elif bottom: res = 15 # HTBOTTOM
-                    
-                    if res != 0:
-                        return True, res
-            except Exception:
-                pass
-        return super().nativeEvent(eventType, message)
+        Tries patch-based correction first (structured JSON output, minimal tokens).
+        Falls back to full-text correction if patch mode fails.
+        """
+        import traceback
 
-    def keyPressEvent(self, event):
-        """Handle keyboard shortcuts"""
-        if event.key() == Qt.Key_Escape:
-            self.close()
-        elif event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.corrected_text:
-            if self.chat_input.hasFocus():
-                self.send_chat_message()
-            else:
-                self.accept_correction()
-        super().keyPressEvent(event)
+        log("[CW] _do_correction started (LLM autocorrect)")
+        try:
+            text = self.original
 
-    def mousePressEvent(self, event):
-        """Start window dragging — only when clicking on empty chrome, not on child widgets"""
-        if event.button() == Qt.LeftButton:
-            # Only drag if clicking on the window background, not on a child widget
-            child = self.childAt(event.pos())
-            if child is None or isinstance(child, QLabel):
-                self.dragging = True
-                self.drag_position = event.globalPos() - self.pos()
-                event.accept()
-            else:
-                super().mousePressEvent(event)
+            if not self.ac_model.is_loaded():
+                self.ac_model.load_model()
 
-    def mouseMoveEvent(self, event):
-        """Handle window dragging"""
-        if self.dragging and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPos() - self.drag_position)
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
+            if not self.ac_model.is_loaded():
+                log("[CW] Autocorrect model unavailable — showing original")
+                self._correction_ready.emit(text, "No changes (model error)")
+                return
 
-    def mouseReleaseEvent(self, event):
-        """Stop window dragging"""
-        if event.button() == Qt.LeftButton and self.dragging:
-            self.dragging = False
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)
-
-    def perform_initial_correction(self):
-        """Perform the initial text correction - ALWAYS uses ONNX first (T5-first architecture)"""
-        log_debug("perform_initial_correction started (background thread)")
-        
-        # ALWAYS try ONNX first for autocorrect (T5-first architecture)
-        corrected = None
-        onnx_attempted = False
-        used_model = "Unknown"
-        
-        if self.onnx_manager:
-            log_debug("ONNX manager available, using for initial correction")
-            onnx_attempted = True
-            corrected = self.onnx_manager.proofread(self.original_text)
-            
-            if corrected:
-                log_debug("ONNX correction successful")
-                used_model = "T5 (ONNX)"
-            else:
-                log_debug("ONNX correction returned None - model may not be loaded")
-        
-        # Only fall back to LLM if ONNX explicitly failed (not just "not configured")
-        if not corrected and onnx_attempted:
-            log_debug("ONNX failed, falling back to LLM for initial correction")
-            corrected = self.model_manager.correct_text(self.original_text)
-            if corrected: used_model = "LLM"
-        elif not corrected:
-            log_debug("ONNX not available, using LLM for initial correction")
-            corrected = self.model_manager.correct_text(self.original_text)
-            if corrected: used_model = "LLM"
-        
-        log_debug(
-            f"perform_initial_correction finished. Result len: {len(corrected) if corrected else 'None'}"
-        )
-
-        if corrected:
-            self.corrected_text = corrected
-            # Emit signal to update UI from main thread
-            self.correction_ready.emit(corrected, used_model)
-        else:
-            self.correction_failed_signal.emit()
-
-    def on_correction_done(self, corrected, model_name="Unknown"):
-        """Handle successful correction with diff highlighting"""
-        log_debug("on_correction_done called (main thread)")
-
-        self.model_label.setText(f"Model: {model_name}")
-        self.model_label.show()
-
-        # Check for error messages returned from correct_text
-        if corrected.startswith("[Error]"):
-            self.corrected_edit.setPlainText(corrected)
-            self.status_label.setText("⚠ Error")
-            self.status_label.setStyleSheet(
-                "color: #fbbf24; font-size: 12px; font-weight: 600;"
+            # Every level MUST fix typos, capitalisation, and apostrophes.
+            # Higher levels add progressively more rewriting on top.
+            _BASE = (
+                "ALWAYS fix every typo, misspelling, wrong capitalisation, "
+                "missing or wrong apostrophe, and incorrect punctuation. "
+                "Never skip any of these basic errors regardless of other instructions. "
             )
-            self.add_chat_message("system", corrected)
-            self.send_btn.setEnabled(True)
-            return
-
-        # Show diff-highlighted version
-        if corrected.strip() != self.original_text.strip():
-            self._show_diff(self.original_text, corrected)
-            self.status_label.setText("✓ Corrected")
-            self.status_label.setStyleSheet(
-                "color: #4ade80; font-size: 12px; font-weight: 600;"
+            # Patch-specific instructions: guide what types of patches to generate
+            _patch_strength_instructions = {
+                0: (
+                    "Only patch typos, misspellings, wrong capitalisation, "
+                    "missing/wrong apostrophes, and incorrect punctuation. "
+                    "Do NOT patch grammar, word choice, or style. "
+                    "Preserve all correctly-written words."
+                ),
+                1: (
+                    "Patch typos, misspellings, capitalisation, apostrophes, punctuation, "
+                    "AND clear grammar mistakes (wrong verb tense, subject-verb agreement, "
+                    "wrong preposition). Preserve original wording otherwise."
+                ),
+                2: (
+                    "Patch typos, misspellings, capitalisation, apostrophes, punctuation, "
+                    "grammar mistakes, AND unclear/confusing phrases. "
+                    "Preserve correctly-written words."
+                ),
+                3: (
+                    "Patch typos, misspellings, capitalisation, apostrophes, punctuation, "
+                    "grammar, AND improve sentence structure or word choice where needed. "
+                    "Keep original meaning and tone."
+                ),
+                4: (
+                    "Patch ALL errors and rewrite phrases/sentences for maximum clarity. "
+                    "Restructure if needed. Preserve core meaning only."
+                ),
+            }
+            # Full-text instructions (for fallback): guide output format
+            _strength_instructions = {
+                0: (
+                    _BASE + "Fix ONLY those basic errors listed above. "
+                    "Do not change any wording, sentence structure, or style. "
+                    "Preserve ALL correctly-written words exactly as written. "
+                    "Output only the corrected text, no explanation."
+                ),
+                1: (
+                    _BASE + "Also fix clear grammar mistakes (wrong verb tense, "
+                    "subject-verb agreement, wrong preposition). "
+                    "Preserve the original wording and sentence structure otherwise. "
+                    "Preserve ALL correctly-written words exactly as written. "
+                    "Output only the corrected text, no explanation."
+                ),
+                2: (
+                    _BASE + "Also fix grammar mistakes and lightly improve clarity "
+                    "where the meaning is unclear. "
+                    "Preserve ALL correctly-written words exactly as written. "
+                    "Output only the corrected text, no explanation."
+                ),
+                3: (
+                    _BASE
+                    + "Also improve grammar, sentence structure, and word choice. "
+                    "Keep the original meaning and tone intact. "
+                    "Output only the corrected text, no explanation."
+                ),
+                4: (
+                    _BASE + "Also rewrite for maximum clarity and impact. "
+                    "Restructure sentences if needed. Preserve the core meaning. "
+                    "Output only the rewritten text, no explanation."
+                ),
+            }
+            strength = self.cfg.get("correction_strength", 2)
+            patch_instruction = _patch_strength_instructions.get(
+                strength, _patch_strength_instructions[2]
             )
-        else:
-            self.corrected_edit.setPlainText(corrected)
-            self.status_label.setText("No changes needed")
-            self.status_label.setStyleSheet(
-                "color: rgba(255, 255, 255, 0.5); font-size: 12px;"
+            full_instruction = _strength_instructions.get(
+                strength, _strength_instructions[2]
             )
 
+            # Try patch-based correction first (faster, fewer tokens)
+            log("[CW] Trying patch-based autocorrect…")
+            result = self.ac_model.correct_text_patch(text, instruction=patch_instruction)
+
+            if result is not None:
+                if result == text:
+                    log("[CW] Patch mode: no changes needed")
+                    self._correction_ready.emit(text, "Already correct")
+                else:
+                    log("[CW] Patch-based autocorrect done")
+                    self._correction_ready.emit(result, "AI autocorrect (patch)")
+                return
+
+            # Fall back to full-text correction
+            log("[CW] Patch correction failed, falling back to full-text…")
+            result = self.ac_model.correct_text(text, instruction=full_instruction)
+
+            if result is not None and result.strip() != "":
+                log("[CW] LLM autocorrect done (full-text fallback)")
+                self._correction_ready.emit(result, "AI autocorrect")
+            else:
+                log("[CW] LLM returned nothing")
+                self._correction_ready.emit(text, "No changes")
+
+        except Exception as e:
+            log(f"[CW] _do_correction CRASHED: {e}\n{traceback.format_exc()}")
+            self._correction_failed.emit()
+
+    def _on_correction_ready(self, corrected: str, method: str):
+        self.corrected = corrected
+        self._render_diff(corrected)
+        self.status_lbl.setText("✓  Done")
+        self.status_lbl.setStyleSheet("color:#4ade80;font-size:11px;")
+        self.method_badge.setText(f"via {method}")
+        self.method_badge.show()
         self.accept_btn.setEnabled(True)
         self.copy_btn.setEnabled(True)
         self.send_btn.setEnabled(True)
 
-        # Add system message to chat
-        self.add_chat_message(
-            "system", "Text corrected. You can ask for further changes above."
-        )
-
-    def _show_diff(self, original, corrected):
-        """Show corrected text with changed words highlighted in green"""
-        import html
-        
-        orig_words = [t for t in re.split(r'(\s+)', original) if t]
-        corr_words = [t for t in re.split(r'(\s+)', corrected) if t]
-        matcher = difflib.SequenceMatcher(None, orig_words, corr_words)
-
-        html_parts = []
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            chunk = "".join(corr_words[j1:j2])
-            if not chunk:
-                continue
-                
-            chunk_escaped = html.escape(chunk)
-            chunk_html = chunk_escaped.replace('\n', '<br>')
-            
-            if tag == "equal":
-                # Unchanged text
-                html_parts.append(chunk_html)
-            elif tag in ("replace", "insert"):
-                # Changed/Inserted text — highlight in green
-                html_parts.append(
-                    f'<span style="background-color: rgba(74, 222, 128, 0.2); '
-                    f'color: #86efac; border-radius: 3px; padding: 1px 2px;">{chunk_html}</span>'
-                )
-            # tag == 'delete' — words removed, skip
-
-        html_content = "".join(html_parts)
-        self.corrected_edit.setHtml(
-            f'<div style="color: #e2e8f0; font-size: 14px; font-family: Segoe UI; white-space: pre-wrap;">{html_content}</div>'
-        )
-
-    def on_correction_failed(self):
-        """Handle failed correction"""
-        self.corrected_edit.setPlainText(
-            "Error: Could not correct text.\n\n"
-            "Possible causes:\n"
-            "• Model failed to load — check the model file path in Settings\n"
-            "• Server crashed — check server_log.txt\n"
-            "• Model too large for GPU — try a smaller model"
-        )
-        self.status_label.setText("✗ Failed")
-        self.status_label.setStyleSheet(
-            "color: #f87171; font-size: 12px; font-weight: 600;"
-        )
-        self.add_chat_message(
-            "system", "Error: Correction failed. Check status message for details."
-        )
+    def _on_correction_failed(self):
+        self.status_lbl.setText("⚠  Could not correct")
+        self.status_lbl.setStyleSheet("color:#f87171;font-size:11px;")
+        self.corr_edit.setPlainText(self.original)
+        self.corrected = self.original
+        self.accept_btn.setEnabled(True)
+        self.copy_btn.setEnabled(True)
         self.send_btn.setEnabled(True)
 
-    def open_settings(self):
-        """Open settings dialog from the correction window"""
-        dialog = SettingsDialog(self.config, parent=self)
-        dialog.exec_()
+    def _render_diff(self, corrected: str):
+        import difflib
 
-    def add_chat_message(self, role, content):
-        """Add a message to the chat display"""
-        colors = {"user": "#4CAF50", "model": "#2196F3", "system": "#888"}
-        labels = {"user": "You", "model": "AI", "system": "System"}
-
-        color = colors.get(role, "#888")
-        label = labels.get(role, role)
-
-        self.chat_display.append(
-            f'<span style="color: {color}; font-weight: bold;">{label}:</span> '
-            f'<span style="color: #ddd;">{content}</span>'
+        orig_words = self.original.split()
+        corr_words = corrected.split()
+        sm = difflib.SequenceMatcher(None, orig_words, corr_words, autojunk=False)
+        parts: list[str] = []
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            chunk = " ".join(corr_words[j1:j2])
+            if tag == "equal":
+                parts.append(chunk)
+            elif tag in ("replace", "insert"):
+                parts.append(
+                    f'<span style="background:rgba(59,130,246,0.28);'
+                    f'color:#93c5fd;border-radius:3px;padding:1px 2px;">{chunk}</span>'
+                )
+        html = " ".join(parts)
+        self.corr_edit.setHtml(
+            f'<body style="color:#e2e8f0;font-family:Segoe UI,sans-serif;font-size:13px;">'
+            f"{html}</body>"
         )
 
-    def send_chat_message(self):
-        """Send a chat message for refinement"""
-        user_message = self.chat_input.text().strip()
-        if not user_message:
+    # ── chat ──────────────────────────────────────────────────────────────
+    def _send_chat(self):
+        msg = self.chat_input.text().strip()
+        if not msg:
             return
-
         self.chat_input.clear()
         self.send_btn.setEnabled(False)
-        self.add_chat_message("user", user_message)
-        self.status_label.setText("Thinking...")
+        self.accept_btn.setEnabled(False)
 
-        # Get current text being edited
-        current_text = self.corrected_edit.toPlainText()
-
-        # Build conversation history for context
-        # Start with STRICT system message for chat
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a text editing assistant. CRITICAL OUTPUT RULES - VIOLATING THESE IS AN ERROR:\n\n"
-                    "1. OUTPUT ONLY THE MODIFIED TEXT - absolutely nothing else\n"
-                    "2. NEVER add preamble like 'Here is...', 'Sure, ...', 'Certainly', 'I've made the changes', etc.\n"
-                    "3. NEVER add explanations, commentary, or questions after the output\n"
-                    "4. NEVER wrap output in quotes, markdown code blocks, or labels\n"
-                    "5. If user asks a question ABOUT the text (not to modify), answer briefly and helpfully\n"
-                    "6. PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines\n"
-                    "7. Maintain original formatting exactly, including multiple line breaks\n\n"
-                    "DETECTION RULE:\n"
-                    "- If user request is to FIX/CORRECT/MODIFY/REWRITE text → output ONLY the corrected text\n"
-                    "- If user request is a QUESTION about the text → answer briefly, then stop\n"
-                    "- NEVER say 'The corrected version is:' or similar labels\n\n"
-                    "/no_think"
-                ),
-            },
-        ]
-
-        # Add recent chat history for context (last 3 exchanges = 6 messages)
-        if len(self.chat_history) > 0:
-            messages.extend(self.chat_history[-6:])
-
-        # Add current request
-        messages.append(
-            {
-                "role": "user",
-                "content": f"Current text:\n{current_text}\n\nUser request: {user_message}",
-            }
+        self.chat_display.append(
+            f'<span style="color:#60a5fa;font-weight:600;">You:</span> {msg}'
+        )
+        self.chat_display.append(
+            '<span style="color:#64748b;font-style:italic;">AI is thinking…</span>'
         )
 
-        # Store this exchange in history
-        self.chat_history.append({"role": "user", "content": user_message})
+        system = (
+            "You are a helpful writing assistant. The user may ask you to rewrite, "
+            "shorten, change tone, or otherwise modify the text. "
+            "Respond with ONLY the new text unless the user explicitly asks a question."
+        )
+        if not self.chat_history:
+            self.chat_history = [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": f"Here is the text to work with:\n\n{self.corrected}",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Understood. I'm ready to help modify this text.",
+                },
+            ]
+        self.chat_history.append({"role": "user", "content": msg})
 
-        # Process in background - ALWAYS use LLM for chat (user wants conversation)
-        threading.Thread(
-            target=self._process_chat_message,
-            args=(messages, user_message),
-            daemon=True,
-        ).start()
-
-    def _detect_chat_output_type(self, output: str, user_message: str) -> dict:
-        """Detect whether chat output is correction or conversation.
-        
-        Returns dict with:
-            - is_correction: bool - True if output is mostly corrected text
-            - should_paste: bool - True if output should be pasted to clipboard
-            - confidence: float - 0.0 to 1.0 confidence in detection
-        """
-        if not output or not user_message:
-            return {"is_correction": False, "should_paste": False, "confidence": 0.0}
-        
-        output_lower = output.lower().strip()
-        user_lower = user_message.lower().strip()
-        
-        # Heuristic 1: Check for conversational prefixes (meta-commentary)
-        conversational_prefixes = [
-            "sure", "here's", "here is", "i've", "i have", "let me",
-            "i can", "of course", "certainly", "absolutely", "happy to",
-            "glad to", "the corrected", "corrected version", "here you",
-            "i'd be", "i will", "i would", "in response", "to answer"
-        ]
-        has_conversational_prefix = any(output_lower.startswith(p) for p in conversational_prefixes)
-        
-        # Heuristic 2: Length similarity - corrections are usually similar length to input
-        # Extract text to correct from user message if possible
-        text_to_correct = ""
-        if "current text:" in user_lower:
-            # Try to extract the original text portion
-            parts = user_message.split("\n")
-            for i, part in enumerate(parts):
-                if part.strip() and not part.lower().startswith(("current text", "user request", "please", "can you", "could you")):
-                    text_to_correct = part.strip()
-                    break
-        
-        output_len = len(output.split())
-        input_len = len(text_to_correct.split()) if text_to_correct else len(user_message.split())
-        length_ratio = output_len / max(input_len, 1)
-        is_similar_length = 0.5 <= length_ratio <= 2.0
-        
-        # Heuristic 3: Check if output contains explanations or multiple paragraphs
-        paragraph_count = output.count("\n\n") + 1
-        sentence_count = len(re.findall(r'[.!?]+', output))
-        has_explanation = paragraph_count > 2 or sentence_count > 4
-        
-        # Heuristic 4: Check for question patterns (conversation indicator)
-        has_question = "?" in output
-        
-        # Heuristic 5: Check for common correction patterns
-        # If user message contains correction-related keywords
-        correction_keywords = ["correct", "fix", "grammar", "spelling", "proofread", "improve", "rewrite", "edit"]
-        user_wants_correction = any(kw in user_lower for kw in correction_keywords)
-        
-        # Decision logic
-        confidence = 0.0
-        is_correction = False
-        should_paste = False
-        
-        if has_conversational_prefix and not is_similar_length:
-            # Clearly conversational
-            is_correction = False
-            should_paste = False
-            confidence = 0.8
-        elif has_question or has_explanation:
-            # Contains explanations or questions - likely conversation
-            is_correction = False
-            should_paste = False
-            confidence = 0.7
-        elif user_wants_correction and is_similar_length and not has_conversational_prefix:
-            # User asked for correction and output is similar length without preamble
-            is_correction = True
-            should_paste = True
-            confidence = 0.85
-        elif is_similar_length and len(output) < len(user_message) * 3:
-            # Output is concise and similar length - likely correction
-            is_correction = True
-            should_paste = True
-            confidence = 0.6
-        else:
-            # Default to conversation for safety
-            is_correction = False
-            should_paste = False
-            confidence = 0.5
-        
-        return {
-            "is_correction": is_correction,
-            "should_paste": should_paste,
-            "confidence": confidence
-        }
-
-    def _process_chat_message(self, messages, user_message):
-        """Process chat message in background - ALWAYS use LLM for chat.
-        
-        Chat is for conversation about text. Use LLM with strict guardrails.
-        """
-        response = None
-        
-        # ALWAYS use LLM for chat (user wants conversation/refinement)
-        log_debug("Using LLM for chat message processing")
-        response = self.model_manager.chat_with_model(messages)
-        
-        if response:
-            self.corrected_text = response
-            
-            # Detect output type for proper handling
-            output_type = self._detect_chat_output_type(response, user_message)
-            log_debug(f"Chat output type detection: {output_type}")
-            
-            # Store assistant response in history
-            self.chat_history.append({"role": "assistant", "content": response})
-            # Keep history manageable (last 10 exchanges)
-            if len(self.chat_history) > 20:
-                self.chat_history = self.chat_history[-20:]
-            self.chat_response_ready.emit(response)
-        else:
-            self.chat_error_signal.emit()
-
-    def on_chat_response(self, response):
-        """Handle chat response - always update the text with the model's response"""
-        # Always update the corrected text with the model's response
-        # This is more reliable than trying to detect if it's a conversation
-        self.corrected_edit.setPlainText(response)
-        self.model_label.setText("Model: LLM")
-        self.model_label.show()
-        self.add_chat_message("model", "Text updated ✓")
-
-        self.send_btn.setEnabled(True)
-        self.status_label.setText("Updated ✓")
-
-    def on_chat_error(self):
-        """Handle chat error"""
-        self.add_chat_message("system", "Error: Could not process request.")
-        self.send_btn.setEnabled(True)
-        self.status_label.setText("Error")
-
-    def reset_text(self):
-        """Reset corrected text to original"""
-        self.corrected_edit.setPlainText(self.original_text)
-        self.corrected_text = self.original_text
-        self.status_label.setText("Reset to original")
-
-    def copy_corrected(self):
-        """Copy corrected text to clipboard"""
-        text = self.corrected_edit.toPlainText()
-        if text:
-            pyperclip.copy(text)
-            self.status_label.setText("✓ Copied")
-            self.status_label.setStyleSheet(
-                "color: #4ade80; font-size: 12px; font-weight: 600;"
+        if not self.chat_model.is_loaded():
+            self.chat_display.append(
+                '<span style="color:#f59e0b;font-style:italic;">⏳ Loading chat model…</span>'
             )
+            threading.Thread(target=self._load_then_send, daemon=True).start()
+            return
 
-    def accept_correction(self):
-        """Accept the correction and paste it"""
-        text = self.corrected_edit.toPlainText()
-        if text:
-            pyperclip.copy(text)
-            self.correction_accepted.emit(text)
-            self.hide() # hide instead of close to prevent closeEvent from restoring old clipboard too early
-            # Simulate paste
-            QTimer.singleShot(200, lambda: keyboard.send("ctrl+v"))
-            
-            # Restore old clipboard after a delay (so paste works first), then close
-            def finish_paste():
-                self._restore_old_clipboard()
-                self.close()
-                
-            QTimer.singleShot(500, finish_paste)
+        self._do_stream()
 
-    def _restore_old_clipboard(self):
-        """Restore the original clipboard content"""
-        app = QApplication.instance()
-        if app and hasattr(app, "old_clipboard"):
-            pyperclip.copy(app.old_clipboard)
-            del app.old_clipboard
+    def _load_then_send(self):
+        self.chat_model.load_model()
+        if self.chat_model.is_loaded():
+            self._chat_token.emit("")
+            QTimer.singleShot(0, self._do_stream)
+        else:
+            self._chat_error.emit("Chat model could not be loaded. Check Settings.")
 
-    def closeEvent(self, event):
-        """Handle window close - restore old clipboard if not already restored"""
-        app = QApplication.instance()
-        if app and hasattr(app, "old_clipboard"):
-            pyperclip.copy(app.old_clipboard)
-            del app.old_clipboard
-        event.accept()
+    def _do_stream(self):
+        self._stream_buf = ""
+        worker = self.chat_model.make_stream_worker(self.chat_history, max_tokens=1024)
+        worker.token.connect(self._chat_token)
+        worker.done.connect(self._chat_done)
+        worker.error.connect(self._chat_error)
+        self._stream_worker = worker
+        worker.start()
+
+    def _on_chat_token(self, token: str):
+        import html as _html
+
+        self._stream_buf += token
+        escaped = _html.escape(self._stream_buf).replace("\n", "<br>")
+        from PyQt6.QtGui import QTextCursor
+
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        cursor.removeSelectedText()
+        cursor.insertHtml(
+            f'<span style="color:#e2e8f0;white-space:pre-wrap;">'
+            f'<b style="color:#a78bfa;">AI:</b>&nbsp;{escaped}</span>'
+        )
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.ensureCursorVisible()
+
+    def _on_chat_done(self, full: str):
+        full = strip_think(full)
+        full = strip_preamble(full, self.corrected)
+        self.chat_history.append({"role": "assistant", "content": full})
+        self.corrected = full
+        self._render_diff(full)
+        self.method_badge.setText("via AI chat")
+        self.send_btn.setEnabled(True)
+        self.accept_btn.setEnabled(True)
+        self.chat_display.append("")
+
+    def _on_chat_error(self, err: str):
+        self.chat_display.append(f'<span style="color:#f87171;">Error: {err}</span>')
+        self.send_btn.setEnabled(True)
+        self.accept_btn.setEnabled(True)
+
+    # ── actions ──────────────────────────────────────────────────────────
+    def _accept(self):
+        text = self.corr_edit.toPlainText()
+        self.corrected = text
+        self.close()
+        self.accepted.emit(text)
+
+    def _copy(self):
+        pyperclip.copy(self.corr_edit.toPlainText())
+
+    def _reset(self):
+        self.corrected = self.original
+        self.corr_edit.setPlainText(self.original)
+        self.chat_history.clear()
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.cfg, self, re_register_cb=self._re_register_cb)
+        dlg.saved.connect(self._re_register_cb)
+        dlg.exec()
+
+    def closeEvent(self, e):
+        if self._stream_worker and self._stream_worker.isRunning():
+            self._stream_worker.stop()
+            self._stream_worker.wait(500)
+        super().closeEvent(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tray icon helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def make_tray_icon(color: str) -> QIcon:
+    logo_path = SCRIPT_DIR / "logo.png"
+    if logo_path.exists():
+        base = QPixmap(str(logo_path)).scaled(
+            64,
+            64,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    else:
+        base = QPixmap(64, 64)
+        base.fill(Qt.GlobalColor.transparent)
+    result = QPixmap(64, 64)
+    result.fill(Qt.GlobalColor.transparent)
+    p = QPainter(result)
+    p.drawPixmap(0, 0, base)
+    p.setBrush(QColor(color))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(44, 44, 18, 18)
+    p.end()
+    return QIcon(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main application
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TextCorrectorApp(QApplication):
-    """Main application class"""
+    _trigger = pyqtSignal(str)
+    _notify = pyqtSignal(str, str)
 
-    trigger_correction = pyqtSignal(str)
-
-    def __init__(self, argv):
-        super().__init__(argv)
+    def __init__(self):
+        super().__init__(sys.argv)
         self.setQuitOnLastWindowClosed(False)
+        self.setApplicationName("TextCorrector")
 
-        # Initialize config
-        self.config = ConfigManager()
+        self.cfg = ConfigManager()
+        self.ac_model = ModelManager(
+            self.cfg,
+            model_path_key="ac_model_path",
+            label="AC",
+            keep_loaded_key="keep_model_loaded",
+            idle_timeout_key="idle_timeout_seconds",
+        )
+        self.chat_model = ModelManager(
+            self.cfg,
+            model_path_key="model_path",
+            label="Chat",
+            keep_loaded_key="keep_model_loaded",
+            idle_timeout_key="idle_timeout_seconds",
+        )
+        self._window: CorrectionWindow | None = None
+        self._old_clip = ""
 
-        # Initialize model manager
-        self.model_manager = ModelManager(self.config)
-        self.model_manager.status_changed.connect(self.update_status)
-        self.model_manager.model_loaded.connect(self.on_model_loaded)
-        self.model_manager.model_unloaded.connect(self.on_model_unloaded)
+        self._trigger.connect(self._show_window)
+        self._notify.connect(self._show_notify)
+        self.ac_model.status_changed.connect(self._on_ac_status)
+        self.chat_model.status_changed.connect(self._on_chat_status)
+        self.ac_model.model_loaded.connect(lambda: self._set_tray_icon("#3b82f6"))
+        self.chat_model.model_loaded.connect(lambda: self._set_tray_icon("#a78bfa"))
+        self.chat_model.model_unloaded.connect(lambda: self._set_tray_icon("#475569"))
 
-        # Initialize ONNX manager
-        self.onnx_manager = ONNXManager(self.config)
-        # Connect ONNX status to UI for visibility
-        self.onnx_manager.status_changed.connect(self.update_status)
+        self._build_tray()
+        self._register_hotkey()
 
-        # Create tray
-        self.create_tray_icon()
+        self._idle_timer = QTimer()
+        self._idle_timer.timeout.connect(self.chat_model.check_idle)
+        self._idle_timer.start(60_000)
 
-        # Connect hotkey signal
-        self.trigger_correction.connect(self.show_correction_window)
-
-        # Track correction window
-        self.correction_window = None
-
-        # Register hotkey (delayed to ensure UI is ready)
-        QTimer.singleShot(1000, self.register_hotkey)
-
-        # T5-first architecture: Preload ONNX at startup if configured
-        onnx_dir = self.config.get("onnx_model_dir", "")
-        if onnx_dir and os.path.exists(onnx_dir):
-            # Preload ONNX model at startup for fast autocorrect
-            log_debug("ONNX model dir configured, preloading at startup")
-            QTimer.singleShot(500, self._preload_onnx_model)
-            # Don't load LLM at startup if ONNX is available
-            log_debug("ONNX available, skipping LLM auto-load at startup")
-        elif self.config.get("model_path"):
-            # No ONNX, fall back to LLM
-            log_debug("No ONNX configured, loading LLM at startup")
-            QTimer.singleShot(500, self._load_model_threaded)
+        # Load autocorrect model at boot
+        if self.cfg.get("ac_same_as_chat", True):
+            ac_path = self.cfg.get("model_path", "")
         else:
-            # No model configured, show welcome
-            QTimer.singleShot(2000, self.show_first_run_dialog)
+            ac_path = self.cfg.get("ac_model_path", "")
+        if ac_path:
+            threading.Thread(target=self.ac_model.load_model, daemon=True).start()
 
-    def create_tray_icon(self):
-        """Create system tray icon and menu"""
-        self.tray_icon = QSystemTrayIcon(self._create_icon("#888"), self)
-        self.tray_icon.setToolTip("Text Corrector — Not loaded")
+    def _build_tray(self):
+        self.tray = QSystemTrayIcon(make_tray_icon("#475569"), self)
+        self.tray.setToolTip("TextCorrector")
+        self.tray.activated.connect(self._tray_activated)
 
         menu = QMenu()
-        menu.setStyleSheet("""
-            QMenu { background-color: #2b2b2b; color: #fff; border: 1px solid #555; }
-            QMenu::item { padding: 6px 20px; }
-            QMenu::item:selected { background-color: #0078d4; }
-            QMenu::separator { height: 1px; background: #555; margin: 4px 0; }
-        """)
-
-        # Status
-        self.status_action = menu.addAction("Status: Not loaded")
-        self.status_action.setEnabled(False)
-        menu.addSeparator()
-
-        # Quick Model Selector submenu
-        self.model_menu = menu.addMenu("Switch Model")
-        self._rebuild_model_menu()
-
-        menu.addSeparator()
-
-        # Load / Unload
-        load_action = menu.addAction("Load Model")
-        load_action.triggered.connect(self._load_model_threaded)
-
-        unload_action = menu.addAction("Unload Model")
-        unload_action.triggered.connect(self.model_manager.unload_model)
-
-        # Keep loaded toggle
-        self.keep_loaded_action = menu.addAction("Keep Model Loaded")
-        self.keep_loaded_action.setCheckable(True)
-        self.keep_loaded_action.setChecked(self.config.get("keep_model_loaded", False))
-        self.keep_loaded_action.toggled.connect(self.toggle_keep_loaded)
-
-        menu.addSeparator()
-
-        # Test Hotkey (manual trigger)
-        test_hotkey_action = menu.addAction("Test Hotkey")
-        test_hotkey_action.triggered.connect(self.test_hotkey)
-
-        menu.addSeparator()
-
-        # Settings
-        settings_action = menu.addAction("Settings...")
-        settings_action.triggered.connect(self.show_settings)
-
-        # Select Model (file browser)
-        select_model_action = menu.addAction("Browse for Model...")
-        select_model_action.triggered.connect(self.select_model_dialog)
-
-        menu.addSeparator()
-
-        # Startup
-        startup_action = menu.addAction("Add to Startup")
-        startup_action.triggered.connect(self.add_to_startup)
-
-        remove_startup_action = menu.addAction("Remove from Startup")
-        remove_startup_action.triggered.connect(self.remove_from_startup)
-
-        menu.addSeparator()
-
-        # Exit
-        exit_action = menu.addAction("Exit")
-        exit_action.triggered.connect(self.quit_app)
-
-        self.tray_icon.setContextMenu(menu)
-        self.tray_icon.show()
-
-    def _rebuild_model_menu(self):
-        """Rebuild the quick model selector submenu"""
-        self.model_menu.clear()
-
-        # Discover models in app directory
-        models = discover_models()
-        # Also add recent models that might be elsewhere
-        recent = self.config.get("recent_models", [])
-
-        # Normalize all paths to avoid duplicates with different slash formats
-        normalized_models = set()
-        unique_models = []
-        for m in models + recent:
-            if os.path.exists(m):
-                norm_path = os.path.normpath(os.path.abspath(m)).lower()
-                if norm_path not in normalized_models:
-                    normalized_models.add(norm_path)
-                    unique_models.append(m)
-        models = unique_models
-
-        current_model = self.config.get("model_path", "")
-
-        if not models:
-            no_model_action = self.model_menu.addAction("No models found")
-            no_model_action.setEnabled(False)
-            return
-
-        model_group = QActionGroup(self.model_menu)
-        model_group.setExclusive(True)
-
-        for model_path in models:
-            name = friendly_model_name(model_path)
-            action = self.model_menu.addAction(name)
-            action.setCheckable(True)
-            model_group.addAction(action)
-            # Case-insensitive comparison on Windows
-            if current_model:
-                is_checked = (
-                    os.path.normpath(model_path).lower()
-                    == os.path.normpath(current_model).lower()
-                )
-                action.setChecked(is_checked)
-            else:
-                action.setChecked(False)
-                
-            # Use default argument to capture model_path in lambda
-            action.triggered.connect(
-                lambda checked, mp=model_path: self._switch_model(mp)
-            )
-
-    def _create_icon(self, color):
-        """Create an icon combining the logo and status color"""
-        from PyQt5.QtGui import QPainter, QBrush, QColor, QPixmap, QIcon, QPen
-
-        pixmap = QPixmap(32, 32)
-        pixmap.fill(Qt.transparent)
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        logo_path = str(SCRIPT_DIR / "logo.png")
-        import os
-        if os.path.exists(logo_path):
-            logo = QPixmap(logo_path)
-            logo = logo.scaled(32, 32, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap(0, 0, logo)
-
-            # Draw status dot
-            painter.setBrush(QBrush(QColor(color)))
-            pen = QPen(QColor("#000000"))
-            pen.setWidth(1)
-            painter.setPen(pen)
-            painter.drawEllipse(18, 18, 12, 12)
-        else:
-            # Fallback to plain circle
-            painter.setBrush(QBrush(QColor(color)))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(4, 4, 24, 24)
-
-        painter.end()
-        return QIcon(pixmap)
-
-    def toggle_keep_loaded(self, checked):
-        """Toggle keep model loaded setting"""
-        self.config.set("keep_model_loaded", checked)
-        if checked:
-            self.tray_icon.showMessage(
-                "Text Corrector",
-                "Model will stay loaded in VRAM",
-                QSystemTrayIcon.Information,
-                2000,
-            )
-
-    def show_first_run_dialog(self):
-        """Show dialog on first run to configure model"""
-        msg = QMessageBox()
-        msg.setWindowTitle("Text Corrector - First Run")
-        msg.setText("Welcome to Text Corrector!")
-        msg.setInformativeText(
-            "Please configure your settings:\n\n"
-            "1. Select a GGUF model file (or use the included Gemma model)\n"
-            "2. The llama.cpp server is included\n\n"
-            "Would you like to open settings now?"
-        )
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.Yes)
-
-        if msg.exec_() == QMessageBox.Yes:
-            self.show_settings()
-
-    def show_settings(self):
-        """Show settings dialog"""
-        dialog = SettingsDialog(self.config, re_register_cb=self.register_hotkey)
-        dialog.settings_changed.connect(self.on_settings_changed)
-        dialog.exec_()
-
-    def on_settings_changed(self):
-        """Handle settings changes"""
-        # Unload and reload with new settings
-        self.model_manager.unload_model()
-        self._rebuild_model_menu()
-        self.register_hotkey()
-
-        # Reload model automatically if a model path is set
-        if self.config.get("model_path"):
-            QTimer.singleShot(500, self._load_model_threaded)
-
-    def select_model_dialog(self):
-        """Quick model selection dialog"""
-        path, _ = QFileDialog.getOpenFileName(
-            None, "Select GGUF Model", "", "GGUF Models (*.gguf)"
+        menu.setStyleSheet(
+            "QMenu{background:#0a1628;border:1px solid rgba(59,130,246,0.25);border-radius:8px;"
+            "padding:4px;color:#e2e8f0;font-size:13px;}"
+            "QMenu::item{padding:8px 18px;border-radius:4px;}"
+            "QMenu::item:selected{background:rgba(59,130,246,0.25);}"
+            "QMenu::separator{height:1px;background:rgba(59,130,246,0.15);margin:4px 0;}"
         )
 
-        if path:
-            self.config.set("model_path", path)
-            self.config.add_recent_model(path)
+        self._status_action = QAction("Status: idle", self)
+        self._status_action.setEnabled(False)
+        menu.addAction(self._status_action)
+        menu.addSeparator()
 
-            # Unload current model to force reload with new one
-            self.model_manager.unload_model()
-            self._rebuild_model_menu()
+        llm_menu = menu.addMenu("LLM Model")
+        llm_menu.setStyleSheet(menu.styleSheet())
+        act_llm_load = QAction("Load chat model", self)
+        act_llm_unload = QAction("Unload chat model", self)
+        act_llm_browse = QAction("Browse GGUF…", self)
+        act_llm_load.triggered.connect(
+            lambda: threading.Thread(
+                target=self.chat_model.load_model, daemon=True
+            ).start()
+        )
+        act_llm_unload.triggered.connect(self.chat_model.unload_model)
+        act_llm_browse.triggered.connect(self._browse_model)
+        llm_menu.addAction(act_llm_load)
+        llm_menu.addAction(act_llm_unload)
+        llm_menu.addSeparator()
+        llm_menu.addAction(act_llm_browse)
+        self._rebuild_recent_menu(llm_menu)
 
-            self.tray_icon.showMessage(
-                "Text Corrector",
-                f"Model selected:\n{os.path.basename(path)}",
-                QSystemTrayIcon.Information,
-                3000,
-            )
+        menu.addSeparator()
+        act_settings = QAction("Settings…", self)
+        act_settings.triggered.connect(self._open_settings)
+        menu.addAction(act_settings)
 
-    def _load_model_threaded(self):
-        """Load model in background thread"""
-        threading.Thread(target=self.model_manager.load_model, daemon=True).start()
+        act_test = QAction("Test hotkey", self)
+        act_test.triggered.connect(self._test_hotkey)
+        menu.addAction(act_test)
 
-    def _preload_onnx_model(self):
-        """Preload ONNX model at startup for fast autocorrect"""
-        log_debug("Preloading ONNX model at startup")
-        if self.onnx_manager:
-            success = self.onnx_manager.load_model()
-            if success:
-                log_debug("ONNX model preloaded successfully")
-                self.tray_icon.setIcon(self._create_icon("#4CAF50"))
-                onnx_dir = os.path.basename(self.config.get("onnx_model_dir", ""))
-                self.tray_icon.setToolTip(f"Text Corrector — ONNX Ready ({onnx_dir})")
-            else:
-                log_debug("Failed to preload ONNX model")
-                self.tray_icon.setIcon(self._create_icon("#f44336"))
-                self.tray_icon.setToolTip("Text Corrector — ONNX Load Failed")
+        menu.addSeparator()
+        if WINDOWS:
+            act_startup = QAction("Add to startup", self)
+            act_rmstart = QAction("Remove from startup", self)
+            act_startup.triggered.connect(self._add_startup)
+            act_rmstart.triggered.connect(self._rm_startup)
+            menu.addAction(act_startup)
+            menu.addAction(act_rmstart)
+            menu.addSeparator()
 
-    def on_model_loaded(self):
-        """Handle model loaded event (LLM)"""
-        self.tray_icon.setIcon(self._create_icon("#4CAF50"))
-        model_name = friendly_model_name(self.config.get("model_path", ""))
-        self.tray_icon.setToolTip(f"Text Corrector — {model_name}")
+        act_quit = QAction("Quit", self)
+        act_quit.triggered.connect(self._quit)
+        menu.addAction(act_quit)
 
-    def on_model_unloaded(self):
-        """Handle model unloaded event"""
-        self.tray_icon.setIcon(self._create_icon("#888"))
-        self.tray_icon.setToolTip("Text Corrector — Not loaded")
+        self.tray.setContextMenu(menu)
+        self.tray.show()
 
-    def register_hotkey(self):
-        """Register global hotkey"""
-        log_debug("Registering hotkey...")
+    def _set_tray_icon(self, color: str):
+        self.tray.setIcon(make_tray_icon(color))
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._open_settings()
+
+    def _rebuild_recent_menu(self, parent: QMenu):
+        parent.addSeparator()
+        for path in self.cfg.get("recent_models", [])[:8]:
+            act = QAction(friendly_name(path), self)
+            act.triggered.connect(lambda checked, p=path: self._select_model(p))
+            parent.addAction(act)
+
+    def _on_ac_status(self, msg: str):
+        self._status_action.setText(f"Autocorrect: {msg}")
+
+    def _on_chat_status(self, msg: str):
+        color = (
+            "#a78bfa"
+            if "ready" in msg.lower()
+            else "#f59e0b"
+            if "loading" in msg.lower() or "starting" in msg.lower()
+            else "#ef4444"
+            if "error" in msg.lower() or "failed" in msg.lower()
+            else "#475569"
+        )
+        self._set_tray_icon(color)
+
+    def _register_hotkey(self):
         try:
             keyboard.unhook_all_hotkeys()
-            log_debug("Cleared existing hotkeys")
-        except Exception as e:
-            log_debug(f"Error clearing hotkeys: {e}")
+        except Exception:
             pass
-
-        hotkey = self.config.get("hotkey", "alt+shift+t")
-        log_debug(f"Attempting to register hotkey: {hotkey}")
-
-        # Try multiple formats
-        hotkey_formats = [
-            hotkey,  # Original format
-            hotkey.replace("+", " "),  # Space-separated
-            hotkey.replace("alt", "alt")
-            .replace("shift", "shift")
-            .replace("ctrl", "ctrl"),  # Ensure lowercase
-        ]
-
-        registered = False
-        for hk in hotkey_formats:
-            try:
-                log_debug(f"Trying format: {hk}")
-                # Try registering with suppress=False (doesn't block the key)
-                keyboard.add_hotkey(
-                    hk, self.hotkey_triggered, suppress=False, trigger_on_release=False
-                )
-                log_debug(f"Hotkey '{hk}' registered successfully")
-                registered = True
-
-                # Show success message in tray
-                self.tray_icon.showMessage(
-                    "Text Corrector",
-                    f"Hotkey registered: {hk}",
-                    QSystemTrayIcon.Information,
-                    2000,
-                )
-                break
-            except Exception as e:
-                log_debug(f"Failed with format '{hk}': {e}")
-                continue
-
-        if not registered:
-            error_msg = f"Failed to register hotkey '{hotkey}' with all formats"
-            log_debug(error_msg)
-            print(error_msg)
-            self.tray_icon.showMessage(
-                "Text Corrector",
-                f"Failed to register hotkey: {hotkey}\n\nTry running as administrator",
-                QSystemTrayIcon.Warning,
-                5000,
+        hk = self.cfg.get("hotkey", "ctrl+shift+space")
+        try:
+            keyboard.add_hotkey(hk, self._hotkey_fired, suppress=False)
+            log(f"[Hotkey] Registered: {hk}")
+        except Exception as e:
+            log(f"[Hotkey] Failed to register '{hk}': {e}")
+            self.tray.showMessage(
+                "TextCorrector",
+                f"Could not register hotkey '{hk}'. Try running as administrator.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000,
             )
 
-    def test_hotkey(self):
-        """Test the hotkey functionality manually"""
-        log_debug("Test hotkey triggered from menu")
-        self.tray_icon.showMessage(
-            "Text Corrector",
-            "Testing hotkey... Check if window opens.",
-            QSystemTrayIcon.Information,
-            2000,
-        )
-        # Simulate what the hotkey would do
-        test_text = "This is a test. The hotkey is working!"
-        self.old_clipboard = pyperclip.paste()
-        pyperclip.copy(test_text)
-        self.trigger_correction.emit(test_text)
-
-    def hotkey_triggered(self):
-        """Handle hotkey press - copy text first, then process"""
-        log_debug("HOTKEY TRIGGERED!")
+    def _hotkey_fired(self):
+        log("[Hotkey] Fired")
         try:
-            # Release modifier keys FIRST so Ctrl+C isn't corrupted
-            # (Alt+Shift are still held from the hotkey combo)
-            try:
-                keyboard.release("alt")
-                keyboard.release("shift")
-            except Exception:
-                pass
-            time.sleep(0.15)  # Wait for OS to register key releases
+            for k in ("ctrl", "shift", "alt"):
+                try:
+                    keyboard.release(k)
+                except Exception:
+                    pass
+            time.sleep(0.1)
 
-            # Save current clipboard content (will restore after window closes)
-            self.old_clipboard = pyperclip.paste()
-            log_debug(f"Saved old clipboard (length: {len(self.old_clipboard)})")
-
-            # Clear clipboard to detect if copy succeeds
+            self._old_clip = pyperclip.paste()
             pyperclip.copy("")
             time.sleep(0.05)
-
-            # Send Ctrl+C to copy selected text
-            log_debug("Sending Ctrl+C")
             keyboard.send("ctrl+c")
 
-            # Wait for clipboard to update (poll with timeout)
-            selected_text = ""
-            max_attempts = 20  # 1 second total (20 * 0.05s)
-            for i in range(max_attempts):
+            selected = ""
+            for _ in range(20):
                 time.sleep(0.05)
                 try:
-                    current = pyperclip.paste()
-                    if current != "":
-                        selected_text = current
-                        log_debug(f"Clipboard updated! Length: {len(selected_text)}")
+                    clip = pyperclip.paste()
+                    if clip:
+                        selected = clip
                         break
-                except Exception as clip_err:
-                    log_debug(f"Clipboard read error: {clip_err}")
+                except Exception:
                     pass
 
-            # DON'T restore clipboard yet - wait until window closes
-            # Store selected text for later
-
-            if selected_text and selected_text.strip():
-                log_debug(
-                    f"Emitting trigger_correction signal with text length: {len(selected_text)}"
-                )
-                # Emit signal to show window from main thread
-                self.trigger_correction.emit(selected_text.strip())
+            if selected.strip():
+                self._trigger.emit(selected.strip())
             else:
-                log_debug("No text selected")
-                # Restore clipboard since no text was selected
-                if hasattr(self, "old_clipboard"):
-                    pyperclip.copy(self.old_clipboard)
-                self.tray_icon.showMessage(
-                    "Text Corrector",
+                if self._old_clip:
+                    pyperclip.copy(self._old_clip)
+                self._notify.emit(
                     "No text selected. Select text first, then press the hotkey.",
-                    QSystemTrayIcon.Warning,
-                    3000,
+                    "info",
                 )
         except Exception as e:
-            error_msg = f"Hotkey error: {e}"
-            log_debug(error_msg)
-            print(error_msg)
+            log(f"[Hotkey] Error: {e}")
 
-    def show_correction_window(self, text):
-        """Show the correction window"""
-        if self.correction_window:
-            self.correction_window.close()
+    def _show_notify(self, msg: str, icon: str):
+        ico = (
+            QSystemTrayIcon.MessageIcon.Warning
+            if icon == "warn"
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+        self.tray.showMessage("TextCorrector", msg, ico, 2500)
 
-        self.correction_window = CorrectionWindow(text, self.model_manager, self.onnx_manager, self.config)
-        self.correction_window.show()
-        self.correction_window.raise_()
-        self.correction_window.activateWindow()
+    def _show_window(self, text: str):
+        log(f"[Window] _show_window called, text length={len(text)}")
+        try:
+            if self._window:
+                self._window.close()
 
-    def update_status(self, status, color=None):
-        """Update tray status"""
-        # Handle both single arg (from ModelManager) and two args (from ONNXManager)
-        if isinstance(status, tuple):
-            status, color = status
-        
-        self.status_action.setText(f"Status: {status}")
-        
-        # Determine color based on status text if not provided
-        if color is None:
-            if "error" in status.lower() or "failed" in status.lower():
-                color = "#ef4444"
-            elif "loading" in status.lower() or "starting" in status.lower():
-                color = "#f59e0b"
-            elif "ready" in status.lower() or "loaded" in status.lower():
-                color = "#10b981"
-            else:
-                color = "#888"
-        
-        self.tray_icon.setIcon(self._create_icon(color))
-        self.tray_icon.setToolTip(f"Text Corrector — {status}")
+            self._window = CorrectionWindow(
+                text,
+                self.ac_model,
+                self.chat_model,
+                self.cfg,
+                re_register_cb=self._register_hotkey,
+            )
+            self._window.accepted.connect(self._paste_text)
+            self._window.show()
+            self._window.raise_()
+            self._window.activateWindow()
+            log("[Window] Window shown successfully")
+        except Exception as e:
+            import traceback
 
-    def add_to_startup(self):
-        """Add application to Windows startup"""
+            log(f"[Window] CRASH in _show_window: {e}\n{traceback.format_exc()}")
+
+    def _paste_text(self, text: str):
+        pyperclip.copy(text)
+        time.sleep(0.15)
+        keyboard.send("ctrl+v")
+        time.sleep(0.1)
+        if self._old_clip and self._old_clip != text:
+            QTimer.singleShot(500, lambda: pyperclip.copy(self._old_clip))
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.cfg, re_register_cb=self._register_hotkey)
+        dlg.saved.connect(self._on_settings_saved)
+        dlg.exec()
+
+    def _on_settings_saved(self):
+        self._register_hotkey()
+        # If autocorrect model changed, reload
+        if self.cfg.get("ac_same_as_chat", True):
+            ac_path = self.cfg.get("model_path", "")
+        else:
+            ac_path = self.cfg.get("ac_model_path", "")
+        if self.ac_model.is_loaded():
+            self.ac_model.unload_model()
+        if ac_path:
+            threading.Thread(target=self.ac_model.load_model, daemon=True).start()
+
+    def _browse_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            None, "Select GGUF Model", "", "GGUF (*.gguf)"
+        )
+        if path:
+            self._select_model(path)
+
+    def _select_model(self, path: str):
+        self.cfg.set("model_path", path)
+        self.cfg.add_recent(path)
+        self.chat_model.unload_model()
+        self.tray.showMessage(
+            "TextCorrector",
+            f"Model selected: {os.path.basename(path)}",
+            QSystemTrayIcon.MessageIcon.Information,
+            2500,
+        )
+
+    def _test_hotkey(self):
+        self._trigger.emit(
+            "The quick brown fox jumps over the lazy dog. Ths is a tset."
+        )
+
+    def _add_startup(self):
         try:
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
@@ -3247,34 +2210,25 @@ class TextCorrectorApp(QApplication):
                 0,
                 winreg.KEY_SET_VALUE,
             )
-            script_path = os.path.abspath(__file__)
-            python_path = sys.executable
-
-            # Use pythonw for no console
-            pythonw_path = python_path.replace("python.exe", "pythonw.exe")
-            if os.path.exists(pythonw_path):
-                cmd = f'"{pythonw_path}" "{script_path}"'
-            else:
-                cmd = f'"{python_path}" "{script_path}"'
-
+            exe = sys.executable
+            cmd = f'"{exe.replace("python.exe", "pythonw.exe") if Path(exe.replace("python.exe", "pythonw.exe")).exists() else exe}" "{__file__}"'
             winreg.SetValueEx(key, "TextCorrector", 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(key)
-            self.tray_icon.showMessage(
-                "Text Corrector",
-                "Added to Windows startup",
-                QSystemTrayIcon.Information,
-                3000,
+            self.tray.showMessage(
+                "TextCorrector",
+                "Added to Windows startup.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
             )
         except Exception as e:
-            self.tray_icon.showMessage(
-                "Text Corrector",
-                f"Failed to add to startup: {e}",
-                QSystemTrayIcon.Warning,
+            self.tray.showMessage(
+                "TextCorrector",
+                f"Startup error: {e}",
+                QSystemTrayIcon.MessageIcon.Warning,
                 3000,
             )
 
-    def remove_from_startup(self):
-        """Remove application from Windows startup"""
+    def _rm_startup(self):
         try:
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
@@ -3284,50 +2238,69 @@ class TextCorrectorApp(QApplication):
             )
             try:
                 winreg.DeleteValue(key, "TextCorrector")
-                self.tray_icon.showMessage(
-                    "Text Corrector",
-                    "Removed from Windows startup",
-                    QSystemTrayIcon.Information,
-                    3000,
-                )
             except FileNotFoundError:
-                self.tray_icon.showMessage(
-                    "Text Corrector",
-                    "Not found in startup",
-                    QSystemTrayIcon.Information,
-                    3000,
-                )
+                pass
             winreg.CloseKey(key)
+            self.tray.showMessage(
+                "TextCorrector",
+                "Removed from startup.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
         except Exception as e:
-            self.tray_icon.showMessage(
-                "Text Corrector",
-                f"Failed: {e}",
-                QSystemTrayIcon.Warning,
+            self.tray.showMessage(
+                "TextCorrector",
+                f"Error: {e}",
+                QSystemTrayIcon.MessageIcon.Warning,
                 3000,
             )
 
-    def quit_app(self):
-        """Clean up and quit application"""
-        self.model_manager.unload_model()
-        keyboard.unhook_all_hotkeys()
+    def _quit(self):
+        self.ac_model.unload_model()
+        self.chat_model.unload_model()
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
         self.quit()
 
 
-if __name__ == "__main__":
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # Single instance check
-    import socket
 
+def main():
+    import traceback
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log(f"[UNCAUGHT EXCEPTION]\n{msg}")
+        print(msg, file=sys.stderr)
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _excepthook
+
+    def _thread_excepthook(args):
+        msg = "".join(
+            traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback
+            )
+        )
+        log(f"[THREAD EXCEPTION in {args.thread}]\n{msg}")
+
+    threading.excepthook = _thread_excepthook
+
+    _lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 47521))
-    except:
-        print("Another instance is already running")
-        sys.exit(1)
+        _lock_sock.bind(("127.0.0.1", 47321))
+    except OSError:
+        print("TextCorrector is already running.")
+        sys.exit(0)
 
-    app = TextCorrectorApp(sys.argv)
-    sys.exit(app.exec_())
+    app = TextCorrectorApp()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
