@@ -1387,7 +1387,6 @@ class CorrectionWindow(QWidget):
         cfg: ConfigManager,
         re_register_cb=None,
     ):
-        log("[CW] CorrectionWindow.__init__ start")
         super().__init__()
         self.original = original
         self.corrected = original
@@ -1400,17 +1399,12 @@ class CorrectionWindow(QWidget):
         self._stream_buf = ""
         self._drag_pos = None
 
-        log("[CW] Building UI…")
         self._build_ui()
-        log("[CW] Positioning window…")
         self._position_window()
-        log("[CW] Connecting signals…")
         self._connect_signals()
         self._setup_shortcuts()
 
-        log("[CW] Starting correction thread…")
         threading.Thread(target=self._do_correction, daemon=True).start()
-        log("[CW] __init__ complete")
 
     def _position_window(self):
         self.setWindowFlags(
@@ -1702,7 +1696,9 @@ class CorrectionWindow(QWidget):
 
             # Try patch-based correction first (faster, fewer tokens)
             log("[CW] Trying patch-based autocorrect…")
-            result = self.ac_model.correct_text_patch(text, instruction=patch_instruction)
+            result = self.ac_model.correct_text_patch(
+                text, instruction=patch_instruction
+            )
 
             if result is not None:
                 if result == text:
@@ -1750,6 +1746,7 @@ class CorrectionWindow(QWidget):
 
     def _render_diff(self, corrected: str):
         import difflib
+        import html as _html
 
         orig_words = self.original.split()
         corr_words = corrected.split()
@@ -1758,11 +1755,12 @@ class CorrectionWindow(QWidget):
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             chunk = " ".join(corr_words[j1:j2])
             if tag == "equal":
-                parts.append(chunk)
+                parts.append(_html.escape(chunk))
             elif tag in ("replace", "insert"):
                 parts.append(
                     f'<span style="background:rgba(59,130,246,0.28);'
-                    f'color:#93c5fd;border-radius:3px;padding:1px 2px;">{chunk}</span>'
+                    f'color:#93c5fd;border-radius:3px;padding:1px 2px;">'
+                    f"{_html.escape(chunk)}</span>"
                 )
         html = " ".join(parts)
         self.corr_edit.setHtml(
@@ -1879,6 +1877,9 @@ class CorrectionWindow(QWidget):
         self.corrected = self.original
         self.corr_edit.setPlainText(self.original)
         self.chat_history.clear()
+        self.status_lbl.setText("⏳  Correcting…")
+        self.status_lbl.setStyleSheet("color:#94a3b8;font-size:11px;")
+        self.method_badge.hide()
 
     def _open_settings(self):
         dlg = SettingsDialog(self.cfg, self, re_register_cb=self._re_register_cb)
@@ -2190,6 +2191,11 @@ class TextCorrectorApp(QApplication):
         self.cfg.set("model_path", path)
         self.cfg.add_recent(path)
         self.chat_model.unload_model()
+        # Reload autocorrect model if it shares the chat model
+        if self.cfg.get("ac_same_as_chat", True):
+            if self.ac_model.is_loaded():
+                self.ac_model.unload_model()
+            threading.Thread(target=self.ac_model.load_model, daemon=True).start()
         self.tray.showMessage(
             "TextCorrector",
             f"Model selected: {os.path.basename(path)}",
