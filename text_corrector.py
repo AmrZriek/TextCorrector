@@ -690,39 +690,31 @@ class ModelManager(QObject):
         self.model_unloaded.emit()
 
     # ── correction (non-streaming, single method for all models) ──────────
-    def correct_text(self, text: str, instruction: str | None = None) -> str | None:
+    def correct_text(
+        self,
+        text: str,
+        system: str | None = None,
+        examples: list[dict] | None = None,
+    ) -> str | None:
         if not self.is_loaded():
             if not self.load_model():
                 return None
         self.last_used = datetime.now()
         self.status_changed.emit("Correcting…")
 
-        system = self.cfg.get("system_prompt", "").strip() or (
-            "You are a text correction engine.\n"
-            "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
-            "Preserve all formatting, line breaks, and original tone.\n"
-            "If the text is already correct, return it unchanged."
-        )
+        if not system:
+            system = self.cfg.get("system_prompt", "").strip() or (
+                "You are a text correction engine.\n"
+                "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
+                "Preserve all formatting, line breaks, and original tone.\n"
+                "If the text is already correct, return it unchanged."
+            )
 
-        if instruction:
-            system = f"{system}\n\n{instruction}"
-
-        # Always include few-shot examples so the model knows what to do
-        messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": "the project were delayed because of bad wether",
-            },
-            {
-                "role": "assistant",
-                "content": "The project was delayed because of bad weather.",
-            },
-            {"role": "user", "content": "i dont know if its gona work"},
-            {"role": "assistant", "content": "I don't know if it's going to work."},
-            {"role": "user", "content": text},
-            {"role": "assistant", "content": ""},
-        ]
+        messages = [{"role": "system", "content": system}]
+        if examples:
+            messages.extend(examples)
+        messages.append({"role": "user", "content": text})
+        messages.append({"role": "assistant", "content": ""})
 
         payload = {
             "messages": messages,
@@ -754,13 +746,21 @@ class ModelManager(QObject):
 
     # ── patch-based correction (structured JSON output) ──────────────────
     def correct_text_patch(
-        self, text: str, instruction: str | None = None
+        self,
+        text: str,
+        system: str | None = None,
+        examples: list[dict] | None = None,
     ) -> str | None:
         """Return corrected text by asking the LLM for a JSON patch list.
 
         The LLM outputs only the words that need changing, dramatically reducing
         output tokens. Falls back to None on any parsing error so the caller
         can use correct_text() instead.
+
+        Parameters:
+            text: The text to correct.
+            system: Complete system prompt (caller builds it per strength level).
+            examples: Few-shot message pairs (caller builds per strength level).
         """
         if not self.is_loaded():
             if not self.load_model():
@@ -768,44 +768,26 @@ class ModelManager(QObject):
         self.last_used = datetime.now()
         self.status_changed.emit("Correcting…")
 
-        system = (
-            "You are a text correction engine. You output ONLY a JSON array of patches.\n"
-            "Each patch object has exactly two keys:\n"
-            '  "old" — the wrong word or short phrase as it appears in the text\n'
-            '  "new" — the corrected replacement\n\n'
-            "Rules:\n"
-            "- Only include words that are actually wrong\n"
-            "- Preserve correct words exactly as-is — do NOT include them in patches\n"
-            "- Include fixes for: typos, spelling, grammar, capitalization, apostrophes, punctuation\n"
-            "- Keep each patch short: 1-3 words max for old/new\n"
-            "- If the text is already perfect, output an empty array []\n"
-            "- Output ONLY the JSON array, nothing else\n"
-        )
+        if not system:
+            system = (
+                "You are a text correction engine. You output ONLY a JSON array of patches.\n"
+                "Each patch object has exactly two keys:\n"
+                '  "old" — the wrong word or short phrase as it appears in the text\n'
+                '  "new" — the corrected replacement\n\n'
+                "Rules:\n"
+                "- Only include words that are actually wrong\n"
+                "- Preserve correct words exactly as-is — do NOT include them in patches\n"
+                "- Keep each patch short: 1-3 words max for old/new\n"
+                "- If the text is already perfect, output an empty array []\n"
+                "- Output ONLY the JSON array, nothing else\n"
+            )
 
-        if instruction:
-            system = f"{system}\n\nAdditional instructions: {instruction}"
+        messages = [{"role": "system", "content": system}]
+        if examples:
+            messages.extend(examples)
+        messages.append({"role": "user", "content": text})
+        messages.append({"role": "assistant", "content": ""})
 
-        messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": "the project were delayed because of bad wether",
-            },
-            {
-                "role": "assistant",
-                "content": '[{"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
-            },
-            {"role": "user", "content": "i dont know if its gona work"},
-            {
-                "role": "assistant",
-                "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]',
-            },
-            {"role": "user", "content": text},
-            {"role": "assistant", "content": ""},
-        ]
-
-        # Enough tokens for the JSON to complete. The model outputs far fewer
-        # tokens than full-text regeneration because it only lists wrong words.
         payload = {
             "messages": messages,
             "max_tokens": min(max(len(text.split()) * 2 + 30, 60), 512),
@@ -1254,11 +1236,11 @@ class SettingsDialog(QDialog):
         # Correction strength ─────────────────────────────────────────────
         section("CORRECTION STRENGTH")
         _strength_labels = [
-            "0 — Minimal  (typos + capitalisation only)",
-            "1 — Light    (typos + grammar, preserve wording)",
-            "2 — Standard (grammar + spelling, light clarity)",
-            "3 — Thorough (grammar + structure + word choice)",
-            "4 — Full Rewrite (maximum clarity, restructure)",
+            "0 — Minimal  (typos only)",
+            "1 — Light    (+ caps, punctuation, apostrophes)",
+            "2 — Standard (+ grammar fixes)",
+            "3 — Thorough (+ structure & word choice)",
+            "4 — Full Rewrite (maximum clarity)",
         ]
         self.strength_slider = QSlider(Qt.Orientation.Horizontal)
         self.strength_slider.setRange(0, 4)
@@ -1618,86 +1600,187 @@ class CorrectionWindow(QWidget):
                 self._correction_ready.emit(text, "No changes (model error)")
                 return
 
-            # Every level MUST fix typos, capitalisation, and apostrophes.
-            # Higher levels add progressively more rewriting on top.
-            _BASE = (
-                "ALWAYS fix every typo, misspelling, wrong capitalisation, "
-                "missing or wrong apostrophe, and incorrect punctuation. "
-                "Never skip any of these basic errors regardless of other instructions. "
+            # ── Strength-aware prompts and few-shot examples ──────────
+            # Each level gets its own complete system prompt and matching
+            # few-shot examples so the model sees exactly what to fix.
+            strength = self.cfg.get("correction_strength", 2)
+            log(f"[CW] Correction strength: {strength}")
+
+            _PATCH_FMT = (
+                "You are a text correction engine. You output ONLY a JSON array of patches.\n"
+                "Each patch object has exactly two keys:\n"
+                '  "old" — the wrong word or short phrase as it appears in the text\n'
+                '  "new" — the corrected replacement\n\n'
+                "Rules:\n"
+                "- Only include words that are actually wrong\n"
+                "- Preserve correct words exactly as-is — do NOT include them in patches\n"
+                "- Keep each patch short: 1-3 words max for old/new\n"
+                "- If the text is already perfect, output an empty array []\n"
+                "- Output ONLY the JSON array, nothing else\n"
             )
-            # Patch-specific instructions: guide what types of patches to generate
-            _patch_strength_instructions = {
+
+            _FULL_FMT = (
+                "You are a text correction engine.\n"
+                "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
+                "Preserve all formatting, line breaks, and original tone.\n"
+                "If the text is already correct, return it unchanged.\n"
+            )
+
+            # -- Patch system prompts (complete, per-level) --
+            _patch_systems = {
                 0: (
-                    "Only patch typos, misspellings, wrong capitalisation, "
-                    "missing/wrong apostrophes, and incorrect punctuation. "
-                    "Do NOT patch grammar, word choice, or style. "
-                    "Preserve all correctly-written words."
+                    _PATCH_FMT
+                    + "\nONLY fix clear typos and misspellings.\n"
+                    "Do NOT fix grammar, capitalization, punctuation, or style.\n"
+                    "Preserve everything else exactly as written."
                 ),
                 1: (
-                    "Patch typos, misspellings, capitalisation, apostrophes, punctuation, "
-                    "AND clear grammar mistakes (wrong verb tense, subject-verb agreement, "
-                    "wrong preposition). Preserve original wording otherwise."
+                    _PATCH_FMT
+                    + "\nFix typos, misspellings, capitalization, apostrophes, "
+                    "punctuation, and quotes.\n"
+                    "Do NOT fix grammar, word choice, or rephrase anything.\n"
+                    "Preserve original wording and sentence structure."
                 ),
                 2: (
-                    "Patch typos, misspellings, capitalisation, apostrophes, punctuation, "
-                    "grammar mistakes, AND unclear/confusing phrases. "
-                    "Preserve correctly-written words."
+                    _PATCH_FMT
+                    + "\nFix typos, misspellings, capitalization, punctuation, "
+                    "apostrophes, quotes, AND clear grammar errors "
+                    "(verb tense, subject-verb agreement, articles, prepositions).\n"
+                    "Preserve original wording otherwise."
                 ),
                 3: (
-                    "Patch typos, misspellings, capitalisation, apostrophes, punctuation, "
-                    "grammar, AND improve sentence structure or word choice where needed. "
+                    _PATCH_FMT
+                    + "\nFix all spelling, capitalization, punctuation, grammar errors "
+                    "AND improve sentence structure and word choice.\n"
                     "Keep original meaning and tone."
                 ),
                 4: (
-                    "Patch ALL errors and rewrite phrases/sentences for maximum clarity. "
+                    _PATCH_FMT
+                    + "\nFix ALL errors and rewrite phrases/sentences for maximum clarity.\n"
                     "Restructure if needed. Preserve core meaning only."
                 ),
             }
-            # Full-text instructions (for fallback): guide output format
-            _strength_instructions = {
+
+            # -- Full-text system prompts (complete, per-level) --
+            _full_systems = {
                 0: (
-                    _BASE + "Fix ONLY those basic errors listed above. "
-                    "Do not change any wording, sentence structure, or style. "
-                    "Preserve ALL correctly-written words exactly as written. "
-                    "Output only the corrected text, no explanation."
+                    _FULL_FMT
+                    + "\nONLY fix clear typos and misspellings.\n"
+                    "Do NOT change grammar, capitalization, punctuation, or style.\n"
+                    "Preserve everything else exactly as written."
                 ),
                 1: (
-                    _BASE + "Also fix clear grammar mistakes (wrong verb tense, "
-                    "subject-verb agreement, wrong preposition). "
-                    "Preserve the original wording and sentence structure otherwise. "
-                    "Preserve ALL correctly-written words exactly as written. "
-                    "Output only the corrected text, no explanation."
+                    _FULL_FMT
+                    + "\nFix typos, misspellings, capitalization, apostrophes, "
+                    "punctuation, and quotes.\n"
+                    "Do NOT fix grammar, word choice, or rephrase anything.\n"
+                    "Preserve original wording and sentence structure."
                 ),
                 2: (
-                    _BASE + "Also fix grammar mistakes and lightly improve clarity "
-                    "where the meaning is unclear. "
-                    "Preserve ALL correctly-written words exactly as written. "
-                    "Output only the corrected text, no explanation."
+                    _FULL_FMT
+                    + "\nFix typos, misspellings, capitalization, punctuation, "
+                    "apostrophes, quotes, AND clear grammar errors "
+                    "(verb tense, subject-verb agreement, articles, prepositions).\n"
+                    "Preserve original wording otherwise."
                 ),
                 3: (
-                    _BASE
-                    + "Also improve grammar, sentence structure, and word choice. "
-                    "Keep the original meaning and tone intact. "
-                    "Output only the corrected text, no explanation."
+                    _FULL_FMT
+                    + "\nFix all spelling, capitalization, punctuation, grammar errors "
+                    "AND improve sentence structure and word choice.\n"
+                    "Keep original meaning and tone."
                 ),
                 4: (
-                    _BASE + "Also rewrite for maximum clarity and impact. "
-                    "Restructure sentences if needed. Preserve the core meaning. "
-                    "Output only the rewritten text, no explanation."
+                    _FULL_FMT
+                    + "\nRewrite for maximum clarity and impact.\n"
+                    "Restructure sentences if needed. Preserve the core meaning."
                 ),
             }
-            strength = self.cfg.get("correction_strength", 2)
-            patch_instruction = _patch_strength_instructions.get(
-                strength, _patch_strength_instructions[2]
-            )
-            full_instruction = _strength_instructions.get(
-                strength, _strength_instructions[2]
-            )
+
+            # -- Strength-adaptive few-shot examples (patch mode) --
+            _EX1_INPUT = "the project were delayed because of bad wether"
+            _EX2_INPUT = "i dont know if its gona work"
+
+            _patch_examples = {
+                0: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": '[{"old": "wether", "new": "weather"}]'},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": '[{"old": "gona", "new": "gonna"}]'},
+                ],
+                1: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": '[{"old": "wether", "new": "weather"}]'},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
+                ],
+                2: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
+                ],
+                3: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]'},
+                ],
+                4: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": '[{"old": "the project were delayed because of bad wether", "new": "The project was delayed due to bad weather."}]'},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": '[{"old": "i dont know if its gona work", "new": "I\'m not sure if it\'s going to work."}]'},
+                ],
+            }
+
+            # -- Strength-adaptive few-shot examples (full-text mode) --
+            _full_examples = {
+                0: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": "the project were delayed because of bad weather"},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": "i dont know if its gonna work"},
+                ],
+                1: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": "the project were delayed because of bad weather."},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": "I don't know if it's gonna work."},
+                ],
+                2: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": "The project was delayed because of bad weather."},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": "I don't know if it's gonna work."},
+                ],
+                3: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": "The project was delayed because of bad weather."},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": "I don't know if it's going to work."},
+                ],
+                4: [
+                    {"role": "user", "content": _EX1_INPUT},
+                    {"role": "assistant", "content": "The project was delayed due to bad weather."},
+                    {"role": "user", "content": _EX2_INPUT},
+                    {"role": "assistant", "content": "I'm not sure if it's going to work."},
+                ],
+            }
+
+            patch_system = _patch_systems.get(strength, _patch_systems[2])
+            patch_examples = _patch_examples.get(strength, _patch_examples[2])
+            full_system = _full_systems.get(strength, _full_systems[2])
+            full_examples = _full_examples.get(strength, _full_examples[2])
+
+            # Override with user's custom system prompt if set (full-text only)
+            custom_sys = self.cfg.get("system_prompt", "").strip()
+            if custom_sys:
+                full_system = custom_sys
 
             # Try patch-based correction first (faster, fewer tokens)
             log("[CW] Trying patch-based autocorrect…")
             result = self.ac_model.correct_text_patch(
-                text, instruction=patch_instruction
+                text, system=patch_system, examples=patch_examples
             )
 
             if result is not None:
@@ -1711,7 +1794,9 @@ class CorrectionWindow(QWidget):
 
             # Fall back to full-text correction
             log("[CW] Patch correction failed, falling back to full-text…")
-            result = self.ac_model.correct_text(text, instruction=full_instruction)
+            result = self.ac_model.correct_text(
+                text, system=full_system, examples=full_examples
+            )
 
             if result is not None and result.strip() != "":
                 log("[CW] LLM autocorrect done (full-text fallback)")

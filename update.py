@@ -68,7 +68,9 @@ def _detect_asset_keyword() -> str:
     is_arm = arch in ("arm64", "aarch64")
 
     if sys.platform == "win32":
-        return "win-cuda" if _has_nvidia() else "win-noavx" if not _has_avx2() else "win-avx2"
+        # Prefer CUDA 12.x for broadest driver compatibility.
+        # Falls back to cpu-x64 if no NVIDIA GPU is present.
+        return "win-cuda-12" if _has_nvidia() else "win-cpu-x64"
     elif sys.platform == "darwin":
         return "macos-arm64" if is_arm else "macos-x86_64"
     else:  # Linux
@@ -87,6 +89,24 @@ def _has_avx2() -> bool:
         import cpuinfo  # type: ignore
         return "avx2" in cpuinfo.get_cpu_info().get("flags", [])
     except Exception: return True  # assume modern CPU
+
+
+def _extract_zip_to(zip_path: Path, dest_dir: Path):
+    """Extract llama binaries + all DLLs from a zip into dest_dir."""
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            mname = Path(member).name
+            if not mname:
+                continue
+            is_binary = mname.startswith("llama-") or mname.startswith("rpc-")
+            is_lib    = mname.endswith((".dll", ".so", ".dylib"))
+            if is_binary or is_lib:
+                data_bytes = zf.read(member)
+                dest = dest_dir / mname
+                dest.write_bytes(data_bytes)
+                if sys.platform != "win32":
+                    dest.chmod(0o755)
+                print(f"    Extracted: {mname}")
 
 
 def update_llama():
@@ -109,59 +129,68 @@ def update_llama():
     print(f"  Latest release : {tag}")
     print(f"  Platform hint  : {kw}")
 
-    # Find a matching asset
-    match = None
+    # Find the main binary asset
+    main_asset = None
     for asset in assets:
         name = asset["name"].lower()
-        if kw in name and name.endswith((".zip", ".tar.gz")):
-            match = asset
+        # Must start with "llama-b" (not "cudart-") and match the keyword
+        if name.startswith("llama-b") and kw in name and name.endswith((".zip", ".tar.gz")):
+            main_asset = asset
             break
 
-    if not match:
+    if not main_asset:
         print(f"  No asset matched '{kw}'. Available assets:")
         for a in assets:
             print(f"    {a['name']}")
         print("  Please download manually from: https://github.com/ggerganov/llama.cpp/releases")
         return
 
-    url       = match["browser_download_url"]
-    filename  = match["name"]
-    tmp_path  = ROOT / filename
-
-    print(f"  Downloading {filename} …")
-    urllib.request.urlretrieve(url, tmp_path, reporthook=_progress)
-    print()
-
-    # Extract
     LLAMA_DIR.mkdir(exist_ok=True)
-    print(f"  Extracting to {LLAMA_DIR}/ …")
+    downloads: list[tuple] = [(main_asset["browser_download_url"], main_asset["name"])]
 
-    if filename.endswith(".zip"):
-        with zipfile.ZipFile(tmp_path) as zf:
-            for member in zf.namelist():
-                mname = Path(member).name
-                if mname and (mname.startswith("llama-") or mname.endswith(".dll") or
-                               mname.endswith(".so") or mname.endswith(".dylib")):
-                    data_bytes = zf.read(member)
-                    dest = LLAMA_DIR / mname
-                    dest.write_bytes(data_bytes)
-                    if sys.platform != "win32":
-                        dest.chmod(0o755)
-                    print(f"    Extracted: {mname}")
-    elif filename.endswith(".tar.gz"):
-        with tarfile.open(tmp_path) as tf:
-            for member in tf.getmembers():
-                mname = Path(member.name).name
-                if mname and (mname.startswith("llama-") or mname.endswith(".so") or
-                               mname.endswith(".dylib")):
-                    f = tf.extractfile(member)
-                    if f:
-                        dest = LLAMA_DIR / mname
-                        dest.write_bytes(f.read())
-                        dest.chmod(0o755)
-                        print(f"    Extracted: {mname}")
+    # For CUDA Windows builds, also grab the cudart package (CUDA runtime DLLs).
+    # These are distributed separately since llama-bXXXX-bin-win-cuda-*.zip does NOT
+    # bundle cudart64_*.dll / cublas64_*.dll — without them ggml-cuda.dll won't load.
+    if sys.platform == "win32" and "cuda" in kw:
+        # Extract the CUDA version from the matched asset name, e.g. "cuda-12.4"
+        import re
+        m = re.search(r"cuda-(\d+\.\d+)", main_asset["name"].lower())
+        cuda_ver = m.group(1) if m else None
+        cudart_asset = None
+        for asset in assets:
+            aname = asset["name"].lower()
+            if aname.startswith("cudart-") and aname.endswith(".zip"):
+                if cuda_ver and cuda_ver in aname:
+                    cudart_asset = asset
+                    break
+        if cudart_asset:
+            downloads.append((cudart_asset["browser_download_url"], cudart_asset["name"]))
+            print(f"  Also downloading CUDA runtime package: {cudart_asset['name']}")
+        else:
+            print("  WARNING: cudart package not found — CUDA runtime DLLs will be missing.")
 
-    tmp_path.unlink(missing_ok=True)
+    for url, filename in downloads:
+        tmp_path = ROOT / filename
+        print(f"  Downloading {filename} …")
+        urllib.request.urlretrieve(url, tmp_path, reporthook=_progress)
+        print()
+        print(f"  Extracting to {LLAMA_DIR}/ …")
+        if filename.endswith(".zip"):
+            _extract_zip_to(tmp_path, LLAMA_DIR)
+        elif filename.endswith(".tar.gz"):
+            with tarfile.open(tmp_path) as tf:
+                for member in tf.getmembers():
+                    mname = Path(member.name).name
+                    if mname and (mname.startswith("llama-") or mname.endswith(".so") or
+                                   mname.endswith(".dylib")):
+                        f = tf.extractfile(member)
+                        if f:
+                            dest = LLAMA_DIR / mname
+                            dest.write_bytes(f.read())
+                            dest.chmod(0o755)
+                            print(f"    Extracted: {mname}")
+        tmp_path.unlink(missing_ok=True)
+
     print(f"  llama.cpp updated to {tag}.")
 
 
