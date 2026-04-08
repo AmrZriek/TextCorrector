@@ -73,6 +73,56 @@ DEBUG_LOG = SCRIPT_DIR / "app_debug.log"
 
 SERVER_EXE = "llama-server.exe" if WINDOWS else "llama-server"
 
+GITHUB_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+
+
+def _get_local_build_number() -> int:
+    """Return the local llama-server build number (e.g. 8196), or 0 on failure."""
+    try:
+        exe = LLAMA_CPP_DIR / SERVER_EXE
+        if not exe.exists():
+            return 0
+        r = subprocess.run(
+            [str(exe), "--version"],
+            capture_output=True, text=True, timeout=8,
+            **{"creationflags": 0x08000000} if WINDOWS else {},
+        )
+        # Output: "version: 8196 (c99909dd0)"
+        m = re.search(r"version:\s*(\d+)", r.stderr + r.stdout)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+class UpdateChecker(QThread):
+    """Background thread — checks GitHub for a newer llama.cpp release."""
+    update_available = pyqtSignal(str, int)   # (new_tag, new_build_number)
+    check_done = pyqtSignal()
+
+    def run(self):
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                GITHUB_RELEASES_API,
+                headers={"User-Agent": "TextCorrector-update-checker"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "")           # e.g. "b8690"
+            m = re.search(r"b(\d+)", tag)
+            if not m:
+                return
+            remote_build = int(m.group(1))
+            local_build = _get_local_build_number()
+            log(f"[Update] local build={local_build}  remote build={remote_build}  tag={tag}")
+            if remote_build > local_build:
+                self.update_available.emit(tag, remote_build)
+        except Exception as e:
+            log(f"[Update] Check failed: {e}")
+        finally:
+            self.check_done.emit()
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
@@ -172,28 +222,99 @@ def _apply_patches(original: str, patches: list[dict]) -> str:
     by replacing only the first match per patch.
     """
     result = original
+    patches_applied = 0
+
     for patch in patches:
         old_word = patch.get("old", "").strip()
         new_word = patch.get("new", "").strip()
         if not old_word or not new_word:
             continue
+
         escaped = re.escape(old_word)
         # Use negative lookbehind/lookahead instead of \b to handle punctuation adjacency
         # Matches word not preceded/followed by letter (allows punctuation boundaries)
-        pattern = re.compile(rf"(?<![a-zA-Z]){escaped}(?![a-zA-Z])", re.IGNORECASE)
-        if pattern.search(result):
+        # CASE SENSITIVE: model was instructed to return old EXACTLY as it appears in text
+        pattern = re.compile(rf"(?<![a-zA-Z]){escaped}(?![a-zA-Z])")
+
+        match = pattern.search(result)
+        if match:
             result = pattern.sub(new_word, result, count=1)
+            patches_applied += 1
+        else:
+            # Also try case-insensitive as fallback, but log it
+            pattern_ci = re.compile(
+                rf"(?<![a-zA-Z]){escaped}(?![a-zA-Z])", re.IGNORECASE
+            )
+            match_ci = pattern_ci.search(result)
+            if match_ci:
+                log(
+                    f"[PATCH] Case mismatch: model returned '{old_word}' but found '{match_ci.group()}' - applying anyway"
+                )
+                result = pattern_ci.sub(new_word, result, count=1)
+                patches_applied += 1
+            else:
+                log(
+                    f"[PATCH] No match found for: '{old_word}' → '{new_word}' (skipping)"
+                )
+
+    if patches_applied == 0:
+        log(f"[PATCH] No patches were applied successfully")
+        return original
+
+    log(f"[PATCH] Applied {patches_applied}/{len(patches)} patches successfully")
     return result
 
 
-def _extract_patches_from_response(raw: str) -> list[dict]:
+def _extract_content_from_response(resp: dict) -> tuple[str, str]:
+    """Extract usable text content from an llama.cpp API response.
+
+    Handles thinking models where content is empty and reasoning_content
+    has the output (llama.cpp auto-activates thinking mode for models whose
+    GGUF chat template includes <think> tokens).
+
+    Returns:
+        (content, finish_reason) — content may be empty if thinking consumed
+        all tokens.
+    """
+    choice = resp["choices"][0]
+    finish_reason = choice.get("finish_reason", "")
+    message = choice["message"]
+    content = (message.get("content") or "").strip()
+    reasoning = (message.get("reasoning_content") or "").strip()
+
+    if content:
+        return content, finish_reason
+
+    if reasoning:
+        log(
+            "[API] Thinking model detected: content is empty, reasoning_content present. "
+            "The model spent all tokens on reasoning and never produced output. "
+            "Ensure 'think: false' is in the API payload to disable this."
+        )
+
+    return "", finish_reason
+
+
+def _extract_patches_from_response(raw: str) -> list[dict] | None:
     """Extract JSON patch array from LLM response.
+
+    Returns:
+        list[dict]: Parsed patches (may be empty [] if model says text is correct).
+        None: Parsing failed — raw had content but no valid JSON found.
 
     Handles cases where the model wraps JSON in markdown code fences
     or adds explanatory text around it.
     """
+    if not raw or not raw.strip():
+        return []  # Empty input = no corrections needed
+
     cleaned = strip_think(raw)
     cleaned = strip_preamble(cleaned)
+
+    # Strip markdown code fences
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
 
     # Try direct JSON array parse
     try:
@@ -211,7 +332,14 @@ def _extract_patches_from_response(raw: str) -> list[dict]:
             if isinstance(data, list):
                 return data
         except (json.JSONDecodeError, ValueError):
-            pass
+            # Try fixing trailing comma (common with small models)
+            fixed = re.sub(r",\s*\]", "]", array_match.group(0))
+            try:
+                data = json.loads(fixed)
+                if isinstance(data, list):
+                    return data
+            except (json.JSONDecodeError, ValueError):
+                pass
 
     # Try to find JSON object with "patches" key
     obj_match = re.search(r"\{[\s\S]*\}", cleaned)
@@ -223,7 +351,8 @@ def _extract_patches_from_response(raw: str) -> list[dict]:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    return []
+    # Parsing failed — raw had content but no valid JSON
+    return None
 
 
 # ── Scroll-wheel ignore helper ────────────────────────────────────────────────
@@ -616,6 +745,7 @@ class ModelManager(QObject):
             host,
             "--port",
             str(port),
+            "--no-warmup",
             "--log-disable",
         ]
 
@@ -623,6 +753,19 @@ class ModelManager(QObject):
             kwargs: dict = {}
             if WINDOWS:
                 kwargs["creationflags"] = 0x08000000
+
+            # Clear any orphaned llama-server from a previous session
+            try:
+                if WINDOWS:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", SERVER_EXE],
+                        capture_output=True,
+                        creationflags=0x08000000,
+                        timeout=5,
+                    )
+            except Exception:
+                pass
+
             self.log_file = open(LOG_FILE, "w", encoding="utf-8")
             self.server_process = subprocess.Popen(
                 cmd, stdout=self.log_file, stderr=self.log_file, **kwargs
@@ -630,6 +773,12 @@ class ModelManager(QObject):
 
             for i in range(180):
                 if self.server_process.poll() is not None:
+                    # Dump server log into app_debug.log for easier diagnosis
+                    try:
+                        tail = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        log(f"[{self.label}] server_log.txt tail:\n{tail}")
+                    except Exception:
+                        pass
                     raise RuntimeError("Server exited immediately — see server_log.txt")
                 try:
                     if requests.get(self._health_url(), timeout=1).status_code == 200:
@@ -714,7 +863,6 @@ class ModelManager(QObject):
         if examples:
             messages.extend(examples)
         messages.append({"role": "user", "content": text})
-        messages.append({"role": "assistant", "content": ""})
 
         payload = {
             "messages": messages,
@@ -723,22 +871,34 @@ class ModelManager(QObject):
             "top_k": self.cfg.get("top_k", 40),
             "top_p": self.cfg.get("top_p", 0.95),
             "stream": False,
+            "think": False,
         }
 
         try:
+            log(f"[{self.label}] POST {self._chat_url()} payload={json.dumps(payload)[:300]}")
             r = requests.post(self._chat_url(), json=payload, timeout=120)
+            if not r.ok:
+                log(f"[{self.label}] HTTP {r.status_code} — body: {r.text[:500]}")
             r.raise_for_status()
             resp = r.json()
             log(f"[{self.label}] Raw API response: {json.dumps(resp)[:500]}")
-            raw = resp["choices"][0]["message"]["content"]
-            log(f"[{self.label}] Raw content before strip: {repr(raw[:200])}")
-            raw = raw.strip()
+
+            raw, finish_reason = _extract_content_from_response(resp)
+            log(f"[{self.label}] Raw content: {repr(raw[:200])}, finish_reason={finish_reason}")
+
+            if not raw:
+                log(f"[{self.label}] correct_text got empty content (finish_reason={finish_reason})")
+                return None
+
+            if finish_reason == "length":
+                log(f"[{self.label}] correct_text output truncated (finish_reason=length)")
+
             raw = strip_think(raw)
             raw = strip_preamble(raw, text)
             log(f"[{self.label}] After strip: {repr(raw[:200])}")
             self.last_used = datetime.now()
             self.status_changed.emit("Ready")
-            return raw or text
+            return raw if raw else None
         except Exception as e:
             log(f"[{self.label}] correct_text error: {e}")
             self.status_changed.emit(f"Error: {str(e)[:50]}")
@@ -786,7 +946,6 @@ class ModelManager(QObject):
         if examples:
             messages.extend(examples)
         messages.append({"role": "user", "content": text})
-        messages.append({"role": "assistant", "content": ""})
 
         payload = {
             "messages": messages,
@@ -795,18 +954,29 @@ class ModelManager(QObject):
             "top_k": self.cfg.get("top_k", 40),
             "top_p": self.cfg.get("top_p", 0.95),
             "stream": False,
+            "think": False,
         }
 
         try:
+            log(f"[{self.label}] PATCH POST {self._chat_url()} payload={json.dumps(payload)[:300]}")
             r = requests.post(self._chat_url(), json=payload, timeout=120)
+            if not r.ok:
+                log(f"[{self.label}] HTTP {r.status_code} — body: {r.text[:500]}")
             r.raise_for_status()
             resp = r.json()
             log(f"[{self.label}] Patch raw response: {json.dumps(resp)[:500]}")
-            raw = resp["choices"][0]["message"]["content"]
-            log(f"[{self.label}] Patch raw content: {repr(raw[:300])}")
+
+            raw, finish_reason = _extract_content_from_response(resp)
+            log(f"[{self.label}] Patch raw content: {repr(raw[:300])}, finish_reason={finish_reason}")
+
+            # Thinking model consumed all tokens — no usable output
+            if not raw and finish_reason == "length":
+                log(f"[{self.label}] finish_reason=length with empty content — falling back")
+                return None
 
             patches = _extract_patches_from_response(raw)
-            if not patches:
+
+            if patches is None:
                 log(f"[{self.label}] No valid patches extracted from response")
                 return None
 
@@ -817,7 +987,7 @@ class ModelManager(QObject):
                 if p.get("old", "").strip() != p.get("new", "").strip()
             ]
             if not real_patches:
-                log(f"[{self.label}] All patches were no-ops — text is already correct")
+                log(f"[{self.label}] No corrections needed — text is already correct")
                 return text
 
             log(
@@ -825,6 +995,12 @@ class ModelManager(QObject):
             )
             result = _apply_patches(text, real_patches)
             log(f"[{self.label}] Patch result: {repr(result[:200])}")
+
+            # Patches exist but none applied — fall back to full-text
+            if result == text and len(real_patches) > 0:
+                log(f"[{self.label}] No patches applied successfully — falling back to full text")
+                return None
+
             self.last_used = datetime.now()
             self.status_changed.emit("Ready")
             return result
@@ -843,6 +1019,7 @@ class ModelManager(QObject):
             "temperature": self.cfg.get("temperature", 0.3),
             "top_k": self.cfg.get("top_k", 40),
             "top_p": self.cfg.get("top_p", 0.95),
+            "think": False,
         }
         return StreamWorker(self._chat_url(), payload)
 
@@ -1410,6 +1587,7 @@ class CorrectionWindow(QWidget):
         self._chat_token.connect(self._on_chat_token)
         self._chat_done.connect(self._on_chat_done)
         self._chat_error.connect(self._on_chat_error)
+        self.ac_model.status_changed.connect(self._on_model_status)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -1580,6 +1758,20 @@ class CorrectionWindow(QWidget):
         lay.addLayout(btn_row)
 
     # ── correction logic ──────────────────────────────────────────────────
+    def _on_model_status(self, msg: str):
+        ml = msg.lower()
+        if "ready" in ml:
+            return  # completion signal handles the final state
+        elif "correcting" in ml:
+            self.status_lbl.setText("⏳  Processing…")
+            self.status_lbl.setStyleSheet("color:#94a3b8;font-size:11px;")
+        elif "loading" in ml or "starting" in ml:
+            self.status_lbl.setText("⏳  Loading model…")
+            self.status_lbl.setStyleSheet("color:#f59e0b;font-size:11px;")
+        elif "error" in ml or "failed" in ml or "not found" in ml:
+            self.status_lbl.setText(f"⚠  {msg[:45]}")
+            self.status_lbl.setStyleSheet("color:#f87171;font-size:11px;")
+
     def _do_correction(self):
         """Autocorrect using the LLM (autocorrect model).
 
@@ -1629,8 +1821,7 @@ class CorrectionWindow(QWidget):
             # -- Patch system prompts (complete, per-level) --
             _patch_systems = {
                 0: (
-                    _PATCH_FMT
-                    + "\nONLY fix clear typos and misspellings.\n"
+                    _PATCH_FMT + "\nONLY fix clear typos and misspellings.\n"
                     "Do NOT fix grammar, capitalization, punctuation, or style.\n"
                     "Preserve everything else exactly as written."
                 ),
@@ -1664,8 +1855,7 @@ class CorrectionWindow(QWidget):
             # -- Full-text system prompts (complete, per-level) --
             _full_systems = {
                 0: (
-                    _FULL_FMT
-                    + "\nONLY fix clear typos and misspellings.\n"
+                    _FULL_FMT + "\nONLY fix clear typos and misspellings.\n"
                     "Do NOT change grammar, capitalization, punctuation, or style.\n"
                     "Preserve everything else exactly as written."
                 ),
@@ -1690,8 +1880,7 @@ class CorrectionWindow(QWidget):
                     "Keep original meaning and tone."
                 ),
                 4: (
-                    _FULL_FMT
-                    + "\nRewrite for maximum clarity and impact.\n"
+                    _FULL_FMT + "\nRewrite for maximum clarity and impact.\n"
                     "Restructure sentences if needed. Preserve the core meaning."
                 ),
             }
@@ -1703,33 +1892,63 @@ class CorrectionWindow(QWidget):
             _patch_examples = {
                 0: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "wether", "new": "weather"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "wether", "new": "weather"}]',
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "gona", "new": "gonna"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "gona", "new": "gonna"}]',
+                    },
                 ],
                 1: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "wether", "new": "weather"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "wether", "new": "weather"}]',
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]',
+                    },
                 ],
                 2: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]',
+                    },
                 ],
                 3: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]',
+                    },
                 ],
                 4: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "the project were delayed because of bad wether", "new": "The project was delayed due to bad weather."}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "the project were delayed because of bad wether", "new": "The project was delayed due to bad weather."}]',
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "i dont know if its gona work", "new": "I\'m not sure if it\'s going to work."}]'},
+                    {
+                        "role": "assistant",
+                        "content": '[{"old": "i dont know if its gona work", "new": "I\'m not sure if it\'s going to work."}]',
+                    },
                 ],
             }
 
@@ -1737,33 +1956,60 @@ class CorrectionWindow(QWidget):
             _full_examples = {
                 0: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": "the project were delayed because of bad weather"},
+                    {
+                        "role": "assistant",
+                        "content": "the project were delayed because of bad weather",
+                    },
                     {"role": "user", "content": _EX2_INPUT},
                     {"role": "assistant", "content": "i dont know if its gonna work"},
                 ],
                 1: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": "the project were delayed because of bad weather."},
+                    {
+                        "role": "assistant",
+                        "content": "the project were delayed because of bad weather.",
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": "I don't know if it's gonna work."},
+                    {
+                        "role": "assistant",
+                        "content": "I don't know if it's gonna work.",
+                    },
                 ],
                 2: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": "The project was delayed because of bad weather."},
+                    {
+                        "role": "assistant",
+                        "content": "The project was delayed because of bad weather.",
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": "I don't know if it's gonna work."},
+                    {
+                        "role": "assistant",
+                        "content": "I don't know if it's gonna work.",
+                    },
                 ],
                 3: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": "The project was delayed because of bad weather."},
+                    {
+                        "role": "assistant",
+                        "content": "The project was delayed because of bad weather.",
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": "I don't know if it's going to work."},
+                    {
+                        "role": "assistant",
+                        "content": "I don't know if it's going to work.",
+                    },
                 ],
                 4: [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": "The project was delayed due to bad weather."},
+                    {
+                        "role": "assistant",
+                        "content": "The project was delayed due to bad weather.",
+                    },
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": "I'm not sure if it's going to work."},
+                    {
+                        "role": "assistant",
+                        "content": "I'm not sure if it's going to work.",
+                    },
                 ],
             }
 
@@ -1802,8 +2048,8 @@ class CorrectionWindow(QWidget):
                 log("[CW] LLM autocorrect done (full-text fallback)")
                 self._correction_ready.emit(result, "AI autocorrect")
             else:
-                log("[CW] LLM returned nothing")
-                self._correction_ready.emit(text, "No changes")
+                log("[CW] Both patch and full-text correction failed — model produced no output")
+                self._correction_ready.emit(text, "No changes (model error)")
 
         except Exception as e:
             log(f"[CW] _do_correction CRASHED: {e}\n{traceback.format_exc()}")
@@ -1972,6 +2218,10 @@ class CorrectionWindow(QWidget):
         dlg.exec()
 
     def closeEvent(self, e):
+        try:
+            self.ac_model.status_changed.disconnect(self._on_model_status)
+        except Exception:
+            pass
         if self._stream_worker and self._stream_worker.isRunning():
             self._stream_worker.stop()
             self._stream_worker.wait(500)
@@ -2061,6 +2311,10 @@ class TextCorrectorApp(QApplication):
         if ac_path:
             threading.Thread(target=self.ac_model.load_model, daemon=True).start()
 
+        # Check for llama.cpp updates 5 s after boot (non-blocking)
+        self._update_checker: UpdateChecker | None = None
+        QTimer.singleShot(5000, self._check_llama_update)
+
     def _build_tray(self):
         self.tray = QSystemTrayIcon(make_tray_icon("#475569"), self)
         self.tray.setToolTip("TextCorrector")
@@ -2119,6 +2373,12 @@ class TextCorrectorApp(QApplication):
 
         act_quit = QAction("Quit", self)
         act_quit.triggered.connect(self._quit)
+
+        # Update checker — shown before Quit; text changes when update found
+        self._update_action = QAction("Check for llama.cpp update", self)
+        self._update_action.triggered.connect(self._check_llama_update)
+        menu.addAction(self._update_action)
+        menu.addSeparator()
         menu.addAction(act_quit)
 
         self.tray.setContextMenu(menu)
@@ -2345,6 +2605,25 @@ class TextCorrectorApp(QApplication):
                 QSystemTrayIcon.MessageIcon.Warning,
                 3000,
             )
+
+    def _check_llama_update(self):
+        """Start background update check. Safe to call multiple times."""
+        if self._update_checker and self._update_checker.isRunning():
+            return
+        self._update_checker = UpdateChecker()
+        self._update_checker.update_available.connect(self._on_update_available)
+        self._update_checker.start()
+
+    def _on_update_available(self, tag: str, build: int):
+        local = _get_local_build_number()
+        log(f"[Update] New llama.cpp available: {tag} (build {build}, you have {local})")
+        self._update_action.setText(f"⬆️  llama.cpp {tag} available — run update.py --llama")
+        self.tray.showMessage(
+            "TextCorrector — Update available",
+            f"llama.cpp {tag} is out (you have b{local}).\nRun: python update.py --llama",
+            QSystemTrayIcon.MessageIcon.Information,
+            8000,
+        )
 
     def _quit(self):
         self.ac_model.unload_model()

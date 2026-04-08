@@ -108,11 +108,11 @@ LanguageTool JARs exist in this project.
 ## Key Classes (text_corrector.py)
 
 ### Helper Functions
-- `strip_think(text)` — removes `<thinking>`, `
-</think>
-
-`, `<reasoning>` tags and their content
+- `strip_think(text)` — removes `<thinking>`, `</think>`, `<reasoning>` tags and their content
 - `strip_preamble(text, original)` — strips LLM preamble ("Here is the corrected text:", markdown code fences, etc.)
+- `_extract_content_from_response(resp)` — extracts `(content, finish_reason)` from API response; detects thinking models where `content` is empty and `reasoning_content` has the output
+- `_extract_patches_from_response(raw)` — extracts JSON patches from LLM output; returns `None` on parse failure (triggers fallback), `[]` for valid empty (text already correct)
+- `_apply_patches(original, patches)` — applies word-level regex patches with case-insensitive fallback
 - `friendly_name(path)` — converts GGUF filenames to readable display names
 - `has_nvidia()` — detects NVIDIA GPU for GPU offload decision
 - `log(msg)` — appends timestamped messages to `app_debug.log`
@@ -126,16 +126,19 @@ LanguageTool JARs exist in this project.
   - Caller provides complete system prompt and few-shot examples (strength-aware)
   - Uses `temperature: 0.0` for deterministic output
   - `max_tokens` calculated as `min(max(len(text.split()) * 2 + 30, 60), 512)`
+  - Sends `"think": false` in payload to disable reasoning for thinking models
+  - Uses `_extract_content_from_response()` to handle thinking model responses
   - Post-processes output through `strip_think()` then `strip_preamble()`
 - `correct_text_patch(text, system, examples)` — structured JSON patch correction (preferred, tried first)
   - Caller provides complete system prompt and few-shot examples (strength-aware)
   - Asks LLM for JSON array of `{old, new}` patches instead of full text
-  - Dramatically fewer output tokens (only wrong words, not entire text)
+  - Sends `"think": false` in payload to disable reasoning
+  - Uses `_extract_content_from_response()` for response extraction
   - Extracts patches via `_extract_patches_from_response()`, applies via `_apply_patches()`
   - Filters out no-op patches where `old == new` (model sometimes outputs every word as a patch with identical values)
   - If all patches are no-ops, returns original text unchanged (not `None`)
   - Returns `None` only on parsing errors so caller can fall back to `correct_text()`
-- `make_stream_worker(messages)` — returns a `StreamWorker` QThread for SSE streaming
+- `make_stream_worker(messages)` — returns a `StreamWorker` QThread for SSE streaming; also sends `"think": false`
 - `check_idle()` — called by QTimer every 60 s; unloads model if idle > timeout (chat only)
 
 ### `StreamWorker(QThread)`
@@ -223,6 +226,16 @@ Do NOT:
 3. **llama-server requires a GGUF model**: A compatible GGUF model file must be
    configured in Settings for any feature to work.
 
+4. **Thinking models / `reasoning_content`**: llama.cpp auto-activates thinking
+   mode for models whose GGUF chat template includes `<think>` tokens (e.g.
+   Qwen 3.x, Gemma 4). When active, the model puts its reasoning in
+   `reasoning_content` and the answer in `content`. Without `"think": false` in
+   the API payload, the model can exhaust all `max_tokens` on reasoning and return
+   empty `content` — making it look like text is "already correct." All API calls
+   now send `"think": false` to prevent this. If corrections stop working again,
+   check `app_debug.log` for `"reasoning_content present"` — that means the fix
+   isn't taking effect (e.g. old llama.cpp build that ignores `think` param).
+
 ---
 
 ## What Was Deleted (Do Not Re-add)
@@ -256,6 +269,21 @@ Level 0 is the absolute minimum (only misspelled words). Each level adds progres
 ---
 
 ## Session Log
+
+### 2026-04-08
+- **Fixed critical bug: thinking models broke all corrections.** llama.cpp auto-activates
+  thinking mode for Qwen 3.x / Gemma 4 models (based on GGUF chat template `<think>` tokens).
+  Model output went to `reasoning_content` instead of `content`, leaving `content` empty.
+  Code only read `content`, so every correction returned "Already correct."
+- Added `"think": false` to all API payloads (`correct_text`, `correct_text_patch`, `make_stream_worker`)
+- Added `_extract_content_from_response()` helper to centralize response parsing and detect
+  thinking model symptoms (empty content + reasoning_content present)
+- Fixed `_extract_patches_from_response()` return type: now returns `None` for parse failure
+  (triggers fallback) vs `[]` for valid empty array (text is correct). Previously both returned
+  `[]`, which caused valid "already correct" responses to wrongly trigger full-text fallback.
+- Removed empty assistant prefill from `correct_text()` (`{"role": "assistant", "content": ""}`)
+- Added trailing-comma tolerance in JSON patch extraction for small model quirks
+- Improved error message when both patch and full-text fail: "No changes (model error)"
 
 ### 2026-04-06
 - Fixed strength slider bug: removed hardcoded system prompt in `correct_text_patch()` that overrode per-level instructions

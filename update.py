@@ -25,7 +25,7 @@ VENV_PY   = ROOT / "venv" / ("Scripts/python.exe" if sys.platform == "win32" els
 REQ_FILE  = ROOT / "requirements.txt"
 LLAMA_DIR = ROOT / "llama_cpp"
 
-GITHUB_API = "https://api.github.com/repos/ggerganov/llama.cpp/releases/latest"
+GITHUB_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def banner(msg: str):
@@ -192,6 +192,20 @@ def update_llama():
         tmp_path.unlink(missing_ok=True)
 
     print(f"  llama.cpp updated to {tag}.")
+
+    # Persist build number so in-app update checker knows what is installed
+    cfg_path = ROOT / "config.json"
+    if cfg_path.exists():
+        try:
+            import re as _re
+            m = _re.search(r"b(\d+)", tag)
+            if m:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                cfg["llama_build"] = int(m.group(1))
+                cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                print(f"  Saved llama_build={m.group(1)} to config.json")
+        except Exception as e:
+            print(f"  Warning: could not update config.json: {e}")
 
 
 def _progress(block, block_size, total):
