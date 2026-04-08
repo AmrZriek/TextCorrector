@@ -49,7 +49,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QDoubleSpinBox,
-    QSlider,
+    QInputDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QPoint, QSize
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QCursor, QAction
@@ -401,8 +401,8 @@ DEFAULT_CONFIG: dict = {
     "hotkey": "ctrl+shift+space",
     # Misc
     "system_prompt": "",
-    # Correction aggressiveness: 0=Minimal … 4=Full Rewrite
-    "correction_strength": 2,
+    "correction_mode": "standard",
+    "custom_templates": [],
 }
 
 
@@ -1410,36 +1410,18 @@ class SettingsDialog(QDialog):
         self.sysprompt_edit.setFixedHeight(90)
         form.addWidget(self.sysprompt_edit)
 
-        # Correction strength ─────────────────────────────────────────────
-        section("CORRECTION STRENGTH")
-        _strength_labels = [
-            "0 — Minimal  (typos only)",
-            "1 — Light    (+ caps, punctuation, apostrophes)",
-            "2 — Standard (+ grammar fixes)",
-            "3 — Thorough (+ structure & word choice)",
-            "4 — Full Rewrite (maximum clarity)",
-        ]
-        self.strength_slider = QSlider(Qt.Orientation.Horizontal)
-        self.strength_slider.setRange(0, 4)
-        self.strength_slider.setSingleStep(1)
-        self.strength_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.strength_slider.setTickInterval(1)
-        self.strength_slider.setStyleSheet(
-            "QSlider::groove:horizontal{height:4px;background:rgba(59,130,246,0.2);border-radius:2px;}"
-            "QSlider::handle:horizontal{width:16px;height:16px;margin:-6px 0;"
-            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #1d4ed8,stop:1 #3b82f6);"
-            "border-radius:8px;}"
-            "QSlider::sub-page:horizontal{background:rgba(59,130,246,0.5);border-radius:2px;}"
-        )
-        self.strength_label = QLabel(_strength_labels[2])
-        self.strength_label.setStyleSheet(
-            "color:#94a3b8;font-size:11px;margin-left:4px;"
-        )
-        self.strength_slider.valueChanged.connect(
-            lambda v: self.strength_label.setText(_strength_labels[v])
-        )
-        form.addLayout(self._row("Strength", self.strength_slider))
-        form.addWidget(self.strength_label)
+        # Correction mode ─────────────────────────────────────────────────
+        section("CORRECTION MODE")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([
+            "Standard (Samsung-like) — grammar, spelling, punctuation",
+            "Less Invasive — typos and misspellings only"
+        ])
+        form.addLayout(self._row("Mode", self.mode_combo))
+        
+        mode_hint = QLabel("Standard: fixes grammar, spelling, caps, punctuation — like Samsung AI.\nLess Invasive: fixes typos only — keeps casual tone, contractions, formatting.")
+        mode_hint.setStyleSheet("color:#94a3b8;font-size:11px;margin-left:4px;")
+        form.addWidget(mode_hint)
 
         form.addStretch()
         scroll.setWidget(inner)
@@ -1493,7 +1475,10 @@ class SettingsDialog(QDialog):
         self.idle_spin.setValue(self.cfg.get("idle_timeout_seconds", 300))
         self.hotkey_edit.setText(self.cfg.get("hotkey", "ctrl+shift+space"))
         self.sysprompt_edit.setPlainText(self.cfg.get("system_prompt", ""))
-        self.strength_slider.setValue(self.cfg.get("correction_strength", 2))
+        
+        mode = self.cfg.get("correction_mode", "standard")
+        self.mode_combo.setCurrentIndex(0 if mode == "standard" else 1)
+        
         self._on_ac_same_toggled(self.ac_same_cb.isChecked())
 
     def _save(self):
@@ -1515,7 +1500,10 @@ class SettingsDialog(QDialog):
         self.cfg.set("idle_timeout_seconds", self.idle_spin.value())
         self.cfg.set("hotkey", self.hotkey_edit.text())
         self.cfg.set("system_prompt", self.sysprompt_edit.toPlainText().strip())
-        self.cfg.set("correction_strength", self.strength_slider.value())
+        
+        mode_val = "standard" if self.mode_combo.currentIndex() == 0 else "less_invasive"
+        self.cfg.set("correction_mode", mode_val)
+        
         model = self.model_edit.text()
         if model:
             self.cfg.add_recent(model)
@@ -1729,6 +1717,20 @@ class CorrectionWindow(QWidget):
         ci_row.addWidget(self.send_btn)
         cp_lay.addLayout(ci_row)
 
+        # Template buttons row
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFixedHeight(38)
+        sc.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollBar:horizontal { height: 0; width: 0; }")
+        self.tmp_w = QWidget()
+        self.tmp_lay = QHBoxLayout(self.tmp_w)
+        self.tmp_lay.setContentsMargins(0, 0, 0, 0)
+        self.tmp_lay.setSpacing(6)
+        self.tmp_lay.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        sc.setWidget(self.tmp_w)
+        cp_lay.addWidget(sc)
+        self._refresh_templates()
+
         lay.addWidget(chat_panel)
 
         btn_row = QHBoxLayout()
@@ -1756,6 +1758,73 @@ class CorrectionWindow(QWidget):
         btn_row.addWidget(cancel_btn)
 
         lay.addLayout(btn_row)
+
+    # ── templates ─────────────────────────────────────────────────────────
+    def _refresh_templates(self):
+        # Clear existing
+        while self.tmp_lay.count():
+            w = self.tmp_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+
+        core_templates = [
+            ("📧 Email", "Rewrite this as a professional email with a proper greeting, clear body, and closing. Keep the core message."),
+            ("💬 Social", "Rewrite this as a social media post. Keep the casual tone, original capitalization style, and personality. Make it engaging but don't over-polish it."),
+            ("📝 Formal", "Rewrite this in formal English. Expand contractions, use complete sentences, maintain professional tone."),
+            ("⚡ Tighten", "Optimize this text. Make it tighter, straight to the point, and more efficient with its words without cutting out details or meaning."),
+            ("📢 Headline", "Rewrite this as a punchy, engaging headline or short tagline. Title case.")
+        ]
+        
+        custom_templates = self.cfg.get("custom_templates", [])
+
+        # Create quick button factory
+        def _make_btn(name, prompt):
+            b = QPushButton(name)
+            b.setObjectName("ghost")
+            b.setStyleSheet("QPushButton { font-size: 11px; padding: 4px 10px; border-radius: 6px; } QPushButton:hover { background: rgba(59,130,246,0.15); color: #93c5fd; }")
+            b.clicked.connect(lambda _, p=prompt: self._apply_template(p))
+            return b
+
+        for name, prompt in core_templates:
+            self.tmp_lay.addWidget(_make_btn(name, prompt))
+            
+        for ct in custom_templates:
+            self.tmp_lay.addWidget(_make_btn(ct.get("name", "Custom"), ct.get("prompt", "")))
+
+        add_btn = QPushButton("➕ Add")
+        add_btn.setObjectName("ghost")
+        add_btn.setStyleSheet("QPushButton { font-size: 11px; padding: 4px 10px; border-radius: 6px; color:#cbd5e1; border: 1px dashed rgba(255,255,255,0.15); } QPushButton:hover { background: rgba(255,255,255,0.05); }")
+        add_btn.clicked.connect(self._add_custom_template)
+        self.tmp_lay.addWidget(add_btn)
+
+    def _apply_template(self, prompt: str):
+        # Stop active stream if any
+        if self._stream_worker and self._stream_worker.isRunning():
+            self._stream_worker.stop()
+            self._stream_worker.wait(timeout=500)
+            
+        # Reset chat logic
+        self.chat_display.clear()
+        self.chat_history.clear()
+        
+        # Make the correction base the original text again if we want, or current corrected.
+        # The user wants "new context window only with the new text and template"
+        
+        self.chat_input.setText(prompt)
+        self._send_chat()
+
+    def _add_custom_template(self):
+        name, ok1 = QInputDialog.getText(self, "New Template", "Template Name (e.g. 🤓 Fun):")
+        if not ok1 or not name.strip(): return
+        
+        prompt, ok2 = QInputDialog.getText(self, "New Template", "AI Prompt (e.g. Rewrite this as a fun joke):")
+        if not ok2 or not prompt.strip(): return
+        
+        customs = self.cfg.get("custom_templates", [])
+        customs.append({"name": name.strip(), "prompt": prompt.strip()})
+        self.cfg.set("custom_templates", customs)
+        self._refresh_templates()
+
 
     # ── correction logic ──────────────────────────────────────────────────
     def _on_model_status(self, msg: str):
@@ -1792,11 +1861,9 @@ class CorrectionWindow(QWidget):
                 self._correction_ready.emit(text, "No changes (model error)")
                 return
 
-            # ── Strength-aware prompts and few-shot examples ──────────
-            # Each level gets its own complete system prompt and matching
-            # few-shot examples so the model sees exactly what to fix.
-            strength = self.cfg.get("correction_strength", 2)
-            log(f"[CW] Correction strength: {strength}")
+            # ── Mode-aware prompts and few-shot examples ──────────────
+            mode = self.cfg.get("correction_mode", "standard")
+            log(f"[CW] Correction mode: {mode}")
 
             _PATCH_FMT = (
                 "You are a text correction engine. You output ONLY a JSON array of patches.\n"
@@ -1818,205 +1885,55 @@ class CorrectionWindow(QWidget):
                 "If the text is already correct, return it unchanged.\n"
             )
 
-            # -- Patch system prompts (complete, per-level) --
-            _patch_systems = {
-                0: (
-                    _PATCH_FMT + "\nONLY fix clear typos and misspellings.\n"
-                    "Do NOT fix grammar, capitalization, punctuation, or style.\n"
-                    "Preserve everything else exactly as written."
-                ),
-                1: (
-                    _PATCH_FMT
-                    + "\nFix typos, misspellings, capitalization, apostrophes, "
-                    "punctuation, and quotes.\n"
-                    "Do NOT fix grammar, word choice, or rephrase anything.\n"
-                    "Preserve original wording and sentence structure."
-                ),
-                2: (
-                    _PATCH_FMT
-                    + "\nFix typos, misspellings, capitalization, punctuation, "
-                    "apostrophes, quotes, AND clear grammar errors "
-                    "(verb tense, subject-verb agreement, articles, prepositions).\n"
-                    "Preserve original wording otherwise."
-                ),
-                3: (
-                    _PATCH_FMT
-                    + "\nFix all spelling, capitalization, punctuation, grammar errors "
-                    "AND improve sentence structure and word choice.\n"
-                    "Keep original meaning and tone."
-                ),
-                4: (
-                    _PATCH_FMT
-                    + "\nFix ALL errors and rewrite phrases/sentences for maximum clarity.\n"
-                    "Restructure if needed. Preserve core meaning only."
-                ),
-            }
-
-            # -- Full-text system prompts (complete, per-level) --
-            _full_systems = {
-                0: (
-                    _FULL_FMT + "\nONLY fix clear typos and misspellings.\n"
-                    "Do NOT change grammar, capitalization, punctuation, or style.\n"
-                    "Preserve everything else exactly as written."
-                ),
-                1: (
-                    _FULL_FMT
-                    + "\nFix typos, misspellings, capitalization, apostrophes, "
-                    "punctuation, and quotes.\n"
-                    "Do NOT fix grammar, word choice, or rephrase anything.\n"
-                    "Preserve original wording and sentence structure."
-                ),
-                2: (
-                    _FULL_FMT
-                    + "\nFix typos, misspellings, capitalization, punctuation, "
-                    "apostrophes, quotes, AND clear grammar errors "
-                    "(verb tense, subject-verb agreement, articles, prepositions).\n"
-                    "Preserve original wording otherwise."
-                ),
-                3: (
-                    _FULL_FMT
-                    + "\nFix all spelling, capitalization, punctuation, grammar errors "
-                    "AND improve sentence structure and word choice.\n"
-                    "Keep original meaning and tone."
-                ),
-                4: (
-                    _FULL_FMT + "\nRewrite for maximum clarity and impact.\n"
-                    "Restructure sentences if needed. Preserve the core meaning."
-                ),
-            }
-
-            # -- Strength-adaptive few-shot examples (patch mode) --
             _EX1_INPUT = "the project were delayed because of bad wether"
             _EX2_INPUT = "i dont know if its gona work"
 
-            _patch_examples = {
-                0: [
+            if mode == "less_invasive":
+                patch_system = (
+                    _PATCH_FMT + "\nONLY fix clear typos and misspellings (e.g. 'wether' → 'weather').\n"
+                    "Do NOT touch: grammar, capitalization, punctuation, contractions, word choice, line breaks, tone, or anything else.\n"
+                    "If a word is casual slang or intentional ('gonna', 'lol'), leave it."
+                )
+                full_system = (
+                    _FULL_FMT + "\nONLY fix clear typos and misspellings (e.g. 'wether' → 'weather').\n"
+                    "Do NOT touch: grammar, capitalization, punctuation, contractions, word choice, line breaks, tone, or anything else.\n"
+                    "If a word is casual slang or intentional ('gonna', 'lol'), leave it."
+                )
+                patch_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "wether", "new": "weather"}]',
-                    },
+                    {"role": "assistant", "content": '[{"old": "wether", "new": "weather"}]'},
                     {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "gona", "new": "gonna"}]',
-                    },
-                ],
-                1: [
+                    {"role": "assistant", "content": '[]'}
+                ]
+                full_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "wether", "new": "weather"}]',
-                    },
+                    {"role": "assistant", "content": "the project were delayed because of bad weather"},
                     {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]',
-                    },
-                ],
-                2: [
+                    {"role": "assistant", "content": "i dont know if its gona work"}
+                ]
+            else:
+                patch_system = (
+                    _PATCH_FMT + "\nFix spelling, grammar (verb tense, subject-verb agreement, articles), capitalization, and punctuation.\n"
+                    "Do NOT: add or remove line breaks, add full stops to casual fragments, expand contractions (keep \"don't\", \"gonna\", \"wanna\" as-is), change tone or style, rephrase sentences.\n"
+                    "Preserve the original voice and structure."
+                )
+                full_system = (
+                    _FULL_FMT + "\nFix spelling, grammar (verb tense, subject-verb agreement, articles), capitalization, and punctuation.\n"
+                    "Do NOT: add or remove line breaks, add full stops to casual fragments, expand contractions (keep \"don't\", \"gonna\", \"wanna\" as-is), change tone or style, rephrase sentences.\n"
+                    "Preserve the original voice and structure."
+                )
+                patch_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
-                    },
+                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
                     {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]',
-                    },
-                ],
-                3: [
+                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'}
+                ]
+                full_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
-                    },
+                    {"role": "assistant", "content": "The project was delayed because of bad weather."},
                     {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]',
-                    },
-                ],
-                4: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "the project were delayed because of bad wether", "new": "The project was delayed due to bad weather."}]',
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i dont know if its gona work", "new": "I\'m not sure if it\'s going to work."}]',
-                    },
-                ],
-            }
-
-            # -- Strength-adaptive few-shot examples (full-text mode) --
-            _full_examples = {
-                0: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "the project were delayed because of bad weather",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": "i dont know if its gonna work"},
-                ],
-                1: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "the project were delayed because of bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I don't know if it's gonna work.",
-                    },
-                ],
-                2: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "The project was delayed because of bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I don't know if it's gonna work.",
-                    },
-                ],
-                3: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "The project was delayed because of bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I don't know if it's going to work.",
-                    },
-                ],
-                4: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "The project was delayed due to bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I'm not sure if it's going to work.",
-                    },
-                ],
-            }
-
-            patch_system = _patch_systems.get(strength, _patch_systems[2])
-            patch_examples = _patch_examples.get(strength, _patch_examples[2])
-            full_system = _full_systems.get(strength, _full_systems[2])
-            full_examples = _full_examples.get(strength, _full_examples[2])
+                    {"role": "assistant", "content": "I don't know if it's gonna work."}
+                ]
 
             # Override with user's custom system prompt if set (full-text only)
             custom_sys = self.cfg.get("system_prompt", "").strip()
