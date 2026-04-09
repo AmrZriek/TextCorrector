@@ -169,45 +169,124 @@ def friendly_name(path: str) -> str:
     return n
 
 
-def strip_think(text: str) -> str:
+def strip_thinking_tokens(text: str) -> str:
+    """Strip thinking/reasoning blocks from model output.
+
+    Handles various formats:
+    - <think>...</think> (Qwen3, DeepSeek)
+    - <thinking>...</thinking> (some models)
+    - <reasoning>...</reasoning> (alternative format)
+    """
     if not text:
         return text
-    for pat in [
-        r"<think>.*?</think>",
-        r"<thinking>.*?</thinking>",
-        r"<reasoning>.*?</reasoning>",
-    ]:
-        text = re.sub(pat, "", text, flags=re.DOTALL)
-    for pat in [r"<think>.*", r"<thinking>.*", r"<reasoning>.*"]:
-        text = re.sub(pat, "", text, flags=re.DOTALL)
-    return text
+
+    # Remove various thinking block formats (including multiline content)
+    thinking_patterns = [
+        (r"<think>.*?</think>", re.DOTALL),  # Qwen3, DeepSeek
+        (r"<thinking>.*?</thinking>", re.DOTALL),  # Alternative format
+        (r"<reasoning>.*?</reasoning>", re.DOTALL),  # Alternative format
+    ]
+
+    cleaned = text
+    for pattern, flags in thinking_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=flags)
+
+    # Also handle unclosed thinking tags (model may not close them)
+    unclosed_patterns = [
+        r"<think>.*",
+        r"<thinking>.*",
+        r"<reasoning>.*",
+    ]
+    for pattern in unclosed_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL)
+
+    return cleaned.strip()
 
 
-def strip_preamble(text: str, original: str = "") -> str:
+def strip_meta_commentary(text: str, original: str = "") -> str:
+    """Strip common meta-commentary prefixes that models add."""
     if not text:
         return text
-    patterns = [
-        r"^(?:Here(?:'s| is)(?: the)? corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:Sure[,!]? [Hh]ere(?:'s| is)(?: the)? corrected (?:text|version)[:\.]?\s*\n?)",
+    # Comprehensive list of preamble patterns models add
+    preamble_patterns = [
+        r"^(?:Here(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
+        r"^(?:Sure[,!]? [Hh]ere(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
         r"^(?:Corrected (?:text|version)[:\.]?\s*\n?)",
         r"^(?:The corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I(?:'ve| have) corrected(?: the)? (?:text|text for you)[:\.]?\s*\n?)",
-        r"^\*\*Corrected(?: text)?\*\*[:\.]?\s*\n?",
-        r"^#+\s*Corrected(?: text)?[:\.]?\s*\n?",
-        r"^[-*]{3,}\s*\n?",
+        r"^(?:I(?:\'ve| have) corrected the (?:text|text for you)[:\.]?\s*\n?)",
+        r"^(?:Below is the corrected (?:text|version)[:\.]?\s*\n?)",
+        r"^(?:This is the corrected (?:text|version)[:\.]?\s*\n?)",
+        r"^(?:I\'ve proofread and refined the text[:\.]?\s*\n?)",
+        r"^(?:I\'ve made the following corrections[:\.]?\s*\n?)",
+        r"^\*\*Corrected(?: text)?\*\*[:\.]?\s*\n?",  # Markdown bold
+        r"^#+\s*Corrected(?: text)?[:\.]?\s*\n?",  # Markdown headers
+        r"^[-*]{3,}\s*\n?",  # Separator lines
+        r"^(?:Here are the corrections?[:\.]?\s*\n?)",
+        r"^(?:The refined (?:text|version)[:\.]?\s*\n?)",
+        r"^(?:I\'ve reviewed and corrected[:\.]?\s*\n?)",
+        r"^(?:I\'ve proofread (?:and refined )?your text[:\.]?\s*\n?)",
+        r"^(?:Here is the refined (?:text|version)[:\.]?\s*\n?)",
+        r"^(?:The text has been corrected[:\.]?\s*\n?)",
+        r"^(?:Your text,? corrected[:\.]?\s*\n?)",
     ]
     cleaned = text
-    for p in patterns:
-        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
+    for pattern in preamble_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    # Strip wrapping quotes if the entire output is quoted
     cleaned = cleaned.strip()
     if len(cleaned) > 2 and cleaned[0] == '"' and cleaned[-1] == '"':
         if not (original.startswith('"') and original.endswith('"')):
             cleaned = cleaned[1:-1]
+    if len(cleaned) > 2 and cleaned[0] == "'" and cleaned[-1] == "'":
+        if not (original.startswith("'") and original.endswith("'")):
+            cleaned = cleaned[1:-1]
+    # Strip markdown code blocks if wrapping the entire output
     if cleaned.startswith("```") and cleaned.endswith("```"):
         lines = cleaned.split("\n")
-        if len(lines) >= 3:
+        if len(lines) >= 2:
+            # Remove first and last lines (the ``` markers)
             cleaned = "\n".join(lines[1:-1])
     return cleaned.strip()
+
+
+def contains_meta_commentary(text: str) -> bool:
+    """Check if text still contains meta-commentary after stripping."""
+    if not text:
+        return False
+
+    # Patterns that indicate the model is being conversational
+    conversational_patterns = [
+        r"^\s*(?:Here|Sure|Okay|Alright|So|Well|Now)[,\s]+",
+        r"^\s*(?:I\s+(?:think|believe|feel|would say)|In my (?:opinion|view))",
+        r"^\s*(?:The\s+(?:corrected|refined)\s+(?:text|version))",
+        r"^\s*(?:I\s+(?:have|ve)\s+(?:corrected|fixed|updated))",
+        r"\n\n(?:Let me know|I hope|Feel free|If you need)",
+        r"\*\*\s*(?:Note|Important|Warning)",
+        r"^\s*[:\-]+\s*",  # Lines starting with just punctuation
+    ]
+
+    for pattern in conversational_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+
+    # Check for question marks (models asking for clarification)
+    if text.count("?") > 0:
+        return True
+
+    # Check for multiple sentences that look like explanations
+    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    if len(sentences) > 3:
+        # If there are many short sentences, might be commentary
+        short_sentences = sum(1 for s in sentences if len(s.split()) < 5)
+        if short_sentences > len(sentences) / 2:
+            return True
+
+    return False
+
+
+# Keep old function names as aliases for backward compatibility
+strip_think = strip_thinking_tokens
+strip_preamble = strip_meta_commentary
 
 
 def _apply_patches(original: str, patches: list[dict]) -> str:
@@ -645,7 +724,7 @@ class StreamWorker(QThread):
                         chunk = json.loads(data)
                         t = chunk["choices"][0]["delta"].get("content", "")
                         if t:
-                            t = strip_think(t)
+                            t = strip_thinking_tokens(t)
                             full += t
                             self.token.emit(t)
                     except Exception:
@@ -845,18 +924,29 @@ class ModelManager(QObject):
         system: str | None = None,
         examples: list[dict] | None = None,
     ) -> str | None:
+        """Correct text using the model via chat completions API.
+        
+        Uses comprehensive stripping and retry logic to handle models that
+        add meta-commentary or thinking preambles.
+        """
         if not self.is_loaded():
             if not self.load_model():
                 return None
         self.last_used = datetime.now()
         self.status_changed.emit("Correcting…")
 
+        # Get custom instruction or use default
         if not system:
             system = self.cfg.get("system_prompt", "").strip() or (
-                "You are a text correction engine.\n"
-                "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
-                "Preserve all formatting, line breaks, and original tone.\n"
-                "If the text is already correct, return it unchanged."
+                "You are a text correction engine. Your task is to proofread and refine text.\n"
+                "CRITICAL RULES - VIOLATING THESE IS AN ERROR:\n"
+                "1. Output ONLY the corrected text - no explanations, no labels, no greetings\n"
+                "2. NEVER start with phrases like 'Here is', 'Sure', 'Corrected', 'The corrected'\n"
+                "3. NEVER wrap output in quotes or markdown\n"
+                "4. If text is perfect, return it unchanged\n"
+                "5. Fix spelling, grammar, punctuation while preserving meaning and tone\n"
+                "6. PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING - do not remove blank lines\n"
+                "7. Maintain original formatting exactly, including multiple line breaks"
             )
 
         messages = [{"role": "system", "content": system}]
@@ -864,44 +954,124 @@ class ModelManager(QObject):
             messages.extend(examples)
         messages.append({"role": "user", "content": text})
 
+        # Give enough room for thinking overhead + corrections
+        max_tokens = min(len(text.split()) * 3 + 500, 4096)
+
         payload = {
             "messages": messages,
-            "max_tokens": min(max(len(text.split()) * 2 + 30, 60), 512),
-            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "temperature": self.cfg.get("temperature", 0.1),
             "top_k": self.cfg.get("top_k", 40),
             "top_p": self.cfg.get("top_p", 0.95),
+            "min_p": self.cfg.get("min_p", 0.05),
+            "frequency_penalty": self.cfg.get("frequency_penalty", 0.0),
+            "presence_penalty": self.cfg.get("presence_penalty", 0.0),
+            "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
             "stream": False,
-            "think": False,
+            # Note: "think": False removed - Qwen3.5-2B-UD ignores it anyway
         }
 
+        url = self._chat_url()
+        log(f"[{self.label}] POST {url} payload={json.dumps(payload)[:300]}")
+
         try:
-            log(f"[{self.label}] POST {self._chat_url()} payload={json.dumps(payload)[:300]}")
-            r = requests.post(self._chat_url(), json=payload, timeout=120)
-            if not r.ok:
-                log(f"[{self.label}] HTTP {r.status_code} — body: {r.text[:500]}")
+            r = requests.post(url, json=payload, timeout=120)
+            
+            # Handle context too long error
+            if r.status_code == 400:
+                error_body = r.text.lower()
+                if "context" in error_body or "too long" in error_body:
+                    self.status_changed.emit("Error: text too long")
+                    return "[Error] Text exceeds the model's context limit."
+                r.raise_for_status()
+            
+            log(f"[{self.label}] Response received. Status: {r.status_code}")
             r.raise_for_status()
-            resp = r.json()
-            log(f"[{self.label}] Raw API response: {json.dumps(resp)[:500]}")
+            
+            result = r.json()
+            log(f"[{self.label}] JSON parsed successfully")
 
-            raw, finish_reason = _extract_content_from_response(resp)
-            log(f"[{self.label}] Raw content: {repr(raw[:200])}, finish_reason={finish_reason}")
+            raw = (
+                result.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
 
-            if not raw:
-                log(f"[{self.label}] correct_text got empty content (finish_reason={finish_reason})")
-                return None
+            # Strip thinking tokens (Qwen3 thinking mode)
+            raw = strip_thinking_tokens(raw)
+            # Strip meta-commentary ("Here is the corrected text:")
+            raw = strip_meta_commentary(raw)
 
-            if finish_reason == "length":
-                log(f"[{self.label}] correct_text output truncated (finish_reason=length)")
+            # Check if output still contains conversational elements and retry if needed
+            if contains_meta_commentary(raw):
+                log(f"[{self.label}] Detected conversational output, retrying with stronger prompt...")
+                self.status_changed.emit("Retrying...")
 
-            raw = strip_think(raw)
-            raw = strip_preamble(raw, text)
-            log(f"[{self.label}] After strip: {repr(raw[:200])}")
+                # Retry with ultra-strict prompt
+                retry_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "OUTPUT FORMAT: PLAIN TEXT ONLY. NO PREAMBLE. NO LABELS. NO EXPLANATIONS. "
+                            "Task: Fix spelling, grammar, and punctuation in the following text. "
+                            "PRESERVE ALL LINE BREAKS AND PARAGRAPH SPACING. "
+                            "Output the corrected text and NOTHING else."
+                        ),
+                    },
+                    {"role": "user", "content": f"Text to correct:\n{text}"},
+                ]
+
+                retry_payload = {
+                    "messages": retry_messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,  # Force deterministic
+                    "top_k": 1,
+                    "top_p": 0.1,  # Very focused sampling
+                    "min_p": 0.05,
+                    "frequency_penalty": 0.0,
+                    "presence_penalty": 0.0,
+                    "repeat_penalty": 1.0,
+                    "stream": False,
+                }
+
+                retry_response = requests.post(url, json=retry_payload, timeout=120)
+                retry_response.raise_for_status()
+
+                retry_result = retry_response.json()
+                raw = (
+                    retry_result.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+
+                # Strip again
+                raw = strip_thinking_tokens(raw)
+                raw = strip_meta_commentary(raw)
+                log(f"[{self.label}] Retry correction length: {len(raw)}")
+
+            log(f"[{self.label}] Correction length (after strip): {len(raw)}")
+
             self.last_used = datetime.now()
             self.status_changed.emit("Ready")
-            return raw if raw else None
+            return raw if raw else text
+            
+        except requests.exceptions.ConnectionError:
+            log(f"[{self.label}] Connection error in correct_text")
+            self.status_changed.emit("Error: server unreachable")
+            return "[Error] Cannot reach inference server. Make sure the model is loaded."
+        except requests.exceptions.Timeout:
+            log(f"[{self.label}] Timeout in correct_text")
+            self.status_changed.emit("Error: timeout")
+            return "[Error] Server took too long to respond."
         except Exception as e:
-            log(f"[{self.label}] correct_text error: {e}")
-            self.status_changed.emit(f"Error: {str(e)[:50]}")
+            log(f"[{self.label}] Error in correct_text: {e}")
+            error_msg = str(e)
+            if "500" in error_msg:
+                self.status_changed.emit("Error: server error")
+                return "[Error] Server error (500). Check server_log.txt."
+            self.status_changed.emit(f"Error: {error_msg[:50]}")
             return None
 
     # ── patch-based correction (structured JSON output) ──────────────────
@@ -1006,6 +1176,74 @@ class ModelManager(QObject):
             return result
         except Exception as e:
             log(f"[{self.label}] correct_text_patch error: {e}")
+            self.status_changed.emit(f"Error: {str(e)[:50]}")
+            return None
+
+    # ── chat with model (non-streaming) ───────────────────────────────────
+    def chat_with_model(
+        self,
+        messages: list,
+        max_tokens: int = 1000,
+    ) -> str | None:
+        """Chat with the model for text refinement via chat completions API.
+        
+        Uses the same comprehensive stripping logic as correct_text().
+        """
+        if not self.is_loaded():
+            if not self.load_model():
+                return None
+        self.last_used = datetime.now()
+        self.status_changed.emit("Thinking...")
+
+        payload = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": self.cfg.get("temperature", 0.1),
+            "top_k": self.cfg.get("top_k", 40),
+            "top_p": self.cfg.get("top_p", 0.95),
+            "min_p": self.cfg.get("min_p", 0.05),
+            "frequency_penalty": self.cfg.get("frequency_penalty", 0.0),
+            "presence_penalty": self.cfg.get("presence_penalty", 0.0),
+            "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
+            "stream": False,
+        }
+
+        url = self._chat_url()
+        log(f"[{self.label}] chat_with_model: POST {url}")
+
+        try:
+            r = requests.post(url, json=payload, timeout=120)
+            log(f"[{self.label}] chat_with_model: Response {r.status_code}")
+            r.raise_for_status()
+
+            result = r.json()
+            reply = (
+                result.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+
+            # Strip thinking tokens
+            reply = strip_thinking_tokens(reply)
+            # Strip meta-commentary
+            reply = strip_meta_commentary(reply)
+            log(f"[{self.label}] chat_with_model: Reply length (after strip) {len(reply)}")
+
+            self.last_used = datetime.now()
+            self.status_changed.emit("Ready")
+            return reply
+
+        except requests.exceptions.ConnectionError:
+            log(f"[{self.label}] Connection error in chat_with_model")
+            self.status_changed.emit("Error: server unreachable")
+            return None
+        except requests.exceptions.Timeout:
+            log(f"[{self.label}] Timeout in chat_with_model")
+            self.status_changed.emit("Error: timeout")
+            return None
+        except Exception as e:
+            log(f"[{self.label}] Error in chat_with_model: {e}")
             self.status_changed.emit(f"Error: {str(e)[:50]}")
             return None
 

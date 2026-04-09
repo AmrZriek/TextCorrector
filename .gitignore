@@ -22,6 +22,7 @@ context.md
 
 # Model files — too large for git
 llama_cpp/
+llama-*/
 *.gguf
 *.onnx
 *.safetensors
