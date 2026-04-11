@@ -182,7 +182,7 @@ a = Analysis(
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=['torch', 'onnxruntime', 'transformers', 'PyQt5'],
+    excludes=['torch', 'onnxruntime', 'transformers', 'gector'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -405,8 +405,7 @@ def build(version: str, make_zip: bool):
     if PLATFORM == "Windows":
         (out_dir / "run.bat").write_text(RUN_BAT)
         (out_dir / "download_model.bat").write_text(DOWNLOAD_BAT)
-        (out_dir / "SETUP.txt").write_text(SETUP_NOTES_WIN, encoding="utf-8")
-        print("  Created run.bat, download_model.bat, SETUP.txt")
+        print("  Created run.bat, download_model.bat")
     else:
         run_sh = out_dir / "run.sh"
         dl_sh = out_dir / "download_model.sh"
@@ -414,8 +413,7 @@ def build(version: str, make_zip: bool):
         run_sh.chmod(0o755)
         dl_sh.write_text(DOWNLOAD_SH)
         dl_sh.chmod(0o755)
-        (out_dir / "SETUP.txt").write_text(SETUP_NOTES_UNIX, encoding="utf-8")
-        print("  Created run.sh, download_model.sh, SETUP.txt")
+        print("  Created run.sh, download_model.sh")
 
     # ── 4. ZIP ────────────────────────────────────────────────────────────
     if make_zip:
