@@ -340,6 +340,25 @@ def _apply_patches(original: str, patches: list[dict]) -> str:
         log(f"[PATCH] No patches were applied successfully")
         return original
 
+    # Post-process: catch common fixes the LLM may have missed
+    post_applied = 0
+
+    # 1. Standalone lowercase 'i' → 'I' (when LLM missed it)
+    i_pattern = re.compile(r"(?<![a-zA-Z])i(?![a-zA-Z'])")
+    if i_pattern.search(result):
+        result = i_pattern.sub("I", result)
+        post_applied += 1
+        log("[PATCH] Post-fix: standalone 'i' → 'I'")
+
+    # 2. Capitalize first letter of first sentence if it's lowercase
+    if result and result[0].islower():
+        result = result[0].upper() + result[1:]
+        post_applied += 1
+        log("[PATCH] Post-fix: capitalized first letter")
+
+    if post_applied:
+        log(f"[PATCH] Post-processing applied {post_applied} additional fix(es)")
+
     log(f"[PATCH] Applied {patches_applied}/{len(patches)} patches successfully")
     return result
 
@@ -2284,21 +2303,32 @@ class CorrectionWindow(QWidget):
         import difflib
         import html as _html
 
-        orig_words = self.original.split()
-        corr_words = corrected.split()
+        # Use a placeholder so newlines survive the word-split/rejoin pipeline
+        NL = "\x00NL\x00"
+
+        def prep(text: str) -> list[str]:
+            t = text.replace("\r\n", "\n").replace("\r", "\n")
+            # Insert placeholder around newline sequences so they become tokens
+            t = t.replace("\n", f" {NL} ")
+            return t.split()
+
+        orig_words = prep(self.original)
+        corr_words = prep(corrected)
         sm = difflib.SequenceMatcher(None, orig_words, corr_words, autojunk=False)
         parts: list[str] = []
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            chunk = " ".join(corr_words[j1:j2])
-            if tag == "equal":
-                parts.append(_html.escape(chunk))
-            elif tag in ("replace", "insert"):
-                parts.append(
-                    f'<span style="background:rgba(59,130,246,0.28);'
-                    f'color:#93c5fd;border-radius:3px;padding:1px 2px;">'
-                    f"{_html.escape(chunk)}</span>"
-                )
-        html = " ".join(parts)
+            for w in corr_words[j1:j2]:
+                if w == NL:
+                    parts.append("<br>")
+                elif tag == "equal":
+                    parts.append(_html.escape(w) + " ")
+                else:  # replace / insert
+                    parts.append(
+                        f'<span style="background:rgba(59,130,246,0.28);'
+                        f'color:#93c5fd;border-radius:3px;padding:1px 2px;">'
+                        f"{_html.escape(w)}</span> "
+                    )
+        html = "".join(parts)
         self.corr_edit.setHtml(
             f'<body style="color:#e2e8f0;font-family:Segoe UI,sans-serif;font-size:13px;">'
             f"{html}</body>"

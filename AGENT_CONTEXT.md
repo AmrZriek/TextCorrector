@@ -1,30 +1,70 @@
 # TextCorrector — Agent Context
 
-**READ THIS BEFORE TOUCHING ANY CODE.**
+**READ THIS ENTIRE FILE BEFORE TOUCHING ANY CODE.**
 
-This file is the authoritative design document for the TextCorrector project.
-Every AI agent working on this codebase must follow the architecture and intent
-described here. Do not deviate from the core philosophy below.
+This is the authoritative design document for TextCorrector v4.0.
+All AI agents working on this codebase must follow the architecture and constraints here.
 
 ---
 
 ## Core Philosophy — Non-Negotiable
 
-TextCorrector is designed to work **exactly like the Samsung keyboard AI autocorrect**:
+TextCorrector works **exactly like the Samsung keyboard AI autocorrect**:
 
-- **Instant** — corrections appear as fast as the autocorrect model can respond.
+- **Instant** — corrections appear as fast as the model can respond.
 - **Accurate** — catches real spelling/grammar errors without false positives.
-- **Non-intrusive** — the popup appears, shows the fix, the user accepts with one key. Done.
+- **Non-intrusive** — popup appears, shows the fix, user accepts with one key. Done.
 
-The LLM (llama.cpp) exists in **two roles**:
+---
 
-1. **Autocorrect model** — a lightweight fine-tuned model loaded at boot. Handles
-   instant grammar/spelling correction when the hotkey fires.
-2. **Chat model** — a larger model loaded lazily on first chat use, unloaded after
-   idle timeout. Handles complex editing tasks (rewrite, tone change, summarization).
+## LOCKED ARCHITECTURE — DO NOT CHANGE WITHOUT USER APPROVAL
 
-Both models use the **same correction method** (`correct_text`) with the same prompt
-structure. The only difference is which model file is loaded.
+These decisions are final. Do not change, "improve," or refactor them unless the user explicitly asks.
+
+### 1. Backend: llama.cpp ONLY
+- Single binary: `llama-server.exe` (HTTP API on port 8080, OpenAI-compatible)
+- **No LanguageTool, no GECToR, no ONNX, no Java** — all were removed in v2.7+
+- Model format: GGUF only, loaded via llama.cpp
+- Do NOT re-add any of the removed backends
+
+### 2. Thinking mode: ALWAYS disabled server-side
+- Server launched with `--reasoning off` in the `cmd` array inside `load_model()`
+- API payloads also send `"think": False` (defense-in-depth, but alone it's insufficient)
+- **Do NOT revert to `--reasoning-budget 0`** — this was tried and failed for Gemma 4
+- If corrections start returning empty output, check `app_debug.log` for `reasoning_content present`
+
+### 3. ac_same_as_chat — one server for both roles
+- `ac_same_as_chat = True` (default): ONE llama-server handles both autocorrect and chat
+- `_send_chat()` checks this flag and routes to `self.ac_model` when AC is loaded — no second server
+- Do NOT launch a second server when `ac_same_as_chat = True`
+- Two servers on port 8080 caused `taskkill` to kill the AC server on every chat request
+
+### 4. CUDA DLL injection on Windows
+- `ggml-cuda.dll` (in the server folder) depends on `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`
+- These are NOT in system PATH by default on most systems
+- `load_model()` searches Ollama's bundled CUDA, CUDA Toolkit install paths, and adds them to the subprocess `env["PATH"]` before launching `llama-server`
+- Without them, the server silently falls back to CPU with no error message
+
+### 5. GUI: output boxes are READ-ONLY
+- `corr_edit` (corrected text box): `setReadOnly(True)` — do not remove
+- `orig_edit` (original text box): `setReadOnly(True)` — do not remove
+- Users must not be able to edit either box directly
+
+### 6. Line breaks in diff output
+- `_render_diff()` uses a `\x00NL\x00` placeholder before word-splitting
+- `\n` → `{NL}` → split → diff → `<br>` in final HTML
+- Do NOT revert to plain `.split()` + `" ".join()` — it collapses all line breaks into one paragraph
+
+### 7. No dynamic window resizing
+- No `setFixedHeight()` on text boxes after content is set — causes abrupt window shrink
+- No `adjustSize()` after correction renders — same reason
+- `_fit_text_boxes()` was removed; do not re-add it
+- Window size is set once at init (`min(740, 80% of screen)` × `min(860, 90% of screen)`)
+
+### 8. Single-file deployment
+- All app code lives in `text_corrector.py` — no sub-modules, no packages
+- `build.py` uses PyInstaller → single-folder release + ZIP
+- `build.py` auto-detects the llama-server folder from `config.json`, not hardcoded `llama_cpp/`
 
 ---
 
@@ -34,37 +74,22 @@ structure. The only difference is which model file is loaded.
 User selects text → presses hotkey
         │
         ▼
-  Autocorrect LLM  ───────────────────────────────────→  Result shown in popup
-  (lightweight,      grammar + spelling correction       User presses Ctrl+Enter → paste back
-  loaded at boot)    (patch-based first, full-text fallback)
+  ac_model (ModelManager)
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 1. correct_text_patch() — asks LLM for JSON patches         │
+  │    [{"old": "wether", "new": "weather"}, ...]               │
+  │ 2. If patch fails → correct_text() — full corrected text    │
+  └─────────────────────────────────────────────────────────────┘
         │
-        │  (only if user clicks "Ask AI" chat box)
         ▼
-   Chat LLM        ←── User types in "Ask AI" chat box
-  (larger, lazy)       e.g. "make it more formal", "shorten this", "fix only spelling"
-  streaming SSE      LLM streams tokens live into chat display
+  CorrectionWindow shows diff (changed words highlighted blue)
+  User presses Ctrl+Enter → paste back
+        │
+        │  (only if user types in "Ask AI" chat box)
+        ▼
+  chat_model = ac_model (same server, when ac_same_as_chat=True)
+  StreamWorker streams SSE tokens live into chat display
 ```
-
-### Correction Flow (autocorrect)
-
-1. `_do_correction()` calls `ac_model.correct_text_patch()` first
-2. LLM returns JSON array of patches: `[{"old": "wether", "new": "weather"}]`
-3. `_apply_patches()` applies changes to original text locally
-4. If patch fails (bad JSON, empty patches, parse error), falls back to `correct_text()` (full text)
-
-This approach outputs only wrong words, not the entire corrected text — saving tokens and speed.
-
-### What the autocorrect model handles:
-- Spelling errors
-- Grammar: subject-verb agreement, articles, tense
-- Punctuation, capitalization
-- Common typos
-
-### What the chat model handles (chat-only, user-initiated):
-- Rewrites, tone changes, summarization
-- Style edits: make it formal / casual / shorter / longer
-- Questions about the text
-- Any edit the user explicitly requests
 
 ---
 
@@ -72,130 +97,83 @@ This approach outputs only wrong words, not the entire corrected text — saving
 
 ```
 TextCorrector/
-├── text_corrector.py      ← Single Python file. All app code lives here.
-├── run.bat                ← Windows launcher (auto-elevates, activates venv)
-├── requirements.txt       ← Python deps (PyQt6, keyboard, pyperclip, requests, psutil)
-├── config.json            ← User settings (auto-created, do not commit personal paths)
-├── build.py               ← PyInstaller cross-platform release builder
-├── update.py              ← Updates Python deps and optionally llama-server binary
-├── README.md              ← User-facing documentation (for GitHub)
-├── AGENT_CONTEXT.md       ← THIS FILE — AI agent context (keep updated)
-├── llama_cpp/             ← llama-server binary + DLLs (not committed, user-provided)
-├── venv/                  ← Python virtual environment (not committed)
+├── text_corrector.py      ← Single Python file. ALL app code lives here (~2900 lines)
+├── build.py               ← PyInstaller release builder (Windows/macOS/Linux ZIPs)
+├── requirements.txt       ← Python deps: PyQt6, keyboard, pyperclip, requests
+├── config.json            ← User settings (auto-created on first run, gitignored)
+├── README.md              ← Public GitHub documentation
+├── AGENT_CONTEXT.md       ← THIS FILE — AI agent context (gitignored, local only)
+├── llama-<build>-*/       ← llama-server binary + DLLs (gitignored, user-provided)
+├── venv/                  ← Python venv (gitignored)
 └── logo.png / logo.ico    ← App icons
 ```
 
-No model files (*.gguf), no ONNX files, no PyTorch files, no GECToR files, no
-LanguageTool JARs exist in this project.
-
----
-
-## Project State
-
-- **Single file**: `text_corrector.py` (~2088 lines)
-- **GUI**: PyQt6, frameless dark-navy theme
-- **Backend**: llama.cpp via `llama-server` HTTP API
-- **Dual model**: autocorrect model (eager load) + chat model (lazy load)
-- **No ONNX, no GECToR, no LanguageTool** — all removed
-
-### Key Config
-- Hotkey: `ctrl+shift+space`
-- Correction strength: 0-4 (default 2 = Standard)
-- `ac_same_as_chat`: true (use same GGUF for both roles)
+No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch in this project.
 
 ---
 
 ## Key Classes (text_corrector.py)
 
 ### Helper Functions
-- `strip_think(text)` — removes `<thinking>`, `</think>`, `<reasoning>` tags and their content
-- `strip_preamble(text, original)` — strips LLM preamble ("Here is the corrected text:", markdown code fences, etc.)
-- `_extract_content_from_response(resp)` — extracts `(content, finish_reason)` from API response; detects thinking models where `content` is empty and `reasoning_content` has the output
-- `_extract_patches_from_response(raw)` — extracts JSON patches from LLM output; returns `None` on parse failure (triggers fallback), `[]` for valid empty (text already correct)
-- `_apply_patches(original, patches)` — applies word-level regex patches with case-insensitive fallback
+- `strip_thinking_tokens(text)` — removes `<think>`, `<thinking>`, `<reasoning>` tags and content
+- `strip_meta_commentary(text)` — strips LLM preambles ("Here is the corrected text:", code fences)
+- `contains_meta_commentary(text)` — detects if output contains conversational filler
+- `_extract_content_from_response(resp)` — extracts `(content, finish_reason)` from API response; detects thinking models where `content` is empty and `reasoning_content` has output
+- `_extract_patches_from_response(raw)` — extracts JSON patches; returns `None` on parse failure (triggers fallback), `[]` for valid empty (text already correct)
+- `_apply_patches(original, patches)` — word-level regex patches with case-insensitive fallback
+- `_checkbox_css()` — generates QSS for checkbox checkmark using SVG (Qt theme blocks native rendering)
+- `has_nvidia()` — detects NVIDIA GPU via nvidia-smi
+- `log(msg)` — timestamped append to `app_debug.log`
 - `friendly_name(path)` — converts GGUF filenames to readable display names
-- `has_nvidia()` — detects NVIDIA GPU for GPU offload decision
-- `log(msg)` — appends timestamped messages to `app_debug.log`
+
+### `ConfigManager`
+- Wraps `config.json` with typed get/set and lazy save
 
 ### `ModelManager(QObject)`
-- Manages a single `llama-server` subprocess (llama.cpp OpenAI-compatible HTTP server)
-- Two instances exist: `ac_model` (autocorrect) and `chat_model` (chat)
-- `load_model()` — starts the server subprocess, polls /health, waits up to 180 s
-- `unload_model()` — terminates the server subprocess
-- `correct_text(text, system, examples)` — non-streaming correction; same method for both models
-  - Caller provides complete system prompt and few-shot examples (strength-aware)
-  - Uses `temperature: 0.0` for deterministic output
-  - `max_tokens` calculated as `min(max(len(text.split()) * 2 + 30, 60), 512)`
-  - Sends `"think": false` in payload to disable reasoning for thinking models
-  - Uses `_extract_content_from_response()` to handle thinking model responses
-  - Post-processes output through `strip_think()` then `strip_preamble()`
-- `correct_text_patch(text, system, examples)` — structured JSON patch correction (preferred, tried first)
-  - Caller provides complete system prompt and few-shot examples (strength-aware)
-  - Asks LLM for JSON array of `{old, new}` patches instead of full text
-  - Sends `"think": false` in payload to disable reasoning
-  - Uses `_extract_content_from_response()` for response extraction
-  - Extracts patches via `_extract_patches_from_response()`, applies via `_apply_patches()`
-  - Filters out no-op patches where `old == new` (model sometimes outputs every word as a patch with identical values)
-  - If all patches are no-ops, returns original text unchanged (not `None`)
-  - Returns `None` only on parsing errors so caller can fall back to `correct_text()`
-- `make_stream_worker(messages)` — returns a `StreamWorker` QThread for SSE streaming; also sends `"think": false`
-- `check_idle()` — called by QTimer every 60 s; unloads model if idle > timeout (chat only)
-
-### `StreamWorker(QThread)`
-- Streams SSE tokens from llama.cpp `/v1/chat/completions`
-- Emits: `token(str)`, `done(str)`, `error(str)`
-- Only used by chat path — never by autocorrect
+- Manages one `llama-server` subprocess instance
+- Two instances: `ac_model` (autocorrect, eager load) and `chat_model` (chat, lazy load)
+- Key methods:
+  - `load_model()` — kills orphaned servers, injects CUDA PATH, starts server, polls `/health` up to 180 s
+  - `unload_model()` — terminates server process
+  - `correct_text(text, system, examples)` — non-streaming correction
+  - `correct_text_patch(text, system, examples)` — JSON patch correction (preferred, tried first)
+  - `make_stream_worker(messages)` — returns `StreamWorker` for SSE streaming (chat only)
+  - `check_idle()` — QTimer every 60 s; unloads if idle > timeout (skip if `keep_model_loaded`)
+- All API payloads send `"think": False`
+- Server launched with `--reasoning off` and `--no-warmup`
 
 ### `CorrectionWindow(QWidget)`
-- Main popup shown after hotkey fires
-- `_do_correction()` — background thread, builds strength-aware prompts, tries patch then full-text
-  - Builds complete system prompts and few-shot examples per strength level
-  - First calls `ac_model.correct_text_patch(text, system, examples)` (structured JSON, minimal tokens)
-  - If patch fails (bad JSON, empty patches), falls back to `ac_model.correct_text(text, system, examples)`
-  - Uses `correction_strength` config (0-4) to select correction scope:
-  - Level 0: typos/misspellings only
-  - Level 1: + caps, punctuation, apostrophes, quotes (Samsung-like)
-  - Level 2: + clear grammar fixes (default)
-  - Level 3: + sentence structure and word choice
-  - Level 4: full rewrite for maximum clarity
-- `_send_chat()` — triggered by user pressing Send in Ask AI box, invokes `chat_model`
-- `_do_stream()` — creates StreamWorker, starts SSE streaming into chat display
-- `_render_diff(text)` — uses `difflib.SequenceMatcher` to highlight changed words in blue
+- Main popup; appears near cursor on hotkey press
+- `_do_correction()` — background thread; tries patch → falls back to full-text
+- `_send_chat()` — routes to `ac_model` when `ac_same_as_chat=True` and AC is loaded
+- `_do_stream()` — picks correct ModelManager backend, creates StreamWorker
+- `_render_diff(text)` — word-level diff with `\x00NL\x00` newline placeholder → `<br>` in HTML
 
 ### `TextCorrectorApp(QApplication)`
 - System tray, hotkey registration, window lifecycle
-- Creates two `ModelManager` instances: `ac_model` and `chat_model`
 - `ac_model` loads at boot (eager)
-- `chat_model` loads on first chat use (lazy)
-- `_hotkey_fired()` — runs in keyboard library's background thread; uses signals only
+- `chat_model` loads on first chat use (lazy), reused if `ac_same_as_chat=True`
 
 ---
 
 ## Thread Safety Rules
 
-**NEVER access Qt objects directly from a non-main thread.** This causes silent
-segfaults. The keyboard library's hotkey callbacks run in a background thread.
+**NEVER access Qt objects directly from a non-main thread.** The `keyboard` library's hotkey callbacks run in a background thread.
 
-Safe patterns used in this codebase:
 - Emit `pyqtSignal` from background thread → slot runs in main thread via queued connection
 - Use `QThread` (not `threading.Thread`) for workers that emit signals
-- `_hotkey_fired` uses `self._trigger.emit()` and `self._notify.emit()` — never touches Qt widgets directly
-
-Do NOT:
-- Call `tray.showMessage()` from `_hotkey_fired` (background thread)
-- Call `widget.setText()` from any `threading.Thread` worker
-- Use `ctypes.wintypes.MSG.from_address(int(msg))` in `nativeEvent` (segfaults on Windows)
+- `_hotkey_fired` uses `self._trigger.emit()` only — never touches Qt widgets directly
 
 ---
 
-## Configuration (config.json / DEFAULT_CONFIG)
+## Configuration (config.json)
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `llama_server_path` | `llama_cpp/llama-server.exe` | Path to server binary |
-| `model_path` | `""` | Path to chat model GGUF |
-| `ac_model_path` | `""` | Path to autocorrect model GGUF |
-| `ac_same_as_chat` | `true` | If true, use `model_path` for autocorrect too |
+| `llama_server_path` | `""` | Path to `llama-server[.exe]` binary |
+| `model_path` | `""` | Path to chat/autocorrect GGUF |
+| `ac_model_path` | `""` | Path to separate autocorrect GGUF (if `ac_same_as_chat=false`) |
+| `ac_same_as_chat` | `true` | Reuse chat model for autocorrect (one server) |
 | `server_host` | `127.0.0.1` | llama-server host |
 | `server_port` | `8080` | llama-server port |
 | `context_size` | `4096` | LLM context window |
@@ -204,137 +182,92 @@ Do NOT:
 | `top_k` | `40` | Top-K sampling |
 | `top_p` | `0.95` | Top-P sampling |
 | `min_p` | `0.05` | Min-P sampling |
-| `keep_model_loaded` | `true` | Keep chat model running between uses |
-| `idle_timeout_seconds` | `300` | Unload chat model after N seconds idle |
+| `keep_model_loaded` | `true` | Keep model in memory between uses |
+| `idle_timeout_seconds` | `300` | Unload after N seconds idle (only if `keep_model_loaded=false`) |
 | `hotkey` | `ctrl+shift+space` | Global hotkey |
 | `system_prompt` | `""` | Override LLM system prompt (blank = use built-in) |
-| `correction_strength` | `2` | Autocorrect aggressiveness: 0=Minimal, 1=Light, 2=Standard, 3=Thorough, 4=Full Rewrite |
-| `recent_models` | `[]` | Recently used model paths |
-
----
-
-## Known Limitations
-
-1. **Small model quality**: Lightweight autocorrect models (<1B params) may produce
-   gibberish or random output if not properly fine-tuned for grammar correction.
-   The user should use a model specifically trained for this task.
-
-2. **Autocorrect model load time**: The autocorrect model loads at boot. First
-   correction after boot takes as long as the model needs to load (typically 5-15s
-   for small models). Subsequent corrections are near-instant.
-
-3. **llama-server requires a GGUF model**: A compatible GGUF model file must be
-   configured in Settings for any feature to work.
-
-4. **Thinking models / `reasoning_content`**: llama.cpp auto-activates thinking
-   mode for models whose GGUF chat template includes `<think>` tokens (e.g.
-   Qwen 3.x, Gemma 4). When active, the model puts its reasoning in
-   `reasoning_content` and the answer in `content`. Without `"think": false` in
-   the API payload, the model can exhaust all `max_tokens` on reasoning and return
-   empty `content` — making it look like text is "already correct." All API calls
-   now send `"think": false` to prevent this. If corrections stop working again,
-   check `app_debug.log` for `"reasoning_content present"` — that means the fix
-   isn't taking effect (e.g. old llama.cpp build that ignores `think` param).
-
----
-
-## What Was Deleted (Do Not Re-add)
-
-The following were part of v1/v2/v3 and were fully removed. Do not re-add them:
-- GECToR model integration (gector package, ONNX runtime)
-- T5 / CoEdit model integration
-- PyTorch / Hugging Face transformers
-- PyQt5 (migrated to PyQt6)
-- LanguageTool / language_tool_python integration
-- All test scripts (test_*.py, check_*.py, inspect_*.py, etc.)
-- `nativeEvent` override with ctypes MSG reading (caused segfaults)
-- build.ps1, download_models.bat, update_llama_cpp.bat (replaced by build.py, update.py)
+| `correction_mode` | `1` | 0 = conservative, 1 = Smart Fix (patch-based) |
+| `correction_strength` | `4` | 0=Minimal, 1=Light, 2=Standard, 3=Thorough, 4=Full Rewrite |
+| `custom_templates` | `[]` | User-defined chat/rewrite templates |
 
 ---
 
 ## Correction Strength Levels
 
-The `correction_strength` config (0-4) controls how aggressively the autocorrect model modifies text:
-
 | Level | Name | Behavior |
 |-------|------|----------|
-| 0 | Minimal | Clear typos and misspellings only. No grammar, caps, or punctuation changes. |
-| 1 | Light | + Capitalization, punctuation, apostrophes, quotes. No grammar or rephrasing. (Samsung-like) |
-| 2 | Standard | + Clear grammar fixes (verb tense, agreement, articles, prepositions). (default) |
-| 3 | Thorough | + Sentence structure and word choice improvements. |
-| 4 | Full Rewrite | Maximum clarity, restructure sentences as needed. |
-
-Level 0 is the absolute minimum (only misspelled words). Each level adds progressively more correction scope. The system prompt and few-shot examples are built per-level so the model sees exactly what to fix at each strength.
+| 0 | Minimal | Clear typos and misspellings only |
+| 1 | Light | + Capitalization, punctuation, apostrophes (Samsung-like) |
+| 2 | Standard | + Clear grammar fixes (verb tense, agreement, articles) |
+| 3 | Thorough | + Sentence structure and word choice improvements |
+| 4 | Full Rewrite | Maximum clarity, restructure sentences as needed |
 
 ---
 
-## Session Log
+## Known Limitations
+
+1. **Thinking models** — llama.cpp auto-activates thinking mode for Qwen 3.x / Gemma 4 (based on GGUF chat template `<think>` / `<start_of_thought>` tokens). Fixed with `--reasoning off` server flag. If corrections fail again, check `app_debug.log` for `reasoning_content present`.
+
+2. **CUDA DLLs** — On Windows, `cudart64_12.dll` etc. are not in PATH by default. `load_model()` searches common locations (Ollama, CUDA Toolkit) and injects them into the subprocess PATH. If GPU is not being used, check `server_log.txt` for missing CUDA backend lines.
+
+3. **First-run load time** — Model loads at boot. First correction takes 3–15 s while llama-server starts. Subsequent corrections are near-instant.
+
+4. **Small model quality** — Models under 2B params may produce poor corrections. Gemma 2B or Qwen 2.5 3B Q4_K_M are the recommended minimum.
+
+---
+
+## What Was Deleted — DO NOT RE-ADD
+
+- GECToR / ONNX Runtime integration
+- T5 / CoEdit model integration
+- PyTorch / Hugging Face Transformers
+- LanguageTool / `language_tool_python`
+- PyQt5 (migrated to PyQt6 in v2.7)
+- `nativeEvent` override with ctypes MSG reading (caused segfaults)
+- `_fit_text_boxes()` dynamic resize method (caused abrupt window shrink)
+- `--reasoning-budget 0` server flag (replaced by `--reasoning off`)
+- All test scripts (`test_*.py`, `check_*.py`, `inspect_*.py`)
+- `build.ps1`, `download_models.bat`, `update_llama_cpp.bat`
+
+---
+
+## Session History
+
+### 2026-04-11 (latest)
+- **Fixed: corrections returning same input** — Gemma 4 entered thinking mode despite `"think":false`. Root cause: `--reasoning-budget 0` didn't prevent it. Fix: changed to `--reasoning off` server flag in `load_model()`.
+- **Fixed: GPU not used** — CUDA runtime DLLs missing from subprocess PATH. Added CUDA search in `load_model()` to inject Ollama/CUDA Toolkit paths before server launch. Removed `--log-disable` so `server_log.txt` now shows CUDA backend loading.
+- **Fixed: output box editable** — Added `setReadOnly(True)` to `corr_edit`.
+- **Fixed: window shrinks after correction** — Removed `_fit_text_boxes()` and its `QTimer.singleShot(50, ...)` trigger. Was calling `setFixedHeight()` + `adjustSize()` causing abrupt resize.
+- **Fixed: line breaks lost in output** — `_render_diff()` now uses `\x00NL\x00` placeholder around `\n` before word-splitting; renders as `<br>` in HTML. Preserves email/paragraph formatting.
+- **Fixed: chat "loading model" message every time** — `_send_chat()` now checks `ac_same_as_chat` and routes to `ac_model` directly, skipping chat model load.
+- **build.py rewritten** — Auto-detects llama-server from config; bundles CUDA DLLs; complete `RELEASE_CONFIG`; platform checks use `PLATFORM` variable (not `sys.platform`) to avoid Pylance unreachable-code hints.
+- **README.md rewritten** — Updated to v4.0, removed LanguageTool/Java references, documents CUDA DLL requirement.
 
 ### 2026-04-08
-- **Fixed critical bug: thinking models broke all corrections.** llama.cpp auto-activates
-  thinking mode for Qwen 3.x / Gemma 4 models (based on GGUF chat template `<think>` tokens).
-  Model output went to `reasoning_content` instead of `content`, leaving `content` empty.
-  Code only read `content`, so every correction returned "Already correct."
-- Added `"think": false` to all API payloads (`correct_text`, `correct_text_patch`, `make_stream_worker`)
-- Added `_extract_content_from_response()` helper to centralize response parsing and detect
-  thinking model symptoms (empty content + reasoning_content present)
-- Fixed `_extract_patches_from_response()` return type: now returns `None` for parse failure
-  (triggers fallback) vs `[]` for valid empty array (text is correct). Previously both returned
-  `[]`, which caused valid "already correct" responses to wrongly trigger full-text fallback.
-- Removed empty assistant prefill from `correct_text()` (`{"role": "assistant", "content": ""}`)
-- Added trailing-comma tolerance in JSON patch extraction for small model quirks
-- Improved error message when both patch and full-text fail: "No changes (model error)"
+- **Fixed: thinking models broke all corrections** — Added `"think": false` to all API payloads; added `_extract_content_from_response()` helper to detect empty-content thinking responses.
+- Fixed `_extract_patches_from_response()` return type: `None` for parse failure (triggers fallback) vs `[]` for valid empty array.
+- Removed empty assistant prefill from `correct_text()`.
 
 ### 2026-04-06
-- Fixed strength slider bug: removed hardcoded system prompt in `correct_text_patch()` that overrode per-level instructions
-- Redesigned strength levels: 0=typos only, 1=Samsung-like (caps/punctuation/apostrophes), 2=+grammar, 3=+structure, 4=rewrite
-- Made both `correct_text()` and `correct_text_patch()` accept caller-provided system prompts and few-shot examples
-- Built strength-adaptive few-shot examples so model sees exactly what to fix at each level
+- Fixed strength slider: removed hardcoded system prompt in `correct_text_patch()` that overrode per-level instructions.
+- Redesigned strength levels: 0=typos, 1=Samsung-like, 2=+grammar, 3=+structure, 4=rewrite.
 
 ### 2026-04-05
-- Merged CLAUDE.md + context.md + CHANGELOG.md into single AGENT_CONTEXT.md
-- Implemented patch-based autocorrect: `correct_text_patch()` in ModelManager, `_apply_patches()` and `_extract_patches_from_response()` helpers
-- Modified `_do_correction()` to try patch-based first, fall back to full-text
-- Squashed 7 unpushed commits into single v2.10 commit
+- Implemented patch-based autocorrect: `correct_text_patch()`, `_apply_patches()`, `_extract_patches_from_response()`.
+- `_do_correction()` tries patch first, falls back to full-text.
+- Merged all context files into AGENT_CONTEXT.md.
 
 ---
 
 ## Version History
 
-- **v2.10** — Patch-based autocorrect: LLM outputs only JSON patches for wrong words
-  instead of regenerating full text. Dramatically reduces token output and speeds up
-  corrections. Falls back to full-text correction if patch parsing fails.
-
-  **Design decisions and reasoning:**
-  - `max_tokens` uses same formula as full-text (`len(words)*2+30`, cap 512). The initial
-    implementation used `len//2+20` (cap 150) which caused `finish_reason: "length"` — the
-    JSON array got truncated mid-stream and could not be parsed. Input tokens don't affect
-    speed; only output tokens do. The model naturally outputs far fewer tokens because it
-    only lists wrong words, so a high ceiling is fine.
-  - No-op patches (`old == new`) are filtered out after extraction. The model (especially
-    smaller ones like 2B) sometimes outputs every single word as a patch with identical
-    old/new values. Without filtering, these would be wasted tokens and could cause
-    unnecessary regex replacements.
-  - When all patches are no-ops, returns original text with "Already correct" badge instead
-    of falling back to full-text. This avoids a second LLM round-trip when the text is
-    already perfect.
-  - `_apply_patches()` uses regex with word boundaries (`\b`) and `count=1` per patch to
-    safely replace only the first occurrence of each wrong word, preserving punctuation
-    adjacency and preventing accidental replacements elsewhere.
-  - `_extract_patches_from_response()` tries three strategies in order: direct JSON parse,
-    regex search for `[...]` array, regex search for `{...}` object with `"patches"` key.
-    This handles models that wrap JSON in markdown code fences or add explanatory text.
-  - **Taskbar icon fix**: Added `Qt.WindowType.Window` flag to `_position_window()`.
-    `FramelessWindowHint` alone tells Windows to hide the window from the taskbar. The
-    `Window` flag overrides that while keeping the frameless appearance.
-- **v2.9** — LanguageTool removed, LLM-only autocorrect, dual model support
-  (autocorrect model loaded at boot, chat model lazy-loaded), same correction
-  method for all models, correction strength slider (0-4)
-- **v2.8** — Bug fixes: nativeEvent segfault, scroll wheel spinboxes, Enter key
-  shortcut, LLM 503 on chat, LT-only autocorrect enforced, HTML escaping in
-  chat display, global exception hook, venv cleaned
-- **v2.7** — Full rewrite: GECToR/ONNX removed, LanguageTool added, PyQt5→PyQt6,
-  dark navy theme, streaming LLM chat, build.py/update.py
-- **v2.3.x** — GECToR DeBERTa-Large integration (later broken), ONNX model idle timers
-- **v2.1.x** — T5-first architecture; LLM reserved for chat, ONNX CoEdit-Large migration
-- **v2.0** — Initial PyQt5 system-tray app, llama.cpp backend
+| Version | Summary |
+|---------|---------|
+| **v4.0** | CUDA DLL injection, `--reasoning off`, read-only output boxes, line break preservation in diff, single-server chat routing, build.py auto-detect |
+| **v2.10** | Patch-based autocorrect (JSON `{old,new}` patches), fallback to full-text |
+| **v2.9** | LanguageTool removed; LLM-only; dual model (AC eager + chat lazy); correction strength 0–4 |
+| **v2.8** | Bug fixes: nativeEvent segfault, scroll wheel spinboxes, HTML escaping, global exception hook |
+| **v2.7** | Full rewrite: GECToR/ONNX removed, PyQt5→PyQt6, dark navy theme, streaming LLM chat |
+| **v2.3.x** | GECToR DeBERTa-Large, ONNX idle timers |
+| **v2.1.x** | T5-first architecture, ONNX CoEdit-Large |
+| **v2.0** | Initial PyQt5 system-tray app, llama.cpp backend |
