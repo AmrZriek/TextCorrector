@@ -36,7 +36,7 @@ TextCorrector lives in the system tray. Select text in any app, press the hotkey
 ## Requirements
 
 - **Python 3.11+** (only needed when running from source; prebuilt releases include Python)
-- **NVIDIA GPU** recommended (RTX 3060+, 6 GB+ VRAM) — CPU fallback works but is slow
+- **NVIDIA GPU** recommended (4 GB+ VRAM) — CPU fallback works but is slow
 - A GGUF model file (~1–4 GB) — see [Setting up the model](#setting-up-the-model) below
 - `llama-server.exe` binary (CUDA 12 build) from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases)
 - On Windows: CUDA 12 runtime DLLs alongside `llama-server.exe`
@@ -67,7 +67,7 @@ python text_corrector.py
 
 ## Setting up the model
 
-1. **Download a GGUF model** — recommended: **Gemma 2B IT Q4_K_M** (~1.5 GB) or **Qwen 2.5 3B Instruct Q4_K_M** (~2 GB).
+1. **Download a GGUF model** — recommended: **Gemma 4 2B Q4** (~1.5 GB) or **Qwen 3.5 2B Instruct Q4** (~2 GB).
    Run `download_model.bat` (Windows) or `./download_model.sh` (macOS/Linux) for an automated download.
 
 2. **Download `llama-server`** from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
