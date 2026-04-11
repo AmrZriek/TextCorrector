@@ -809,7 +809,10 @@ class ModelManager(QObject):
                 self.status_changed.emit("llama-server not found")
                 return False
 
-        gpu_layers = self.cfg.get("gpu_layers", 99) if has_nvidia() else 0
+        gpu_detected = has_nvidia()
+        log(f"[{self.label}] GPU detection: has_nvidia()={gpu_detected}")
+        gpu_layers = self.cfg.get("gpu_layers", 99) if gpu_detected else 0
+        log(f"[{self.label}] Using gpu_layers={gpu_layers}")
         ctx = self.cfg.get("context_size", 4096)
         host = self.cfg.get("server_host", "127.0.0.1")
         port = self.cfg.get("server_port", 8080)
@@ -1263,6 +1266,7 @@ class ModelManager(QObject):
     # ── idle check ─────────────────────────────────────────────────────────
     def check_idle(self):
         if self.cfg.get(self.keep_loaded_key, True):
+            log(f"[{self.label}] keep_model_loaded=True — skipping idle check")
             return
         if not self.is_loaded() or not self.last_used:
             return
@@ -2111,22 +2115,26 @@ class CorrectionWindow(QWidget):
             if mode == 1:
                 # Samsung AI mode: patch-based, aggressive, outputs only changed words
                 patch_system = (
-                    "You are a text correction engine. You output ONLY a JSON array of patches.\n"
-                    "Each patch object has exactly two keys:\n"
-                    '  "old" — the wrong word or short phrase as it appears in the text\n'
-                    '  "new" — the corrected replacement\n\n'
-                    "Rules:\n"
-                    "- Fix ALL errors: spelling, grammar, capitalization, punctuation, apostrophes\n"
-                    "- Only include words that need changing — omit correct words entirely\n"
-                    "- Keep patches short: 1-4 words max\n"
-                    "- If the text is already perfect, output an empty array []\n"
-                    "- Output ONLY the JSON array, nothing else"
+                    "You are a text correction engine. Output ONLY a JSON array of patches.\n"
+                    "Each patch has exactly two keys: 'old' (wrong word/phrase) and 'new' (corrected replacement).\n\n"
+                    "CRITICAL RULES:\n"
+                    "- Fix ALL errors: spelling, grammar, capitalization, punctuation, apostrophes.\n"
+                    "- Capitalize first letter of sentences, proper nouns, and 'I'.\n"
+                    "- Add missing periods, question marks, commas.\n"
+                    "- Fix apostrophes: dont→don't, its→it's, im→I'm, doesnt→doesn't.\n"
+                    "- Include punctuation in 'new' value when adding to end of sentence.\n"
+                    "- Only include words that need changing — omit correct words entirely.\n"
+                    "- Keep patches short: 1-4 words max.\n"
+                    "- If text is perfect, output [].\n"
+                    "- Output ONLY the JSON array, nothing else."
                 )
                 patch_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
+                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather."}]'},
                     {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
+                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}, {"old": "work", "new": "work."}]'},
+                    {"role": "user", "content": "samsung released a new phone"},
+                    {"role": "assistant", "content": '[{"old": "samsung", "new": "Samsung"}, {"old": "phone", "new": "phone."}]'},
                 ]
                 log("[CW] Samsung AI mode: patch-based correction")
                 result = self.ac_model.correct_text_patch(
@@ -2402,6 +2410,13 @@ class TextCorrectorApp(QApplication):
         self.setApplicationName("TextCorrector")
 
         self.cfg = ConfigManager()
+        _ac_path_boot = self.cfg.get("model_path", "") if self.cfg.get("ac_same_as_chat", True) else self.cfg.get("ac_model_path", "")
+        log(f"[APP] Boot — ac_same_as_chat: {self.cfg.get('ac_same_as_chat', True)}")
+        log(f"[APP] Boot — Autocorrect model: {_ac_path_boot}")
+        log(f"[APP] Boot — Chat model: {self.cfg.get('model_path', '')}")
+        log(f"[APP] Boot — keep_model_loaded: {self.cfg.get('keep_model_loaded', True)}")
+        log(f"[APP] Boot — gpu_layers: {self.cfg.get('gpu_layers', 99)}")
+        log(f"[APP] Boot — correction_mode: {self.cfg.get('correction_mode', 0)}")
         self.ac_model = ModelManager(
             self.cfg,
             model_path_key="ac_model_path",
