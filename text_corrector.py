@@ -480,8 +480,10 @@ DEFAULT_CONFIG: dict = {
     "hotkey": "ctrl+shift+space",
     # Misc
     "system_prompt": "",
-    # Correction aggressiveness: 0=Minimal … 4=Full Rewrite
-    "correction_strength": 2,
+    # Correction mode: 0=Conservative (typos only), 1=Samsung AI (aggressive patch)
+    "correction_mode": 0,
+    # Custom templates: list of {"name": str, "prompt": str}
+    "custom_templates": [],
 }
 
 
@@ -824,6 +826,7 @@ class ModelManager(QObject):
             host,
             "--port",
             str(port),
+            "--reasoning-budget", "0",
             "--no-warmup",
             "--log-disable",
         ]
@@ -968,7 +971,7 @@ class ModelManager(QObject):
             "presence_penalty": self.cfg.get("presence_penalty", 0.0),
             "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
             "stream": False,
-            # Note: "think": False removed - Qwen3.5-2B-UD ignores it anyway
+            "think": False,
         }
 
         url = self._chat_url()
@@ -991,12 +994,12 @@ class ModelManager(QObject):
             result = r.json()
             log(f"[{self.label}] JSON parsed successfully")
 
-            raw = (
-                result.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
+            raw, finish_reason = _extract_content_from_response(result)
+            # Thinking model consumed all tokens — no usable output
+            if not raw and finish_reason == "length":
+                log(f"[{self.label}] Thinking model used all tokens, no content produced")
+                self.status_changed.emit("Error: model used all tokens on reasoning")
+                return None
 
             # Strip thinking tokens (Qwen3 thinking mode)
             raw = strip_thinking_tokens(raw)
@@ -1033,18 +1036,14 @@ class ModelManager(QObject):
                     "presence_penalty": 0.0,
                     "repeat_penalty": 1.0,
                     "stream": False,
+                    "think": False,
                 }
 
                 retry_response = requests.post(url, json=retry_payload, timeout=120)
                 retry_response.raise_for_status()
 
                 retry_result = retry_response.json()
-                raw = (
-                    retry_result.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
+                raw, _ = _extract_content_from_response(retry_result)
 
                 # Strip again
                 raw = strip_thinking_tokens(raw)
@@ -1648,36 +1647,14 @@ class SettingsDialog(QDialog):
         self.sysprompt_edit.setFixedHeight(90)
         form.addWidget(self.sysprompt_edit)
 
-        # Correction strength ─────────────────────────────────────────────
-        section("CORRECTION STRENGTH")
-        _strength_labels = [
-            "0 — Minimal  (typos only)",
-            "1 — Light    (+ caps, punctuation, apostrophes)",
-            "2 — Standard (+ grammar fixes)",
-            "3 — Thorough (+ structure & word choice)",
-            "4 — Full Rewrite (maximum clarity)",
-        ]
-        self.strength_slider = QSlider(Qt.Orientation.Horizontal)
-        self.strength_slider.setRange(0, 4)
-        self.strength_slider.setSingleStep(1)
-        self.strength_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.strength_slider.setTickInterval(1)
-        self.strength_slider.setStyleSheet(
-            "QSlider::groove:horizontal{height:4px;background:rgba(59,130,246,0.2);border-radius:2px;}"
-            "QSlider::handle:horizontal{width:16px;height:16px;margin:-6px 0;"
-            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #1d4ed8,stop:1 #3b82f6);"
-            "border-radius:8px;}"
-            "QSlider::sub-page:horizontal{background:rgba(59,130,246,0.5);border-radius:2px;}"
-        )
-        self.strength_label = QLabel(_strength_labels[2])
-        self.strength_label.setStyleSheet(
-            "color:#94a3b8;font-size:11px;margin-left:4px;"
-        )
-        self.strength_slider.valueChanged.connect(
-            lambda v: self.strength_label.setText(_strength_labels[v])
-        )
-        form.addLayout(self._row("Strength", self.strength_slider))
-        form.addWidget(self.strength_label)
+        # Correction mode ─────────────────────────────────────────────────
+        section("CORRECTION MODE")
+        self.mode_combo = no_scroll(QComboBox())
+        self.mode_combo.addItems([
+            "Conservative — typos & obvious errors only",
+            "Samsung AI — aggressive, outputs only changed words",
+        ])
+        form.addLayout(self._row("Mode", self.mode_combo))
 
         form.addStretch()
         scroll.setWidget(inner)
@@ -1731,7 +1708,11 @@ class SettingsDialog(QDialog):
         self.idle_spin.setValue(self.cfg.get("idle_timeout_seconds", 300))
         self.hotkey_edit.setText(self.cfg.get("hotkey", "ctrl+shift+space"))
         self.sysprompt_edit.setPlainText(self.cfg.get("system_prompt", ""))
-        self.strength_slider.setValue(self.cfg.get("correction_strength", 2))
+        try:
+            _mode_idx = int(self.cfg.get("correction_mode", 0))
+        except (TypeError, ValueError):
+            _mode_idx = 0
+        self.mode_combo.setCurrentIndex(_mode_idx)
         self._on_ac_same_toggled(self.ac_same_cb.isChecked())
 
     def _save(self):
@@ -1753,7 +1734,7 @@ class SettingsDialog(QDialog):
         self.cfg.set("idle_timeout_seconds", self.idle_spin.value())
         self.cfg.set("hotkey", self.hotkey_edit.text())
         self.cfg.set("system_prompt", self.sysprompt_edit.toPlainText().strip())
-        self.cfg.set("correction_strength", self.strength_slider.value())
+        self.cfg.set("correction_mode", self.mode_combo.currentIndex())
         model = self.model_edit.text()
         if model:
             self.cfg.add_recent(model)
@@ -1967,6 +1948,24 @@ class CorrectionWindow(QWidget):
         ci_row.addWidget(self.send_btn)
         cp_lay.addLayout(ci_row)
 
+        # Template buttons row
+        tmpl_sc = QScrollArea()
+        tmpl_sc.setWidgetResizable(True)
+        tmpl_sc.setFixedHeight(36)
+        tmpl_sc.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:horizontal{height:0;}"
+        )
+        self.tmp_w = QWidget()
+        self.tmp_w.setStyleSheet("background:transparent;")
+        self.tmp_lay = QHBoxLayout(self.tmp_w)
+        self.tmp_lay.setContentsMargins(0, 0, 0, 0)
+        self.tmp_lay.setSpacing(6)
+        self.tmp_lay.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        tmpl_sc.setWidget(self.tmp_w)
+        cp_lay.addWidget(tmpl_sc)
+        self._refresh_templates()
+
         lay.addWidget(chat_panel)
 
         btn_row = QHBoxLayout()
@@ -1994,6 +1993,73 @@ class CorrectionWindow(QWidget):
         btn_row.addWidget(cancel_btn)
 
         lay.addLayout(btn_row)
+
+    # ── templates ─────────────────────────────────────────────────────────
+    def _refresh_templates(self):
+        while self.tmp_lay.count():
+            w = self.tmp_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+
+        core_templates = [
+            ("📧 Email", "Rewrite this as a professional email with a proper greeting, clear body, and closing. Keep the core message."),
+            ("💬 Social", "Rewrite this as a social media post. Keep the casual tone, original capitalization style, and personality. Make it engaging but don't over-polish it."),
+            ("📝 Formal", "Rewrite this in formal English. Expand contractions, use complete sentences, maintain professional tone."),
+            ("⚡ Tighten", "Optimize this text. Make it tighter, straight to the point, without cutting details or meaning."),
+            ("📢 Headline", "Rewrite this as a punchy, engaging headline or short tagline. Title case."),
+        ]
+        custom_templates = self.cfg.get("custom_templates", [])
+
+        btn_style = (
+            "QPushButton{font-size:11px;padding:4px 10px;border-radius:6px;"
+            "background:rgba(255,255,255,0.05);color:#cbd5e1;"
+            "border:1px solid rgba(255,255,255,0.08);}"
+            "QPushButton:hover{background:rgba(59,130,246,0.15);color:#93c5fd;}"
+        )
+
+        def _make_btn(name, prompt):
+            b = QPushButton(name)
+            b.setObjectName("ghost")
+            b.setStyleSheet(btn_style)
+            b.clicked.connect(lambda _, p=prompt: self._apply_template(p))
+            return b
+
+        for name, prompt in core_templates:
+            self.tmp_lay.addWidget(_make_btn(name, prompt))
+        for ct in custom_templates:
+            self.tmp_lay.addWidget(_make_btn(ct.get("name", "Custom"), ct.get("prompt", "")))
+
+        add_btn = QPushButton("➕ Add")
+        add_btn.setObjectName("ghost")
+        add_btn.setStyleSheet(
+            "QPushButton{font-size:11px;padding:4px 10px;border-radius:6px;"
+            "color:#94a3b8;border:1px dashed rgba(255,255,255,0.12);background:transparent;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.05);}"
+        )
+        add_btn.clicked.connect(self._add_custom_template)
+        self.tmp_lay.addWidget(add_btn)
+
+    def _apply_template(self, prompt: str):
+        if self._stream_worker and self._stream_worker.isRunning():
+            self._stream_worker.stop()
+            self._stream_worker.wait(500)
+        self.chat_display.clear()
+        self.chat_history.clear()
+        self.chat_input.setText(prompt)
+        self._send_chat()
+
+    def _add_custom_template(self):
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok1 = QInputDialog.getText(self, "New Template", "Template name (e.g. 🤓 Fun):")
+        if not ok1 or not name.strip():
+            return
+        prompt, ok2 = QInputDialog.getText(self, "New Template", "AI prompt (e.g. Rewrite this as a fun joke):")
+        if not ok2 or not prompt.strip():
+            return
+        customs = self.cfg.get("custom_templates", [])
+        customs.append({"name": name.strip(), "prompt": prompt.strip()})
+        self.cfg.set("custom_templates", customs)
+        self._refresh_templates()
 
     # ── correction logic ──────────────────────────────────────────────────
     def _on_model_status(self, msg: str):
@@ -2030,264 +2096,91 @@ class CorrectionWindow(QWidget):
                 self._correction_ready.emit(text, "No changes (model error)")
                 return
 
-            # ── Strength-aware prompts and few-shot examples ──────────
-            # Each level gets its own complete system prompt and matching
-            # few-shot examples so the model sees exactly what to fix.
-            strength = self.cfg.get("correction_strength", 2)
-            log(f"[CW] Correction strength: {strength}")
+            # ── Mode-aware correction ─────────────────────────────────
+            try:
+                mode = int(self.cfg.get("correction_mode", 0))
+            except (TypeError, ValueError):
+                mode = 0
+            log(f"[CW] Correction mode: {mode}")
 
-            _PATCH_FMT = (
-                "You are a text correction engine. You output ONLY a JSON array of patches.\n"
-                "Each patch object has exactly two keys:\n"
-                '  "old" — the wrong word or short phrase as it appears in the text\n'
-                '  "new" — the corrected replacement\n\n'
-                "Rules:\n"
-                "- Only include words that are actually wrong\n"
-                "- Preserve correct words exactly as-is — do NOT include them in patches\n"
-                "- Keep each patch short: 1-3 words max for old/new\n"
-                "- If the text is already perfect, output an empty array []\n"
-                "- Output ONLY the JSON array, nothing else\n"
-            )
+            custom_sys = self.cfg.get("system_prompt", "").strip()
 
-            _FULL_FMT = (
-                "You are a text correction engine.\n"
-                "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
-                "Preserve all formatting, line breaks, and original tone.\n"
-                "If the text is already correct, return it unchanged.\n"
-            )
-
-            # -- Patch system prompts (complete, per-level) --
-            _patch_systems = {
-                0: (
-                    _PATCH_FMT + "\nONLY fix clear typos and misspellings.\n"
-                    "Do NOT fix grammar, capitalization, punctuation, or style.\n"
-                    "Preserve everything else exactly as written."
-                ),
-                1: (
-                    _PATCH_FMT
-                    + "\nFix typos, misspellings, capitalization, apostrophes, "
-                    "punctuation, and quotes.\n"
-                    "Do NOT fix grammar, word choice, or rephrase anything.\n"
-                    "Preserve original wording and sentence structure."
-                ),
-                2: (
-                    _PATCH_FMT
-                    + "\nFix typos, misspellings, capitalization, punctuation, "
-                    "apostrophes, quotes, AND clear grammar errors "
-                    "(verb tense, subject-verb agreement, articles, prepositions).\n"
-                    "Preserve original wording otherwise."
-                ),
-                3: (
-                    _PATCH_FMT
-                    + "\nFix all spelling, capitalization, punctuation, grammar errors "
-                    "AND improve sentence structure and word choice.\n"
-                    "Keep original meaning and tone."
-                ),
-                4: (
-                    _PATCH_FMT
-                    + "\nFix ALL errors and rewrite phrases/sentences for maximum clarity.\n"
-                    "Restructure if needed. Preserve core meaning only."
-                ),
-            }
-
-            # -- Full-text system prompts (complete, per-level) --
-            _full_systems = {
-                0: (
-                    _FULL_FMT + "\nONLY fix clear typos and misspellings.\n"
-                    "Do NOT change grammar, capitalization, punctuation, or style.\n"
-                    "Preserve everything else exactly as written."
-                ),
-                1: (
-                    _FULL_FMT
-                    + "\nFix typos, misspellings, capitalization, apostrophes, "
-                    "punctuation, and quotes.\n"
-                    "Do NOT fix grammar, word choice, or rephrase anything.\n"
-                    "Preserve original wording and sentence structure."
-                ),
-                2: (
-                    _FULL_FMT
-                    + "\nFix typos, misspellings, capitalization, punctuation, "
-                    "apostrophes, quotes, AND clear grammar errors "
-                    "(verb tense, subject-verb agreement, articles, prepositions).\n"
-                    "Preserve original wording otherwise."
-                ),
-                3: (
-                    _FULL_FMT
-                    + "\nFix all spelling, capitalization, punctuation, grammar errors "
-                    "AND improve sentence structure and word choice.\n"
-                    "Keep original meaning and tone."
-                ),
-                4: (
-                    _FULL_FMT + "\nRewrite for maximum clarity and impact.\n"
-                    "Restructure sentences if needed. Preserve the core meaning."
-                ),
-            }
-
-            # -- Strength-adaptive few-shot examples (patch mode) --
             _EX1_INPUT = "the project were delayed because of bad wether"
             _EX2_INPUT = "i dont know if its gona work"
 
-            _patch_examples = {
-                0: [
+            if mode == 1:
+                # Samsung AI mode: patch-based, aggressive, outputs only changed words
+                patch_system = (
+                    "You are a text correction engine. You output ONLY a JSON array of patches.\n"
+                    "Each patch object has exactly two keys:\n"
+                    '  "old" — the wrong word or short phrase as it appears in the text\n'
+                    '  "new" — the corrected replacement\n\n'
+                    "Rules:\n"
+                    "- Fix ALL errors: spelling, grammar, capitalization, punctuation, apostrophes\n"
+                    "- Only include words that need changing — omit correct words entirely\n"
+                    "- Keep patches short: 1-4 words max\n"
+                    "- If the text is already perfect, output an empty array []\n"
+                    "- Output ONLY the JSON array, nothing else"
+                )
+                patch_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "wether", "new": "weather"}]',
-                    },
+                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
                     {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "gona", "new": "gonna"}]',
-                    },
-                ],
-                1: [
+                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
+                ]
+                log("[CW] Samsung AI mode: patch-based correction")
+                result = self.ac_model.correct_text_patch(
+                    text, system=patch_system, examples=patch_examples
+                )
+                if result is not None:
+                    if result == text:
+                        self._correction_ready.emit(text, "Already correct")
+                    else:
+                        self._correction_ready.emit(result, "Samsung AI (patch)")
+                    return
+                # Patch failed — fall back to full-text with aggressive prompt
+                log("[CW] Patch failed, falling back to full-text…")
+                full_system = custom_sys or (
+                    "You are a text correction engine.\n"
+                    "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
+                    "Fix ALL errors: spelling, grammar, capitalization, punctuation, apostrophes.\n"
+                    "Preserve formatting, line breaks, and original tone.\n"
+                    "If the text is already correct, return it unchanged."
+                )
+                full_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "wether", "new": "weather"}]',
-                    },
+                    {"role": "assistant", "content": "The project was delayed because of bad weather."},
                     {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]',
-                    },
-                ],
-                2: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]',
-                    },
-                ],
-                3: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]',
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "going to"}]',
-                    },
-                ],
-                4: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "the project were delayed because of bad wether", "new": "The project was delayed due to bad weather."}]',
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": '[{"old": "i dont know if its gona work", "new": "I\'m not sure if it\'s going to work."}]',
-                    },
-                ],
-            }
+                    {"role": "assistant", "content": "I don't know if it's gonna work."},
+                ]
+                result = self.ac_model.correct_text(text, system=full_system, examples=full_examples)
+                if result is not None and result.strip():
+                    self._correction_ready.emit(result, "Samsung AI (full-text)")
+                else:
+                    self._correction_ready.emit(text, "No changes (model error)")
 
-            # -- Strength-adaptive few-shot examples (full-text mode) --
-            _full_examples = {
-                0: [
+            else:
+                # Conservative mode (default): full-text, typos and obvious errors only
+                full_system = custom_sys or (
+                    "You are a text correction engine.\n"
+                    "OUTPUT ONLY the corrected text — no labels, no preamble, no explanations.\n"
+                    "ONLY fix clear misspellings and obvious typos.\n"
+                    "Do NOT change grammar, capitalization, punctuation, style, or word choice.\n"
+                    "Preserve everything else exactly as written.\n"
+                    "If the text has no typos, return it unchanged."
+                )
+                full_examples = [
                     {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "the project were delayed because of bad weather",
-                    },
+                    {"role": "assistant", "content": "the project were delayed because of bad weather"},
                     {"role": "user", "content": _EX2_INPUT},
                     {"role": "assistant", "content": "i dont know if its gonna work"},
-                ],
-                1: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "the project were delayed because of bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I don't know if it's gonna work.",
-                    },
-                ],
-                2: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "The project was delayed because of bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I don't know if it's gonna work.",
-                    },
-                ],
-                3: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "The project was delayed because of bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I don't know if it's going to work.",
-                    },
-                ],
-                4: [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "The project was delayed due to bad weather.",
-                    },
-                    {"role": "user", "content": _EX2_INPUT},
-                    {
-                        "role": "assistant",
-                        "content": "I'm not sure if it's going to work.",
-                    },
-                ],
-            }
-
-            patch_system = _patch_systems.get(strength, _patch_systems[2])
-            patch_examples = _patch_examples.get(strength, _patch_examples[2])
-            full_system = _full_systems.get(strength, _full_systems[2])
-            full_examples = _full_examples.get(strength, _full_examples[2])
-
-            # Override with user's custom system prompt if set (full-text only)
-            custom_sys = self.cfg.get("system_prompt", "").strip()
-            if custom_sys:
-                full_system = custom_sys
-
-            # Try patch-based correction first (faster, fewer tokens)
-            log("[CW] Trying patch-based autocorrect…")
-            result = self.ac_model.correct_text_patch(
-                text, system=patch_system, examples=patch_examples
-            )
-
-            if result is not None:
-                if result == text:
-                    log("[CW] Patch mode: no changes needed")
-                    self._correction_ready.emit(text, "Already correct")
+                ]
+                log("[CW] Conservative mode: full-text, typos only")
+                result = self.ac_model.correct_text(text, system=full_system, examples=full_examples)
+                if result is not None and result.strip():
+                    self._correction_ready.emit(result, "Conservative")
                 else:
-                    log("[CW] Patch-based autocorrect done")
-                    self._correction_ready.emit(result, "AI autocorrect (patch)")
-                return
-
-            # Fall back to full-text correction
-            log("[CW] Patch correction failed, falling back to full-text…")
-            result = self.ac_model.correct_text(
-                text, system=full_system, examples=full_examples
-            )
-
-            if result is not None and result.strip() != "":
-                log("[CW] LLM autocorrect done (full-text fallback)")
-                self._correction_ready.emit(result, "AI autocorrect")
-            else:
-                log("[CW] Both patch and full-text correction failed — model produced no output")
-                self._correction_ready.emit(text, "No changes (model error)")
+                    self._correction_ready.emit(text, "No changes (model error)")
 
         except Exception as e:
             log(f"[CW] _do_correction CRASHED: {e}\n{traceback.format_exc()}")
