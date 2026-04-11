@@ -1,8 +1,8 @@
-# TextCorrector v3.0
+# TextCorrector v4.0
 
 **Instant AI-powered text correction — select text anywhere, press a hotkey, done.**
 
-TextCorrector lives in the system tray. Select text in any app, press the hotkey, and a dark popup appears with corrections highlighted in blue. Accept to paste back. Or chat with the LLM to rewrite, shorten, or change the tone.
+TextCorrector lives in the system tray. Select text in any app, press the hotkey, and a dark popup appears with corrections highlighted in blue. Accept to paste back, or chat with the LLM to rewrite, shorten, or change the tone.
 
 ---
 
@@ -10,9 +10,9 @@ TextCorrector lives in the system tray. Select text in any app, press the hotkey
 
 1. Select text in any application.
 2. Press the hotkey (default `Ctrl + Shift + Space`).
-3. The correction popup appears instantly with grammar/spelling fixes highlighted.
+3. The correction popup appears with grammar/spelling fixes highlighted in blue.
 4. Press **Accept & Paste** (`Ctrl+Enter`) — corrected text is pasted back. Done.
-5. Optionally, type in the **Ask AI** box to make bigger changes with the LLM.
+5. Optionally, type in the **Ask AI** box to make bigger changes (rewrite, shorten, change tone).
 
 ---
 
@@ -20,28 +20,33 @@ TextCorrector lives in the system tray. Select text in any app, press the hotkey
 
 | Layer | Technology | Role |
 |---|---|---|
-| **Autocorrect** | LanguageTool (local Java server) | Primary — always instant, 10–50 ms |
-| **AI Chat** | llama.cpp (any GGUF model) | Secondary — user-initiated only |
+| **Autocorrect** | llama.cpp (GGUF model, local) | Primary — loaded at boot, instant on subsequent presses |
+| **AI Chat** | Same llama.cpp server, reused | No second model load when `ac_same_as_chat = true` |
 | GUI | PyQt6, dark navy frameless | — |
 | Hotkey | `keyboard` library (global hook) | — |
 
-**Design philosophy — same as Samsung keyboard AI:**
-- LanguageTool is the autocorrect engine. It handles spelling and grammar instantly, with no GPU required.
-- The LLM is **never** run automatically. It is only activated when the user explicitly types in the Ask AI chat box.
-- Keeping these roles separate ensures the hotkey always responds fast, regardless of whether an LLM model is loaded.
+**Design philosophy — Samsung AI keyboard style:**
+- A small GGUF model (2–4 B params, quantized) is loaded once at boot.
+- The same server handles both autocorrect patches and the chat/rewrite feature.
+- Thinking mode is explicitly disabled server-side (`--reasoning off`) so every token goes to output, not internal reasoning.
+- GPU acceleration via CUDA 12 — CUDA runtime DLLs must be alongside `llama-server.exe` on Windows.
 
 ---
 
 ## Requirements
 
-- **Python 3.11+**
-- **Java 8+** (for LanguageTool — usually pre-installed; download from https://adoptium.net if not)
-- A GGUF model file for LLM features (optional, but recommended for best accuracy)
-- The `llama_cpp/` folder with the `llama-server` binary
+- **Python 3.11+** (only needed when running from source; prebuilt releases include Python)
+- **NVIDIA GPU** recommended (RTX 3060+, 6 GB+ VRAM) — CPU fallback works but is slow
+- A GGUF model file (~1–4 GB) — see [Setting up the model](#setting-up-the-model) below
+- `llama-server.exe` binary (CUDA 12 build) from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases)
+- On Windows: CUDA 12 runtime DLLs alongside `llama-server.exe`
+  (`cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`)
+
+No Java, no LanguageTool, no internet connection required.
 
 ---
 
-## Installation
+## Installation (from source)
 
 ```bash
 # 1. Clone or download
@@ -55,30 +60,27 @@ venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 
 # 3. Run
-run.bat          # Windows (auto-elevates, uses venv)
-# python text_corrector.py   # macOS/Linux
+python text_corrector.py
 ```
-
-On first run, LanguageTool downloads its server JAR (~200 MB) to `~/.cache/language_tool_python/`. This is a one-time download.
 
 ---
 
-## Setting up the LLM
+## Setting up the model
 
-For the best correction quality and the AI chat feature:
+1. **Download a GGUF model** — recommended: **Gemma 2B IT Q4_K_M** (~1.5 GB) or **Qwen 2.5 3B Instruct Q4_K_M** (~2 GB).
+   Run `download_model.bat` (Windows) or `./download_model.sh` (macOS/Linux) for an automated download.
 
-1. Download a GGUF model — recommended: **Qwen 2.5 3B Instruct Q4_K_M** (~2 GB).
+2. **Download `llama-server`** from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
+   - Windows: grab the `cuda-12.x-x64` build.
+   - Place the entire extracted folder anywhere (e.g. next to `text_corrector.py`).
+   - Copy CUDA 12 runtime DLLs next to `llama-server.exe` if not already present
+     (they ship with Ollama at `%LOCALAPPDATA%\Programs\Ollama\lib\ollama\cuda_v12\`).
 
-2. Download the `llama-server` binary for your OS from:
-   https://github.com/ggerganov/llama.cpp/releases
-   Place the files in `llama_cpp/`.
+3. Open TextCorrector → **Settings** (tray icon or ⚙ in the popup):
+   - **Server binary**: path to `llama-server.exe`
+   - **Model file**: path to your `.gguf` file
 
-3. Open TextCorrector → **Settings** (tray icon → Settings or ⚙ in the popup):
-   - **Server binary**: point to `llama_cpp/llama-server.exe`
-   - **Model file**: point to your `.gguf` file
-
-4. The model is loaded on demand (first hotkey press or first chat message).
-   Enable **Keep model loaded** in Settings for instant response every time.
+4. The model loads on first hotkey press. Enable **Keep model loaded** in Settings for instant response every time.
 
 ---
 
@@ -86,19 +88,10 @@ For the best correction quality and the AI chat feature:
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+Shift+Space` | Trigger correction (configurable) |
-| `Ctrl+Enter` | Accept & Paste corrected text |
+| `Ctrl+Shift+Space` | Trigger correction (configurable in Settings) |
+| `Ctrl+Enter` | Accept & paste corrected text |
 | `Escape` | Close popup |
 | `Enter` (in chat box) | Send chat message |
-
----
-
-## Updating dependencies
-
-```bash
-python update.py          # Update Python packages
-python update.py --all    # Also update llama-server binary
-```
 
 ---
 
@@ -109,49 +102,56 @@ pip install pyinstaller
 python build.py
 ```
 
-Produces `dist/TextCorrector_<version>_<platform>.zip` — self-contained, no Python required on target machine.
+Produces `dist/TextCorrector_<version>_<platform>.zip` — self-contained, no Python required.
+On Windows, `build.py` automatically detects and bundles CUDA 12 runtime DLLs if found.
 
 ---
 
 ## Configuration reference
 
-Settings are in `config.json` (same folder as the script). All values are editable via the Settings dialog.
+All settings are editable via the Settings dialog. `config.json` is created in the app folder on first run.
 
 | Key | Default | Description |
 |---|---|---|
-| `lt_enabled` | `true` | Enable LanguageTool grammar correction |
-| `lt_language` | `en-US` | LanguageTool language code (e.g. `de-DE`, `fr-FR`) |
-| `lt_disabled_rules` | `""` | Comma-separated rule IDs to suppress |
-| `hotkey` | `ctrl+shift+space` | Global trigger hotkey |
-| `model_path` | `""` | Path to GGUF model file |
-| `server_port` | `8080` | llama-server HTTP port |
-| `context_size` | `4096` | LLM context window (tokens) |
+| `llama_server_path` | `""` | Path to `llama-server[.exe]` binary |
+| `model_path` | `""` | Path to GGUF model file (chat/rewrite) |
+| `ac_model_path` | `""` | Path to GGUF model file (autocorrect) |
+| `ac_same_as_chat` | `true` | Reuse the chat model for autocorrect (one server) |
 | `gpu_layers` | `99` | GPU offload layers (0 = CPU only) |
+| `context_size` | `4096` | LLM context window (tokens) |
 | `keep_model_loaded` | `true` | Keep LLM in memory between uses |
+| `hotkey` | `ctrl+shift+space` | Global trigger hotkey |
+| `correction_mode` | `1` | 0 = conservative, 1 = smart fix (patch-based) |
 | `temperature` | `0.1` | LLM temperature |
 | `top_k` | `40` | Top-K sampling |
 | `top_p` | `0.95` | Top-P sampling |
 | `min_p` | `0.05` | Min-P sampling |
+| `server_port` | `8080` | llama-server HTTP port |
 
 ---
 
 ## Troubleshooting
 
 **Hotkey not working:**
-- Windows: run `run.bat` as administrator.
+- Windows: try running as administrator if global hotkeys are blocked.
 - macOS: grant Accessibility in System Settings → Privacy → Accessibility.
-- Linux: may require root or adding user to the `input` group.
+- Linux: may require adding user to the `input` group.
 
-**LLM chat shows 503 error:**
-- The model server isn't running yet. Click the chat send button once more — the app will load the model and retry automatically.
-- Make sure the server binary and model file paths are set correctly in Settings.
+**GPU not being used / slow corrections:**
+- Check `app_debug.log` for `[AC] GPU detection: has_nvidia()=True` and `Using gpu_layers=99`.
+- If CUDA DLLs are missing, the server silently falls back to CPU. Copy `cudart64_12.dll`, `cublas64_12.dll`, and `cublasLt64_12.dll` next to `llama-server.exe`.
+- Ollama users: copy from `%LOCALAPPDATA%\Programs\Ollama\lib\ollama\cuda_v12\`.
 
-**LanguageTool makes a wrong correction (e.g. `exactl` → `exact` instead of `exactly`):**
-- LT uses edit-distance spelling and may prefer shorter candidates. This is a known LanguageTool limitation.
-- Use the **Ask AI** chat box to fix specific words after the initial correction (e.g. type "the word 'exact' should be 'exactly'").
+**Corrections return unchanged text / empty result:**
+- Check `app_debug.log` for `reasoning_content present` — this means the model entered thinking mode. The server flag `--reasoning off` should prevent this; if you see it, your `llama-server` build may be outdated.
+- Also check for `503 Service Unavailable` — means the model is still loading. Wait a moment and retry.
+
+**Chat shows "loading model" every time:**
+- Enable `ac_same_as_chat = true` in Settings so the chat reuses the already-loaded autocorrect server.
 
 **App crashes / disappears:**
-- Check `app_debug.log` in the TextCorrector folder — all exceptions are now logged there.
+- Check `app_debug.log` in the TextCorrector folder — all errors are logged there.
+- Check `server_log.txt` for llama-server startup errors (CUDA failures, model not found, etc.).
 
 ---
 

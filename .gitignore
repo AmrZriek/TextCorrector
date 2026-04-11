@@ -16,6 +16,7 @@ config.json
 # AI agent files (not for GitHub)
 CLAUDE.md
 context.md
+# AGENT_CONTEXT.md is intentionally tracked — it is the shared AI context file
 
 # AI agent worktrees
 .claude/worktrees/
