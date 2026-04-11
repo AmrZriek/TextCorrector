@@ -50,7 +50,7 @@ No Java, no LanguageTool, no internet connection required.
 
 ```bash
 # 1. Clone or download
-git clone https://github.com/your-repo/TextCorrector.git
+git clone https://github.com/AmrZriek/TextCorrector.git
 cd TextCorrector
 
 # 2. Create a venv and install dependencies
