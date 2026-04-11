@@ -434,6 +434,36 @@ def _extract_patches_from_response(raw: str) -> list[dict] | None:
     return None
 
 
+def _checkbox_css() -> str:
+    """Return QSS for checkboxes with a visible checkmark icon.
+
+    Writes a small SVG to disk once (Qt QSS cannot embed data URIs for images).
+    """
+    svg_path = SCRIPT_DIR / "_checkmark.svg"
+    try:
+        if not svg_path.exists():
+            svg_path.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12">'
+                '<path d="M2 6L5 9L10 3" stroke="white" stroke-width="2.2" '
+                'fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                encoding="utf-8",
+            )
+        p = str(svg_path).replace("\\", "/")
+        return (
+            "QCheckBox { color: #94a3b8; spacing: 8px; }"
+            "QCheckBox:checked { color: #e2e8f0; }"
+            "QCheckBox::indicator {"
+            " width: 16px; height: 16px;"
+            " border: 1.5px solid rgba(59,130,246,0.35);"
+            " border-radius: 4px; background: rgba(4,10,28,0.8); }"
+            "QCheckBox::indicator:hover { border: 1.5px solid rgba(96,165,250,0.65); }"
+            f'QCheckBox::indicator:checked {{ background: #3b82f6;'
+            f' border: 1.5px solid #60a5fa; image: url("{p}"); }}'
+        )
+    except Exception:
+        return ""
+
+
 # ── Scroll-wheel ignore helper ────────────────────────────────────────────────
 class _IgnoreWheelFilter(QObject):
     def eventFilter(self, obj, event):
@@ -480,7 +510,7 @@ DEFAULT_CONFIG: dict = {
     "hotkey": "ctrl+shift+space",
     # Misc
     "system_prompt": "",
-    # Correction mode: 0=Conservative (typos only), 1=Samsung AI (aggressive patch)
+    # Correction mode: 0=Conservative (typos only), 1=Smart Fix (aggressive patch)
     "correction_mode": 0,
     # Custom templates: list of {"name": str, "prompt": str}
     "custom_templates": [],
@@ -726,7 +756,6 @@ class StreamWorker(QThread):
                         chunk = json.loads(data)
                         t = chunk["choices"][0]["delta"].get("content", "")
                         if t:
-                            t = strip_thinking_tokens(t)
                             full += t
                             self.token.emit(t)
                     except Exception:
@@ -811,7 +840,9 @@ class ModelManager(QObject):
 
         gpu_detected = has_nvidia()
         log(f"[{self.label}] GPU detection: has_nvidia()={gpu_detected}")
-        gpu_layers = self.cfg.get("gpu_layers", 99) if gpu_detected else 0
+        gpu_layers = self.cfg.get("gpu_layers", 99)
+        if not gpu_detected and gpu_layers > 0:
+            log(f"[{self.label}] nvidia-smi not found but gpu_layers={gpu_layers} from config — attempting GPU (error recovery will retry CPU on failure)")
         log(f"[{self.label}] Using gpu_layers={gpu_layers}")
         ctx = self.cfg.get("context_size", 4096)
         host = self.cfg.get("server_host", "127.0.0.1")
@@ -829,15 +860,41 @@ class ModelManager(QObject):
             host,
             "--port",
             str(port),
-            "--reasoning-budget", "0",
+            "--reasoning", "off",
             "--no-warmup",
-            "--log-disable",
         ]
 
         try:
             kwargs: dict = {}
             if WINDOWS:
                 kwargs["creationflags"] = 0x08000000
+
+            # Ensure CUDA runtime DLLs are on PATH for GPU acceleration
+            if WINDOWS and gpu_layers > 0:
+                env = os.environ.copy()
+                server_dir = str(Path(server_path).parent)
+                cuda_search = [
+                    server_dir,
+                    os.path.expandvars(r"%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin"),
+                    os.path.expandvars(r"%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"),
+                ]
+                # Search for cudart64_12.dll in common locations
+                for d in Path(server_dir).parent.iterdir():
+                    if d.is_dir() and "cuda" in d.name.lower():
+                        cuda_search.append(str(d))
+                # Also check Ollama bundled CUDA
+                ollama_cuda = Path(os.path.expandvars(r"%LOCALAPPDATA%")) / "Programs" / "Ollama" / "lib" / "ollama" / "cuda_v12"
+                if ollama_cuda.exists():
+                    cuda_search.append(str(ollama_cuda))
+                # Search broader Ollama locations
+                for p in [Path("E:/AI/AnythingLLM/resources/ollama/lib/ollama/cuda_v12")]:
+                    if p.exists():
+                        cuda_search.append(str(p))
+                extra = [d for d in cuda_search if Path(d).exists() and d not in env.get("PATH", "")]
+                if extra:
+                    env["PATH"] = ";".join(extra) + ";" + env.get("PATH", "")
+                    log(f"[{self.label}] Added CUDA paths to PATH: {extra}")
+                kwargs["env"] = env
 
             # Clear any orphaned llama-server from a previous session
             try:
@@ -1471,6 +1528,7 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(
             THEME
             + "\nSettingsDialog { background: #060d1f; border: 1px solid rgba(59,130,246,0.18); }"
+            + _checkbox_css()
         )
 
         lay = QVBoxLayout(self)
@@ -1656,7 +1714,7 @@ class SettingsDialog(QDialog):
         self.mode_combo = no_scroll(QComboBox())
         self.mode_combo.addItems([
             "Conservative — typos & obvious errors only",
-            "Samsung AI — aggressive, outputs only changed words",
+            "Smart Fix — capitalization, punctuation & grammar",
         ])
         form.addLayout(self._row("Mode", self.mode_combo))
 
@@ -1797,7 +1855,7 @@ class CorrectionWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         sr = screen.geometry()
-        w, h = min(740, int(sr.width() * 0.8)), min(680, int(sr.height() * 0.85))
+        w, h = min(740, int(sr.width() * 0.8)), min(860, int(sr.height() * 0.9))
         self.resize(w, h)
         cx, cy = QCursor.pos().x(), QCursor.pos().y()
         x = max(sr.x(), min(cx - w // 2, sr.right() - w))
@@ -1855,7 +1913,7 @@ class CorrectionWindow(QWidget):
 
     def _build_ui(self):
         self.setWindowTitle("TextCorrector")
-        self.setMinimumSize(420, 380)
+        self.setMinimumSize(500, 560)
         self.setStyleSheet(THEME)
 
         card = QWidget()
@@ -1904,7 +1962,6 @@ class CorrectionWindow(QWidget):
         self.orig_edit.setPlainText(self.original)
         self.orig_edit.setReadOnly(True)
         self.orig_edit.setMinimumHeight(65)
-        self.orig_edit.setMaximumHeight(120)
         lay.addWidget(self.orig_edit)
 
         corr_lbl = QLabel("CORRECTED")
@@ -1912,7 +1969,8 @@ class CorrectionWindow(QWidget):
         lay.addWidget(corr_lbl)
         self.corr_edit = QTextEdit()
         self.corr_edit.setPlaceholderText("Processing…")
-        self.corr_edit.setMinimumHeight(80)
+        self.corr_edit.setReadOnly(True)
+        self.corr_edit.setMinimumHeight(160)
         lay.addWidget(self.corr_edit, 1)
 
         lay.addWidget(self._make_sep())
@@ -1997,6 +2055,14 @@ class CorrectionWindow(QWidget):
         btn_row.addWidget(cancel_btn)
 
         lay.addLayout(btn_row)
+
+        grip_row = QHBoxLayout()
+        grip_row.addStretch()
+        grip = QSizeGrip(self)
+        grip.setFixedSize(16, 16)
+        grip.setStyleSheet("QSizeGrip{background:transparent;}")
+        grip_row.addWidget(grip)
+        lay.addLayout(grip_row)
 
     # ── templates ─────────────────────────────────────────────────────────
     def _refresh_templates(self):
@@ -2113,7 +2179,7 @@ class CorrectionWindow(QWidget):
             _EX2_INPUT = "i dont know if its gona work"
 
             if mode == 1:
-                # Samsung AI mode: patch-based, aggressive, outputs only changed words
+                # Smart Fix mode: patch-based, aggressive, outputs only changed words
                 patch_system = (
                     "You are a text correction engine. Output ONLY a JSON array of patches.\n"
                     "Each patch has exactly two keys: 'old' (wrong word/phrase) and 'new' (corrected replacement).\n\n"
@@ -2136,7 +2202,7 @@ class CorrectionWindow(QWidget):
                     {"role": "user", "content": "samsung released a new phone"},
                     {"role": "assistant", "content": '[{"old": "samsung", "new": "Samsung"}, {"old": "phone", "new": "phone."}]'},
                 ]
-                log("[CW] Samsung AI mode: patch-based correction")
+                log("[CW] Smart Fix mode: patch-based correction")
                 result = self.ac_model.correct_text_patch(
                     text, system=patch_system, examples=patch_examples
                 )
@@ -2144,7 +2210,7 @@ class CorrectionWindow(QWidget):
                     if result == text:
                         self._correction_ready.emit(text, "Already correct")
                     else:
-                        self._correction_ready.emit(result, "Samsung AI (patch)")
+                        self._correction_ready.emit(result, "Smart Fix (patch)")
                     return
                 # Patch failed — fall back to full-text with aggressive prompt
                 log("[CW] Patch failed, falling back to full-text…")
@@ -2163,7 +2229,7 @@ class CorrectionWindow(QWidget):
                 ]
                 result = self.ac_model.correct_text(text, system=full_system, examples=full_examples)
                 if result is not None and result.strip():
-                    self._correction_ready.emit(result, "Samsung AI (full-text)")
+                    self._correction_ready.emit(result, "Smart Fix (full-text)")
                 else:
                     self._correction_ready.emit(text, "No changes (model error)")
 
@@ -2273,6 +2339,11 @@ class CorrectionWindow(QWidget):
             ]
         self.chat_history.append({"role": "user", "content": msg})
 
+        # When ac_same_as_chat=True, the AC server handles chat too — never kill it to load a second one
+        if self.cfg.get("ac_same_as_chat", True) and self.ac_model.is_loaded():
+            self._do_stream()
+            return
+
         if not self.chat_model.is_loaded():
             self.chat_display.append(
                 '<span style="color:#f59e0b;font-style:italic;">⏳ Loading chat model…</span>'
@@ -2292,7 +2363,13 @@ class CorrectionWindow(QWidget):
 
     def _do_stream(self):
         self._stream_buf = ""
-        worker = self.chat_model.make_stream_worker(self.chat_history, max_tokens=1024)
+        # Route to AC model when ac_same_as_chat=True — it's already running on the same server
+        backend = (
+            self.ac_model
+            if (self.cfg.get("ac_same_as_chat", True) and self.ac_model.is_loaded())
+            else self.chat_model
+        )
+        worker = backend.make_stream_worker(self.chat_history, max_tokens=1024)
         worker.token.connect(self._chat_token)
         worker.done.connect(self._chat_done)
         worker.error.connect(self._chat_error)
