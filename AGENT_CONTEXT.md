@@ -66,6 +66,35 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - `build.py` uses PyInstaller → single-folder release + ZIP
 - `build.py` auto-detects the llama-server folder from `config.json`, not hardcoded `llama_cpp/`
 
+### 9. No punctuation insertion in patch mode
+- Patch prompts and few-shot examples must NEVER instruct the LLM to add new punctuation (periods, commas, semicolons) that the user did not write
+- Few-shot example patches must NOT append periods to the last word (e.g. `"phone"→"phone."` is wrong)
+- Post-processing (`_apply_patches`) must NOT add trailing periods or commas — only fix contractions, capitalization, and standalone 'i'
+- This was added after the LLM kept inserting periods/commas mid-sentence when told to "add missing punctuation"
+- Punctuation *correction* (fixing wrong punctuation) is fine; punctuation *insertion* is not
+
+### 10. Custom system prompt is appended, never replaces
+- When `system_prompt` config is set, it is appended to the base prompt as `"\n\nAdditional instructions:\n{custom_sys}"` — never replaces the base constraints
+- The base prompt always includes `"OUTPUT ONLY the corrected text"` (full-text mode) or `"Output ONLY a JSON array"` (patch mode) — these must remain present regardless of custom instructions
+- In patch mode (mode 1), custom instructions are also appended to the patch system prompt so they actually take effect
+- Previously, `custom_sys or (default)` replaced the entire prompt, losing output-format constraints → model added conversational filler → triggered retry → 2x latency
+
+### 11. Long texts are chunked at sentence boundaries, never truncated
+- `correct_text_patch()` splits long texts into sentence-aligned chunks when the input would exceed the context window's safe capacity
+- Each chunk gets its own LLM request with a full output token budget (≥1024 tokens for patches)
+- Chunks are reassembled with their original inter-chunk whitespace/newlines preserved via `_chunk_text_by_sentences()`
+- Overhead is estimated from the actual system prompt + examples (not a fixed constant) — prevents underestimating and starving the output budget
+- If a chunk fails in multi-chunk mode, its original text is kept and processing continues (partial success is better than total failure)
+- Previously, a single-shot request for 3000+ words left only 256 output tokens → patches were truncated → end of text never got corrected
+- The chunking threshold adapts to the user's `context_size` setting — larger contexts allow larger single-shot texts
+
+### 12. Patch mode uses iterative multi-pass (max 3), not single-shot
+- `_do_correction()` runs `correct_text_patch()` in a loop (up to `MAX_PATCH_PASSES = 3`), feeding corrected text back as input until no more changes are found
+- This is necessary because small on-device LLMs miss subtle errors on the first pass when focused on obvious ones — the second pass catches stragglers (same principle as GECToR's iterative refinement)
+- The loop terminates early when the result matches the input (converged) or when patch extraction fails (falls back to full-text)
+- For already-correct text, only one pass runs (returns `[]` immediately) — no extra latency
+- The method badge shows pass count when >1 (e.g. "Smart Fix (patch 2x)")
+
 ---
 
 ## Architecture
@@ -120,7 +149,8 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - `contains_meta_commentary(text)` — detects if output contains conversational filler
 - `_extract_content_from_response(resp)` — extracts `(content, finish_reason)` from API response; detects thinking models where `content` is empty and `reasoning_content` has output
 - `_extract_patches_from_response(raw)` — extracts JSON patches; returns `None` on parse failure (triggers fallback), `[]` for valid empty (text already correct)
-- `_apply_patches(original, patches)` — word-level regex patches with case-insensitive fallback
+- `_apply_patches(original, patches)` — word-level regex patches with case-insensitive fallback + post-processing (contractions, capitalization, standalone 'i')
+- `_chunk_text_by_sentences(text, max_words)` — splits text at sentence/paragraph boundaries into chunks of ≤ max_words; returns `(chunk_text, separator)` tuples for lossless reassembly; used by `correct_text_patch()` to avoid context window overflow on long texts
 - `_checkbox_css()` — generates QSS for checkbox checkmark using SVG (Qt theme blocks native rendering)
 - `has_nvidia()` — detects NVIDIA GPU via nvidia-smi
 - `log(msg)` — timestamped append to `app_debug.log`
@@ -233,7 +263,15 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-11 (latest)
+### 2026-04-12 (latest)
+- **Fixed: long texts skipping corrections at the end** — Root cause: single-shot patch requests for 3000+ word texts consumed the entire context window, leaving only 256 output tokens for patches. The LLM couldn't generate enough patches to cover the full text, silently dropping corrections at the end. Fix: `correct_text_patch()` now splits long texts into sentence-aligned chunks via `_chunk_text_by_sentences()`, each chunk gets its own LLM request with full output budget. Overhead is estimated from actual prompt content, not a fixed 300-token constant. Added locked rule #11.
+- **Fixed: overcorrecting — LLM inserting periods/commas mid-sentence** — Root cause: patch system prompt said "Add missing periods, question marks, commas" and few-shot examples all appended periods to last words (`"phone"→"phone."`). The LLM generalized this and started adding punctuation everywhere. Fix: removed punctuation-insertion instructions, removed period-appending from examples, removed trailing-period post-fix. Added locked rule #9.
+- **Fixed: custom system prompt caused full rewrite + 2x latency** — `custom_sys or (default)` replaced the entire system prompt, losing "OUTPUT ONLY" constraints. Model added conversational filler → triggered retry. Fix: custom prompt is now appended via `"\n\nAdditional instructions:\n"` to both patch and full-text base prompts. Added locked rule #10.
+- **Improved: patch max_tokens now dynamic** — Was hardcoded at 512. Now scales as `word_count * 20` (floor 128), capped to `context_size - estimated_input_tokens`. Prevents JSON truncation for long texts with many errors.
+- **Improved: expanded post-processing in `_apply_patches()`** — Added deterministic contraction fixes (28 patterns: dont→don't, doesnt→doesn't, etc. with case preservation), and capitalize-after-sentence-ending-punctuation. These catch common misses without needing a second LLM pass.
+- **Improved: multi-pass patch correction** — `_do_correction()` now loops patch correction up to 3 times, feeding corrected text back as input. Small LLMs miss subtle errors when focused on obvious ones; the second pass catches stragglers. Converges early when no changes found. Added locked rule #12.
+
+### 2026-04-11
 - **Fixed: corrections returning same input** — Gemma 4 entered thinking mode despite `"think":false`. Root cause: `--reasoning-budget 0` didn't prevent it. Fix: changed to `--reasoning off` server flag in `load_model()`.
 - **Fixed: GPU not used** — CUDA runtime DLLs missing from subprocess PATH. Added CUDA search in `load_model()` to inject Ollama/CUDA Toolkit paths before server launch. Removed `--log-disable` so `server_log.txt` now shows CUDA backend loading.
 - **Fixed: output box editable** — Added `setReadOnly(True)` to `corr_edit`.
