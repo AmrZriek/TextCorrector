@@ -4,7 +4,7 @@ build.py — TextCorrector release packager
 Produces a self-contained ZIP in dist/TextCorrector_<version>_<platform>.zip.
 
 Supports Windows, macOS, Linux.  Must be run on the target platform
-(PyInstaller bundles are not cross-platform).
+(Nuitka binaries are not cross-platform).
 
 Usage
 -----
@@ -14,18 +14,24 @@ Usage
 
 Requirements
 ------------
-    pip install pyinstaller
+    pip install nuitka
     All app Python dependencies must be installed in the active venv.
 
 What it does
 ------------
-1. Runs PyInstaller → single-folder dist/TextCorrector/
+1. Runs Nuitka (--standalone) → compiles to native binary + deps folder
 2. Copies the llama-server binary folder (resolved from config.json or auto-detected)
 3. On Windows: copies CUDA 12 runtime DLLs alongside the server if found
 4. Copies logo, LICENSE, README
 5. Writes a clean release config.json (blank paths, sensible defaults)
 6. Creates run.bat / run.sh launcher and download_model helper script
 7. Zips the whole thing → dist/TextCorrector_<ver>_<platform>.zip
+
+Why Nuitka instead of PyInstaller
+----------------------------------
+Nuitka compiles Python → C → native binary. Windows Defender does not flag it
+because there is no self-extracting archive heuristic. PyInstaller's onefile
+and even onefolder builds triggered false-positive trojan warnings.
 
 LOCKED ARCHITECTURE — DO NOT CHANGE WITHOUT USER APPROVAL
 ----------------------------------------------------------
@@ -39,6 +45,11 @@ LOCKED ARCHITECTURE — DO NOT CHANGE WITHOUT USER APPROVAL
 import sys, os, shutil, subprocess, zipfile, argparse, platform, json
 from pathlib import Path
 from datetime import datetime
+
+# Force UTF-8 output so Unicode box-drawing / arrow chars don't crash on
+# Windows terminals that default to CP1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.resolve()
@@ -149,60 +160,31 @@ def run(cmd: list, **kw):
 
 
 def banner(msg: str):
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print(f"  {msg}")
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
 
 
-# ── PyInstaller spec ─────────────────────────────────────────────────────────
-def _build_spec(icon_png: Path, icon_ico: Path) -> str:
-    datas = []
-    if icon_png.exists():
-        datas.append(f"('{str(icon_png).replace(chr(92), '/')}', '.')")
-    if icon_ico.exists():
-        datas.append(f"('{str(icon_ico).replace(chr(92), '/')}', '.')")
-
-    datas_str = ",\n        ".join(datas) if datas else ""
-
-    icon_arg = f"icon='{str(icon_ico).replace(chr(92), '/')}'" if icon_ico.exists() else ""
-
-    return f"""\
-# -*- mode: python ; coding: utf-8 -*-
-a = Analysis(
-    ['{str(MAIN_SCRIPT).replace(chr(92), '/')}'],
-    pathex=['{str(ROOT).replace(chr(92), '/')}'],
-    binaries=[],
-    datas=[
-        {datas_str}
-    ],
-    hiddenimports=[
-        'keyboard', 'pyperclip', 'requests',
-        'PyQt6', 'PyQt6.QtWidgets', 'PyQt6.QtCore', 'PyQt6.QtGui',
-        'difflib', 'json', 'threading', 'subprocess',
-    ],
-    hookspath=[],
-    runtime_hooks=[],
-    excludes=['torch', 'onnxruntime', 'transformers', 'gector'],
-    noarchive=False,
-)
-pyz = PYZ(a.pure)
-exe = EXE(
-    pyz, a.scripts, [],
-    exclude_binaries=True,
-    name='TextCorrector',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=False,
-    {icon_arg}
-)
-coll = COLLECT(
-    exe, a.binaries, a.zipfiles, a.datas,
-    strip=False, upx=True, upx_exclude=[],
-    name='TextCorrector',
-)
-"""
+# ── Nuitka build command ──────────────────────────────────────────────────────
+def _nuitka_cmd(icon_ico: Path, icon_png: Path) -> list:
+    """Return the Nuitka CLI command for the current platform."""
+    cmd = [
+        sys.executable, "-m", "nuitka",
+        "--standalone",
+        "--enable-plugin=pyqt6",
+        "--assume-yes-for-downloads",
+        f"--output-dir={BUILD}",
+        "--output-filename=TextCorrector",
+        str(MAIN_SCRIPT),
+    ]
+    if PLATFORM == "Windows":
+        cmd.insert(3, "--windows-console-mode=disable")
+        if icon_ico.exists():
+            cmd.insert(3, f"--windows-icon-from-ico={icon_ico}")
+    elif PLATFORM == "macOS":
+        if icon_png.exists():
+            cmd.insert(3, f"--macos-app-icon={icon_png}")
+    return cmd
 
 
 # ── Release config (blank model paths, sensible defaults) ────────────────────
@@ -339,7 +321,6 @@ FIRST RUN
 def build(version: str, make_zip: bool, keep_folder: bool):
     release_name = f"TextCorrector_{version}_{PLATFORM}"
     out_dir = DIST / release_name
-    spec_path = BUILD / "TextCorrector.spec"
 
     banner(f"TextCorrector build  v{version}  [{PLATFORM}]")
 
@@ -363,25 +344,19 @@ def build(version: str, make_zip: bool, keep_folder: bool):
     DIST.mkdir(parents=True, exist_ok=True)
     BUILD.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. PyInstaller ────────────────────────────────────────────────────
-    banner("Step 1 / 4 — PyInstaller")
-    spec_path.write_text(_build_spec(ICON_PNG, ICON_ICO), encoding="utf-8")
-    run([
-        sys.executable, "-m", "PyInstaller",
-        "--distpath", str(DIST),
-        "--workpath", str(BUILD),
-        "--noconfirm",
-        str(spec_path),
-    ])
+    # ── 1. Nuitka ─────────────────────────────────────────────────────────
+    banner("Step 1 / 5 — Nuitka (compile Python → native binary)")
+    run(_nuitka_cmd(ICON_ICO, ICON_PNG))
 
-    pyinstaller_out = DIST / "TextCorrector"
-    if not pyinstaller_out.exists():
-        print("ERROR: PyInstaller output not found.")
+    # Nuitka standalone output: <BUILD>/<script-stem>.dist/
+    nuitka_out = BUILD / (MAIN_SCRIPT.stem + ".dist")
+    if not nuitka_out.exists():
+        print("ERROR: Nuitka output not found.")
         sys.exit(1)
-    pyinstaller_out.rename(out_dir)
+    nuitka_out.rename(out_dir)
 
     # ── 2. Copy extras ────────────────────────────────────────────────────
-    banner("Step 2 / 4 — Copy extras")
+    banner("Step 2 / 5 — Copy extras")
 
     # llama-server binaries
     if llama_dir:
@@ -427,7 +402,7 @@ def build(version: str, make_zip: bool, keep_folder: bool):
             print(f"  Copied asset: {asset}")
 
     # ── 3. Launcher scripts ───────────────────────────────────────────────
-    banner("Step 3 / 4 — Launcher scripts")
+    banner("Step 3 / 5 — Launcher scripts")
     if PLATFORM == "Windows":
         (out_dir / "run.bat").write_text(RUN_BAT)
         (out_dir / "download_model.bat").write_text(DOWNLOAD_BAT)

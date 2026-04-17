@@ -46,38 +46,55 @@ No Java, no LanguageTool, no internet connection required.
 
 ---
 
-## Installation (from source)
+## Installation
+
+### Windows — Prebuilt release
+
+1. Download `TextCorrector_<version>_Windows.zip` from [Releases](https://github.com/AmrZriek/TextCorrector/releases).
+2. Extract anywhere. Run `download_model.bat` to get the recommended model (~1.8 GB download).
+3. Double-click `run.bat` — the app appears in the system tray.
+4. Open Settings → set **Server binary** and **Model file** if not auto-detected.
+
+### macOS / Linux — Run from source
+
+Prebuilt releases are Windows-only. macOS and Linux users run directly from source (no build step needed — Python works fine):
 
 ```bash
-# 1. Clone or download
+# 1. Clone
 git clone https://github.com/AmrZriek/TextCorrector.git
 cd TextCorrector
 
 # 2. Create a venv and install dependencies
 python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # macOS/Linux
+source venv/bin/activate
 pip install -r requirements.txt
 
 # 3. Run
 python text_corrector.py
 ```
 
+**macOS extra step:** Grant Accessibility permissions when prompted — System Settings → Privacy & Security → Accessibility.
+
+**Linux extra step:** If the hotkey doesn't register, add your user to the `input` group and re-login:
+```bash
+sudo usermod -aG input $USER
+```
+
 ---
 
 ## Setting up the model
 
-1. **Download a GGUF model** — recommended: **Gemma 4 2B Q4** (~1.5 GB) or **Qwen 3.5 2B Instruct Q4** (~2 GB).
+1. **Download a GGUF model** — recommended: **Gemma 4 E2B Q4_K_XL** (~1.8 GB).
    Run `download_model.bat` (Windows) or `./download_model.sh` (macOS/Linux) for an automated download.
 
 2. **Download `llama-server`** from the [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
-   - Windows: grab the `cuda-12.x-x64` build.
-   - Place the entire extracted folder anywhere (e.g. next to `text_corrector.py`).
-   - Copy CUDA 12 runtime DLLs next to `llama-server.exe` if not already present
-     (they ship with Ollama at `%LOCALAPPDATA%\Programs\Ollama\lib\ollama\cuda_v12\`).
+   - **Windows**: grab the `cuda-12.x-x64` build. Copy CUDA 12 runtime DLLs next to `llama-server.exe` if not already present (they ship with Ollama at `%LOCALAPPDATA%\Programs\Ollama\lib\ollama\cuda_v12\`).
+   - **macOS**: grab the `macos-arm64` build (Apple Silicon) or `macos-x86_64` (Intel). Mark executable: `chmod +x llama-server`.
+   - **Linux**: grab the `ubuntu-x64` build. Mark executable: `chmod +x llama-server`.
+   - Place the extracted folder anywhere (e.g. next to `text_corrector.py`).
 
 3. Open TextCorrector → **Settings** (tray icon or ⚙ in the popup):
-   - **Server binary**: path to `llama-server.exe`
+   - **Server binary**: path to `llama-server` / `llama-server.exe`
    - **Model file**: path to your `.gguf` file
 
 4. The model loads on first hotkey press. Enable **Keep model loaded** in Settings for instant response every time.
@@ -98,11 +115,12 @@ python text_corrector.py
 ## Building a release
 
 ```bash
-pip install pyinstaller
+pip install nuitka
 python build.py
 ```
 
 Produces `dist/TextCorrector_<version>_<platform>.zip` — self-contained, no Python required.
+Uses Nuitka (compiles Python → C → native binary) instead of PyInstaller to avoid Windows Defender false-positive trojan warnings.
 On Windows, `build.py` automatically detects and bundles CUDA 12 runtime DLLs if found.
 
 ---
