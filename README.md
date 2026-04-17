@@ -57,7 +57,7 @@ No Java, no LanguageTool, no internet connection required.
 
 ### macOS / Linux — Run from source
 
-Prebuilt releases are Windows-only. macOS and Linux users run directly from source (no build step needed — Python works fine):
+Prebuilt releases are Windows-only. macOS and Linux users run directly from source (no build step needed — Python works fine) Download the respective llama.cpp backend from https://github.com/ggml-org/llama.cpp:
 
 ```bash
 # 1. Clone
