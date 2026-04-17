@@ -249,11 +249,25 @@ cd "$(dirname "$0")"
 ./TextCorrector
 """
 
-DOWNLOAD_SH = """#!/usr/bin/env bash
-# Download a recommended LLM model for TextCorrector (Qwen 2.5 3B Instruct, Q4_K_M, ~2 GB)
+# Recommended model: Gemma 4 E2B (Unsloth's UD Q4_K_XL quant, ~1.8 GB).
+# E2B = "effective 2B" — Google's distillation of larger Gemma models into
+# ~2B active parameters. Strong instruction following, small enough for
+# integrated GPUs and 4 GB VRAM cards, and crucially handles the patch-JSON
+# format cleanly (unlike the old Qwen 2.5 3B recommendation which was larger
+# and slower without a meaningful quality bump for typo correction).
+# The ?download=true query param is stripped below because some curl builds
+# misparse the query string; the underlying URL works without it.
+_RECOMMENDED_MODEL_URL = (
+    "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/"
+    "gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+)
+_RECOMMENDED_MODEL_FILE = "gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+
+DOWNLOAD_SH = f"""#!/usr/bin/env bash
+# Download the recommended LLM for TextCorrector (Gemma 4 E2B IT, Q4_K_XL, ~1.8 GB)
 # After download, open Settings and point 'Model Path' to this file.
-MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
-DEST="qwen2.5-3b-instruct-q4_k_m.gguf"
+MODEL_URL="{_RECOMMENDED_MODEL_URL}"
+DEST="{_RECOMMENDED_MODEL_FILE}"
 echo "Downloading $DEST ..."
 if command -v curl &>/dev/null; then
     curl -L --progress-bar -o "$DEST" "$MODEL_URL"
@@ -267,9 +281,9 @@ fi
 echo "Done. Open Settings in TextCorrector and set Model Path to: $(pwd)/$DEST"
 """
 
-DOWNLOAD_BAT = r"""@echo off
-set MODEL_URL=https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf
-set DEST=qwen2.5-3b-instruct-q4_k_m.gguf
+DOWNLOAD_BAT = rf"""@echo off
+set MODEL_URL={_RECOMMENDED_MODEL_URL}
+set DEST={_RECOMMENDED_MODEL_FILE}
 echo Downloading %DEST% ...
 curl -L --progress-bar -o "%DEST%" "%MODEL_URL%"
 if errorlevel 1 (
@@ -322,7 +336,7 @@ FIRST RUN
 
 
 # ── Main build ────────────────────────────────────────────────────────────────
-def build(version: str, make_zip: bool):
+def build(version: str, make_zip: bool, keep_folder: bool):
     release_name = f"TextCorrector_{version}_{PLATFORM}"
     out_dir = DIST / release_name
     spec_path = BUILD / "TextCorrector.spec"
@@ -400,6 +414,18 @@ def build(version: str, make_zip: bool):
     if readme.exists():
         shutil.copy(readme, out_dir / "README.md")
 
+    # Logo & checkmark assets — MUST live next to TextCorrector.exe, not in
+    # _internal/. At runtime, when frozen, SCRIPT_DIR resolves to the EXE's
+    # parent directory, and code looks up logo.png / logo.ico / _checkmark.svg
+    # there directly. PyInstaller's datas=[(f, '.')] puts them in _internal/
+    # instead, so we copy them explicitly here. Missing these is the reason
+    # the built app showed no tray icon.
+    for asset in ("logo.png", "logo.ico", "_checkmark.svg"):
+        src = ROOT / asset
+        if src.exists():
+            shutil.copy2(src, out_dir / asset)
+            print(f"  Copied asset: {asset}")
+
     # ── 3. Launcher scripts ───────────────────────────────────────────────
     banner("Step 3 / 4 — Launcher scripts")
     if PLATFORM == "Windows":
@@ -417,7 +443,7 @@ def build(version: str, make_zip: bool):
 
     # ── 4. ZIP ────────────────────────────────────────────────────────────
     if make_zip:
-        banner("Step 4 / 4 — Packaging ZIP")
+        banner("Step 4 / 5 — Packaging ZIP")
         zip_path = DIST / f"{release_name}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for f in sorted(out_dir.rglob("*")):
@@ -426,8 +452,29 @@ def build(version: str, make_zip: bool):
         size_mb = zip_path.stat().st_size / 1_048_576
         print(f"  Created: {zip_path.name}  ({size_mb:.1f} MB)")
     else:
-        banner("Step 4 / 4 — Skipped ZIP (--no-zip)")
+        banner("Step 4 / 5 — Skipped ZIP (--no-zip)")
         print(f"  Output folder: {out_dir}")
+
+    # ── 5. Cleanup ────────────────────────────────────────────────────────
+    # Leave ONLY the ZIP in dist/ so non-technical users see a single artifact.
+    # The PyInstaller scratch folder at build/TextCorrector/ is NOT a runnable
+    # copy (it's missing python313.dll and assets) — if we leave it behind,
+    # users who don't know the difference double-click its EXE and get
+    # "Failed to load Python DLL" errors. The dist/<release>/ folder is
+    # redundant once the ZIP exists. --keep-folder / --no-zip skip cleanup
+    # for local debugging.
+    if make_zip and not keep_folder:
+        banner("Step 5 / 5 — Cleanup")
+        if out_dir.exists():
+            shutil.rmtree(out_dir, ignore_errors=True)
+            print(f"  Removed: dist/{release_name}/")
+        if BUILD.exists():
+            shutil.rmtree(BUILD, ignore_errors=True)
+            print(f"  Removed: build/ (PyInstaller scratch)")
+    else:
+        banner("Step 5 / 5 — Skipped cleanup")
+        if keep_folder:
+            print("  --keep-folder was set; dist/<release>/ and build/ preserved")
 
     banner(f"Build complete!  →  dist/{release_name}")
 
@@ -444,5 +491,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build TextCorrector release")
     parser.add_argument("--version", default=_get_version(), help="Version tag")
     parser.add_argument("--no-zip", action="store_true", help="Skip ZIP creation")
+    parser.add_argument("--keep-folder", action="store_true",
+                        help="Keep dist/<release>/ and build/ after ZIP (for debugging)")
     args = parser.parse_args()
-    build(args.version, not args.no_zip)
+    build(args.version, not args.no_zip, args.keep_folder)

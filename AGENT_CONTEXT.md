@@ -94,6 +94,46 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - The loop terminates early when the result matches the input (converged) or when patch extraction fails (falls back to full-text)
 - For already-correct text, only one pass runs (returns `[]` immediately) — no extra latency
 - The method badge shows pass count when >1 (e.g. "Smart Fix (patch 2x)")
+- Pass 2+ is skipped when pass 1 was a light edit (< 3 word-level changes) on a short text (≤ 100 words) — most typos fully resolve in pass 1, and additional passes on short text just burn latency
+
+### 13. Hotkey re-entrancy guard & notification throttle
+- `TextCorrectorApp._hotkey_busy = threading.Lock()` with non-blocking `acquire(blocking=False)` — rapid repeats from holding the hotkey are dropped, not queued
+- If the correction window is already visible, the hotkey raises/activates it instead of starting a new clipboard flow
+- "No text selected" tray notifications are throttled to ≤ 1 per 3 s via `self._last_empty_notify_ts`
+- Do NOT remove any of these guards — without them, holding the keys spawned overlapping threads, each firing its own notification in a feedback loop
+
+### 14. Sampling params must flow through CLI AND every request payload
+- `load_model()` passes `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`
+- `correct_text_patch()` payload includes the same set (except `temperature`, which is forced to `0.0` for patch-mode determinism)
+- `correct_text()` and `make_stream_worker()` payloads include all seven
+- If you add a new sampling setting, wire it through all three paths — leaving any path unwired means the setting silently has no effect
+
+### 15. First-run setup dialog on blank model_path
+- `TextCorrectorApp.__init__` schedules `_show_first_run()` via `QTimer.singleShot(800, ...)` when `model_path` is blank
+- Dialog offers three paths: "Download recommended" (launches shipped `download_model.bat` / `.sh`), "Browse existing…", and "Skip"
+- Do NOT remove — non-technical users who unzip a fresh release would otherwise see a silent tray icon and have no entry point
+
+### 16. Release builds produce ONE artifact: the ZIP
+- `build.py` deletes `dist/<release>/` and `build/` (PyInstaller scratch) after ZIP creation
+- `--keep-folder` opts out for local debugging; `--no-zip` also preserves folders
+- Reason: users saw `build/TextCorrector/TextCorrector.exe`, double-clicked it, and got "Failed to load Python DLL python313.dll" because that folder is PyInstaller's intermediate scratch (missing assets and python3*.dll). A single ZIP removes the footgun.
+
+### 17. Tiny-model (<1B) safeguards — three layers remain
+- **Load-time warning:** `ModelManager.model_warning` signal + tray popup when `_model_size_billions() < 1.0`
+- **Output guards:** `_is_corrupt_output()` (rejects `[UNK_BYTE_...]`, control chars, ≥2 `▁` artifacts) and `_is_fewshot_echo()` (rejects verbatim few-shot example outputs) apply in both patch and full-text paths
+- **Simplified prompt branch:** when `_is_tiny` (size_b < 1.0), Smart Fix uses a minimal 3-line system prompt instead of the full rule list
+- **DO NOT re-add `response_format.json_schema` to `correct_text_patch()` payload** — grammar-constrained decoding in llama.cpp filters every sampled token, causing 3–10× slowdown that made autocorrect hang on any text. Removed 2026-04-17. The existing output guards are sufficient.
+- Recommended model: Gemma 4 E2B Unsloth UD Q4_K_XL (bundled via `download_model.bat/.sh`, defined as `_RECOMMENDED_MODEL_URL` in `build.py`)
+
+### 18. Context-window math uses server-reported n_ctx + 1.6 tok/word
+- After a successful load, `ModelManager` fetches `/props` and stores `actual_ctx_size` — may be lower than the user-requested `--ctx-size` if the GGUF's metadata caps n_ctx
+- `correct_text_patch()` prefers `actual_ctx_size` over `cfg["context_size"]` so chunking math matches reality
+- Tokens-per-word estimate is **1.6** (not 1.3) — JSON examples with quotes/braces tokenize densely, and the old 1.3 factor underestimated input and caused overflow
+- Output budget is `clamp(estimated_input_tokens × 0.4, 256, 2048)` — scales with input, not a fixed 1024 that wasted ctx on short texts
+
+### 19. Chat first turn embeds user text inline
+- `_send_chat()` when `self.chat_history` is empty builds a single user message: `f"Task: {msg}\n\nText:\n{self.corrected}"`
+- Do NOT revert to the old 3-message prefill (system + fake-user "Here is the text" + fake-assistant "Understood") — that caused Gemma 4 / Qwen to reply "Please provide the text" because the conversation history claimed the text was already acknowledged
 
 ---
 
@@ -263,7 +303,23 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-12 (latest)
+### 2026-04-17 (latest)
+- **Fixed: hotkey unreliable — slow to open, occasionally dead, "no text" spam** — Root cause trio: (a) no re-entrancy guard, so holding the hotkey spawned overlapping `_hotkey_fired` threads that each re-notified; (b) the flow always restarted the clipboard dance even when a window was already open; (c) sleeps were too long (0.1 s / 0.05 s / 20×50 ms polling). Fix: added `threading.Lock` with non-blocking acquire, early-exit raising an existing window, shortened sleeps to 0.03 s and polling to 10×30 ms, throttled "no text selected" notifications to 3 s intervals. Added locked rule #13.
+- **Fixed: sampling params silently ignored** — `load_model()` only passed `--ctx-size` / `--n-gpu-layers`, and `correct_text_patch()` / `make_stream_worker()` payloads only included `top_k` / `top_p`. User changes to `min_p`, `repeat_penalty`, `frequency_penalty`, `presence_penalty` had no effect. Fix: wired all seven sampling params through the CLI plus every request payload. Added locked rule #14.
+- **Fixed: built release output "I don' know if its gona work." for every input** — User had loaded a 270M grammar model that produced tokenizer garbage (`[UNK_BYTE_0xe29681▁released]`, DEL chars). Patch extraction failed → fell back to full-text → model echoed a few-shot example verbatim. Fix: `_is_corrupt_output()` (rejects tokenizer artifacts), `_is_fewshot_echo()` (rejects verbatim example echoes with Jaccard overlap check), both applied in patch and full-text paths. Also added `model_warning` signal that tray-notifies on load when `_model_size_billions() < 1.0`. Added locked rule #17.
+- **Fixed: PyInstaller scratch folder confused users** — Double-clicking `build/TextCorrector/TextCorrector.exe` produced `Failed to load Python DLL 'python313.dll'`. That folder is PyInstaller's intermediate workpath, not a runnable build. Fix: `build.py` now deletes both `dist/<release>/` and `build/` after ZIP creation (with `--keep-folder` opt-out). Release produces exactly one artifact. Added locked rule #16.
+- **Fixed: built app had no logo** — `datas=[(f, '.')]` in the PyInstaller spec routes files to `_internal/`, but code at `SCRIPT_DIR / "logo.png"` looks next to the EXE when frozen. Fix: `build.py` explicitly `shutil.copy2`'s `logo.png` / `logo.ico` / `_checkmark.svg` into `out_dir`.
+- **Fixed: download_model script pointed at ancient Qwen 2.5 3B** — Replaced with Gemma 4 E2B (Unsloth UD Q4_K_XL, ~1.8 GB). Constants `_RECOMMENDED_MODEL_URL` / `_FILE` in `build.py` drive both `.bat` and `.sh` scripts.
+- **Fixed: settings panel sometimes taller than screen** — Hardcoded `setMinimumSize(580, 680)` + `resize(680, 820)` ignored small/laptop screens. Fix: screen-relative clamping via `QApplication.primaryScreen().availableGeometry()` (min = min(hardcoded, 80/85% screen), resize = min(hardcoded, 90% screen), then re-center).
+- **Fixed: chat replied "Please provide the text" despite being given text** — Old prefill used system + fake-user "Here is the text: …" + fake-assistant "Understood. Ready for your question." The model read the history as "text already delivered and acknowledged" and asked the user for new text. Fix: first turn is now a single real user message `"Task: {msg}\n\nText:\n{self.corrected}"`. Added locked rule #19.
+- **Added: first-run setup dialog** — `TextCorrectorApp._show_first_run()` fires via `QTimer.singleShot(800, ...)` when `model_path` is blank. Offers "Download recommended" (launches bundled script in a visible terminal), "Browse existing…", or "Skip". Added locked rule #15.
+- **Added: llama-server auto-detect** — `_find_shipped_llama_server()` scans `SCRIPT_DIR` for any `llama*/llama-server[.exe]`. Makes unzipped releases plug-and-play. `load_model()` persists the discovered path to config.json on first success.
+- **Reverted: JSON-schema-constrained patch decoding** — Added then removed same session. Grammar-constrained decoding caused 3–10× slowdown (every token filtered against schema), making autocorrect hang on longer texts and become extremely slow on shorter ones. `response_format` removed from `correct_text_patch()` payload. Output guards (`_is_corrupt_output`, `_is_fewshot_echo`) remain as the protection layer instead.
+- **Added: tiny-model simplified prompt branch** — When `_model_size_billions(ac_path) < 1.0`, Smart Fix uses a 3-line system prompt instead of the full rule list. Combined with the schema constraint, this lets small models (270M grammar, phi-mini) at least produce valid JSON.
+- **Improved: conditional extra patch passes** — Previously ran up to 3 passes unconditionally. Now pass 2+ is skipped when pass 1 was a light edit (< 3 word-level changes) on a short text (≤ 100 words). Keeps multi-pass benefits on long/dense texts without burning latency on one-typo fixes.
+- **Improved: context-window math** — Raised tok/word estimate from 1.3 to 1.6 (JSON examples tokenize denser than plain English). Output budget is now `clamp(estimated_input × 0.4, 256, 2048)` instead of hardcoded 1024. Added `/props` fetch after load so `actual_ctx_size` reflects the server's real n_ctx even when the GGUF caps it below the user's request. Added locked rule #18.
+
+### 2026-04-12
 - **Fixed: long texts skipping corrections at the end** — Root cause: single-shot patch requests for 3000+ word texts consumed the entire context window, leaving only 256 output tokens for patches. The LLM couldn't generate enough patches to cover the full text, silently dropping corrections at the end. Fix: `correct_text_patch()` now splits long texts into sentence-aligned chunks via `_chunk_text_by_sentences()`, each chunk gets its own LLM request with full output budget. Overhead is estimated from actual prompt content, not a fixed 300-token constant. Added locked rule #11.
 - **Fixed: overcorrecting — LLM inserting periods/commas mid-sentence** — Root cause: patch system prompt said "Add missing periods, question marks, commas" and few-shot examples all appended periods to last words (`"phone"→"phone."`). The LLM generalized this and started adding punctuation everywhere. Fix: removed punctuation-insertion instructions, removed period-appending from examples, removed trailing-period post-fix. Added locked rule #9.
 - **Fixed: custom system prompt caused full rewrite + 2x latency** — `custom_sys or (default)` replaced the entire system prompt, losing "OUTPUT ONLY" constraints. Model added conversational filler → triggered retry. Fix: custom prompt is now appended via `"\n\nAdditional instructions:\n"` to both patch and full-text base prompts. Added locked rule #10.

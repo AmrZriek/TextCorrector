@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QSlider,
+    QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QPoint, QSize
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QCursor, QAction
@@ -136,6 +137,67 @@ def log(msg: str):
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
+
+
+def _model_size_billions(model_path: str) -> float | None:
+    """Parse the parameter count in billions from a GGUF filename.
+
+    Examples:
+        'qwen2.5-3b-instruct-q4_k_m.gguf'     → 3.0
+        'gemma-4-E2B-it-UD-Q4_K_XL.gguf'      → 2.0
+        'gemma3-270m-grammar-q8_0.gguf'       → 0.27
+        'Llama-3.2-1B-Instruct-Q4_K_M.gguf'   → 1.0
+        'phi-mini-3.8b-Q4.gguf'               → 3.8
+
+    Returns None if no size marker is found. Used for UI-side sanity warnings
+    — a 270M model will produce tokenizer garbage in patch mode, and we want
+    to warn the user upfront rather than after a bad correction.
+    """
+    if not model_path:
+        return None
+    name = os.path.basename(model_path).lower()
+    # Match patterns like "3b", "2.5b", "E2B" (effective 2B), "270m", "1.5m"
+    # E-prefix is used by Google's "effective" size branding (E2B = ~2B effective)
+    m = re.search(r"(?:^|[^a-z0-9])e?(\d+(?:\.\d+)?)([bm])(?:[^a-z]|$)", name)
+    if not m:
+        return None
+    value = float(m.group(1))
+    unit = m.group(2)
+    return value if unit == "b" else value / 1000.0
+
+
+# Models smaller than this won't reliably follow the patch-JSON format and
+# will produce tokenizer garbage or few-shot echoes. The number is empirical —
+# Gemma 2B works, a 270M grammar model does not.
+_MIN_RELIABLE_MODEL_B = 1.0
+
+
+def _find_shipped_llama_server() -> str:
+    """Locate a llama-server binary shipped alongside the app.
+
+    Release ZIPs extract to a folder containing TextCorrector.exe plus a
+    sibling directory like `llama-b8728-bin-win-cuda-12.4-x64/` that holds
+    `llama-server.exe`. Users shouldn't have to point Settings at it manually —
+    if we can find it next to the app, auto-use it. Searched locations, in
+    priority order:
+      1. Legacy `llama_cpp/` folder (pre-v4 release layout)
+      2. Any sibling folder matching `llama*` containing the server binary
+    Returns an empty string if nothing is found.
+    """
+    # Legacy location first — if someone upgrades in place, keep their setup
+    legacy = LLAMA_CPP_DIR / SERVER_EXE
+    if legacy.exists():
+        return str(legacy)
+    # Scan SCRIPT_DIR for any folder that looks like an unpacked llama.cpp build
+    try:
+        for entry in SCRIPT_DIR.iterdir():
+            if entry.is_dir() and "llama" in entry.name.lower():
+                candidate = entry / SERVER_EXE
+                if candidate.exists():
+                    return str(candidate)
+    except Exception:
+        pass
+    return ""
 
 
 def has_nvidia() -> bool:
@@ -287,6 +349,73 @@ def contains_meta_commentary(text: str) -> bool:
 # Keep old function names as aliases for backward compatibility
 strip_think = strip_thinking_tokens
 strip_preamble = strip_meta_commentary
+
+
+def _is_corrupt_output(raw: str) -> bool:
+    """Detect tokenizer-garbage output from undersized/incompatible models.
+
+    Logged examples from a 270M model:
+        'samsung\\x7freleased a new phone'
+        'samsung[UNK_BYTE_0xe29681▁released]released'
+        'The[UNK_BYTE_0xe29681▁phone]phone[UNK_BYTE_0xe29681▁was]was...'
+
+    These show raw BPE/SentencePiece artifacts leaking through. Treating them
+    as "valid corrections" is worse than returning the original text, since
+    they silently corrupt the user's clipboard paste.
+    """
+    if not raw:
+        return False
+    # Known tokenizer artifact markers
+    if "[UNK_BYTE_" in raw:
+        return True
+    # DEL / NAK / SOH / other C0 control chars (except \n\t\r)
+    if any(ord(c) < 0x20 and c not in "\n\t\r" for c in raw):
+        return True
+    if "\x7f" in raw:
+        return True
+    # Multiple ▁ (SentencePiece word marker U+2581) means the tokenizer's
+    # internal representation is leaking, not real output
+    if raw.count("\u2581") >= 2:
+        return True
+    return False
+
+
+# Few-shot example outputs that small models occasionally echo verbatim instead
+# of actually processing the user's text. If the model returns ONLY one of
+# these (ignoring whitespace/case) for arbitrary input, we reject it.
+_FEWSHOT_ECHOES = {
+    "i don't know if it's gonna work.",
+    "i dont know if its gonna work",
+    "the project was delayed because of bad weather.",
+    "the project were delayed because of bad weather",
+    "samsung released a new phone",
+    "samsung released a new phone.",
+}
+
+
+def _is_fewshot_echo(raw: str, original: str) -> bool:
+    """Return True if `raw` is a verbatim few-shot example output unrelated to
+    the user's actual input. Tiny models (<1B params) frequently do this when
+    they fail to follow the instruction — they just regurgitate the last
+    assistant message from the prompt.
+    """
+    if not raw:
+        return False
+    normalized = raw.strip().lower()
+    if normalized not in _FEWSHOT_ECHOES:
+        return False
+    # If the user's input happens to actually match the example, it's not an
+    # echo — it's a legitimate correction. Compare loosely to avoid false
+    # positives on inputs that are close to but not exactly the example.
+    orig_normalized = original.strip().lower()
+    # Any meaningful word overlap means it could be genuine
+    orig_words = set(re.findall(r"\w+", orig_normalized))
+    echo_words = set(re.findall(r"\w+", normalized))
+    if orig_words and echo_words:
+        overlap_ratio = len(orig_words & echo_words) / len(orig_words | echo_words)
+        if overlap_ratio > 0.5:
+            return False
+    return True
 
 
 def _apply_patches(original: str, patches: list[dict]) -> str:
@@ -914,6 +1043,10 @@ class ModelManager(QObject):
     status_changed = pyqtSignal(str)
     model_loaded = pyqtSignal()
     model_unloaded = pyqtSignal()
+    # Fires after load if the model is too small to reliably follow the patch
+    # prompt format. Parent app surfaces this as a tray message so users don't
+    # silently get garbage corrections.
+    model_warning = pyqtSignal(str)
 
     def __init__(
         self,
@@ -934,6 +1067,11 @@ class ModelManager(QObject):
         self.last_used = None
         self.loading = False
         self._lock = threading.Lock()
+        # Actual context size as reported by llama-server's /props endpoint
+        # after load. This may differ from cfg["context_size"] when the model's
+        # metadata caps n_ctx lower than the user-requested value (common with
+        # older GGUFs). None until the first successful load.
+        self.actual_ctx_size: int | None = None
 
     # ── internal helpers ──────────────────────────────────────────────────
     def _base_url(self) -> str:
@@ -966,13 +1104,17 @@ class ModelManager(QObject):
         self.status_changed.emit("Starting server…")
         log(f"[{self.label}] Loading model: {model_path}")
 
-        server_path = self.cfg.get("llama_server_path", str(LLAMA_CPP_DIR / SERVER_EXE))
-        if not Path(server_path).exists():
-            for name in [SERVER_EXE, "llama-server"]:
-                candidate = LLAMA_CPP_DIR / name
-                if candidate.exists():
-                    server_path = str(candidate)
-                    break
+        # Resolve llama-server path. The shipped build has `llama-server` inside
+        # a sibling folder like `llama-b8728-bin-win-cuda-12.4-x64/`, not the
+        # legacy `llama_cpp/` dir. Scan SCRIPT_DIR for any `llama*/llama-server`
+        # so the app is plug-and-play for users who just unzipped the release.
+        server_path = self.cfg.get("llama_server_path", "")
+        if not server_path or not Path(server_path).exists():
+            server_path = _find_shipped_llama_server()
+            if server_path:
+                log(f"[{self.label}] Auto-detected llama-server: {server_path}")
+                # Persist so the auto-detect only happens once
+                self.cfg.set("llama_server_path", server_path)
             else:
                 self.loading = False
                 self.status_changed.emit("llama-server not found")
@@ -988,6 +1130,11 @@ class ModelManager(QObject):
         host = self.cfg.get("server_host", "127.0.0.1")
         port = self.cfg.get("server_port", 8080)
 
+        # Pass all sampling defaults on the CLI too. llama-server uses these as
+        # fallbacks when a request omits a given field, and some endpoints (e.g.
+        # /completion from non-SDK callers) only honor CLI values. The per-request
+        # payloads still override these when set — this just prevents hardcoded
+        # server defaults from masking user settings.
         cmd = [
             server_path,
             "--model",
@@ -1002,6 +1149,13 @@ class ModelManager(QObject):
             str(port),
             "--reasoning", "off",
             "--no-warmup",
+            "--temp", str(self.cfg.get("temperature", 0.1)),
+            "--top-k", str(self.cfg.get("top_k", 40)),
+            "--top-p", str(self.cfg.get("top_p", 0.95)),
+            "--min-p", str(self.cfg.get("min_p", 0.05)),
+            "--repeat-penalty", str(self.cfg.get("repeat_penalty", 1.0)),
+            "--frequency-penalty", str(self.cfg.get("frequency_penalty", 0.0)),
+            "--presence-penalty", str(self.cfg.get("presence_penalty", 0.0)),
         ]
 
         try:
@@ -1079,6 +1233,41 @@ class ModelManager(QObject):
             self.status_changed.emit(f"Ready — {name}")
             self.model_loaded.emit()
             log(f"[{self.label}] Model ready: {name}")
+
+            # Ask the server for the *actual* loaded context size. The user's
+            # requested --ctx-size is a ceiling, not a guarantee — some GGUFs
+            # cap n_ctx lower in their metadata. Chunking math must use the
+            # real value or we'll overflow and the model drops tail tokens.
+            try:
+                pr = requests.get(self._base_url() + "/props", timeout=3)
+                if pr.ok:
+                    jp = pr.json()
+                    # llama.cpp exposes n_ctx either at the top level or under
+                    # default_generation_settings depending on server version
+                    n_ctx = (
+                        jp.get("default_generation_settings", {}).get("n_ctx")
+                        or jp.get("n_ctx")
+                    )
+                    if isinstance(n_ctx, int) and n_ctx > 0:
+                        self.actual_ctx_size = n_ctx
+                        log(f"[{self.label}] /props reports n_ctx={n_ctx}")
+            except Exception as e:
+                log(f"[{self.label}] /props fetch failed (non-fatal): {e}")
+
+            # Warn if the model is too small for reliable patch-mode output.
+            # Tiny models (<1B) produce tokenizer garbage or echo few-shot
+            # examples verbatim — the echo-guard will catch it at correction
+            # time, but a heads-up at load time is friendlier than a silent
+            # "try a larger model" error after the user's first attempt.
+            size_b = _model_size_billions(model_path)
+            if size_b is not None and size_b < _MIN_RELIABLE_MODEL_B:
+                warn = (
+                    f"'{name}' is ~{size_b:g}B parameters. Models smaller than "
+                    f"~1B may produce garbled or echoed output. Recommended: "
+                    f"Gemma 4 E2B or larger."
+                )
+                log(f"[{self.label}] WARNING: {warn}")
+                self.model_warning.emit(warn)
             return True
 
         except Exception as e:
@@ -1327,21 +1516,30 @@ class ModelManager(QObject):
         # a generous output budget (1024 tokens ≈ ~50 patches), and split
         # longer texts into sentence-aligned chunks that each get a full pass.
         word_count = len(text.split())
-        ctx_size = self.cfg.get("context_size", 4096)
+        # Prefer the server-reported n_ctx over the user-configured value —
+        # if the GGUF's metadata capped n_ctx below what the user requested,
+        # our math must match reality or we overflow and tail tokens drop.
+        ctx_size = self.actual_ctx_size or self.cfg.get("context_size", 4096)
 
-        # Estimate overhead from the actual system prompt + example messages,
-        # not a fixed guess. Each word ≈ 1.3 tokens; +100 for chat template
-        # special tokens (BOS, role markers, etc.)
+        # Estimate overhead from the actual system prompt + example messages.
+        # 1.6 tokens/word is a safer average than 1.3 for patch-mode traffic:
+        # JSON examples (with quotes, braces, commas) tokenize much denser than
+        # plain English, and the old 1.3 factor underestimated input, causing
+        # context overflow when chunking long texts.
         prefix_text = system + " ".join(
             m.get("content", "") for m in (examples or [])
         )
-        overhead = int(len(prefix_text.split()) * 1.3) + 100
+        overhead = int(len(prefix_text.split()) * 1.6) + 100
 
-        min_output_budget = 1024  # enough tokens for ~50 patches per chunk
+        # Dynamic output budget: previously hardcoded 1024 which wasted context
+        # on short inputs and sometimes wasn't enough for very dense edits.
+        # Scale with input size (≈40% of input tokens) with sensible floor/ceiling.
+        est_input_tokens = int(word_count * 1.6) + overhead
+        min_output_budget = max(256, min(int(est_input_tokens * 0.4), 2048))
         max_input_tokens = ctx_size - overhead - min_output_budget
         # Convert token budget to word budget; floor at 50 so tiny contexts
         # don't produce degenerate 5-word chunks
-        max_chunk_words = max(int(max_input_tokens / 1.3), 50)
+        max_chunk_words = max(int(max_input_tokens / 1.6), 50)
 
         if word_count > max_chunk_words:
             chunks = _chunk_text_by_sentences(text, max_chunk_words)
@@ -1365,19 +1563,30 @@ class ModelManager(QObject):
 
             messages = msg_prefix + [{"role": "user", "content": chunk_text}]
 
-            # Token budget for THIS chunk (same formula as before, but per-chunk)
+            # Token budget for THIS chunk (same formula as before, but per-chunk).
+            # 1.6 tokens/word matches the chunking math above.
             cw = len(chunk_text.split())
-            est_input = int(cw * 1.3) + overhead
+            est_input = int(cw * 1.6) + overhead
             max_output = max(ctx_size - est_input, 256)
             # ~20 tokens per input word covers dense-error scenarios
             patch_tokens = min(max(cw * 20, 128), max_output)
 
+            # Patch mode intentionally forces temperature=0.0 for deterministic
+            # JSON output — the user's configured temperature is respected for
+            # full-text mode but would destabilize patch extraction here.
+            # All other sampling params come from config so the user's settings
+            # actually apply (previously min_p / repeat_penalty / freq / presence
+            # were silently ignored in patch mode).
             payload = {
                 "messages": messages,
                 "max_tokens": patch_tokens,
                 "temperature": 0.0,
                 "top_k": self.cfg.get("top_k", 40),
                 "top_p": self.cfg.get("top_p", 0.95),
+                "min_p": self.cfg.get("min_p", 0.05),
+                "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
+                "frequency_penalty": self.cfg.get("frequency_penalty", 0.0),
+                "presence_penalty": self.cfg.get("presence_penalty", 0.0),
                 "stream": False,
                 "think": False,
             }
@@ -1409,6 +1618,20 @@ class ModelManager(QObject):
                     if total_chunks == 1:
                         return None  # single-shot: fall back to full-text
                     # Multi-chunk: keep original text for this chunk, continue
+                    corrected_parts.append((chunk_text, separator))
+                    continue
+
+                # Tokenizer-garbage detection: undersized / incompatible models
+                # sometimes emit raw BPE artifacts ([UNK_BYTE_...], ▁, DEL chars)
+                # instead of JSON. Trying to parse patches out of this wastes
+                # time and log space — bail out to the full-text fallback path.
+                if _is_corrupt_output(raw):
+                    log(
+                        f"[{self.label}] Corrupt patch output from "
+                        f"chunk {chunk_idx + 1}: {repr(raw[:120])}"
+                    )
+                    if total_chunks == 1:
+                        return None
                     corrected_parts.append((chunk_text, separator))
                     continue
 
@@ -1547,12 +1770,19 @@ class ModelManager(QObject):
     def make_stream_worker(
         self, messages: list, max_tokens: int = 1024
     ) -> StreamWorker:
+        # Include all sampling params the user configured. Previously min_p,
+        # repeat_penalty, frequency_penalty, and presence_penalty were missing,
+        # so changing them in settings had no effect on streaming chat output.
         payload = {
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": self.cfg.get("temperature", 0.3),
             "top_k": self.cfg.get("top_k", 40),
             "top_p": self.cfg.get("top_p", 0.95),
+            "min_p": self.cfg.get("min_p", 0.05),
+            "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
+            "frequency_penalty": self.cfg.get("frequency_penalty", 0.0),
+            "presence_penalty": self.cfg.get("presence_penalty", 0.0),
             "think": False,
         }
         return StreamWorker(self._chat_url(), payload)
@@ -1728,10 +1958,31 @@ class SettingsDialog(QDialog):
         self._re_register_cb = re_register_cb
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self._drag_pos = None
-        self.setMinimumSize(580, 680)
-        self.resize(680, 820)
+        # Clamp dimensions to the current screen so the dialog never opens
+        # taller than the display (observed on 1366×768 / 1440×900 laptops
+        # where the default 820 px height pushed buttons off-screen).
+        # Minimum shrinks too — a 680 px minimum on a 720 px-tall screen is
+        # unusable once the taskbar eats some space.
+        screen = QApplication.primaryScreen()
+        sr = screen.availableGeometry() if screen else None
+        if sr:
+            max_h = int(sr.height() * 0.9)
+            min_h = min(680, int(sr.height() * 0.8))
+            max_w = int(sr.width() * 0.9)
+            min_w = min(580, int(sr.width() * 0.85))
+            self.setMinimumSize(min_w, min_h)
+            self.resize(min(680, max_w), min(820, max_h))
+        else:
+            self.setMinimumSize(580, 680)
+            self.resize(680, 820)
         self._build_ui()
         self._load()
+        # Re-center on the screen after UI is built so the dialog can never
+        # land with half of it outside the visible area
+        if sr:
+            geo = self.frameGeometry()
+            geo.moveCenter(sr.center())
+            self.move(geo.topLeft())
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -2416,21 +2667,42 @@ class CorrectionWindow(QWidget):
             _EX2_INPUT = "i dont know if its gona work"
 
             if mode == 1:
-                # Smart Fix mode: patch-based, aggressive, outputs only changed words
-                patch_system = (
-                    "You are a text correction engine. Output ONLY a JSON array of patches.\n"
-                    "Each patch has exactly two keys: 'old' (wrong word/phrase) and 'new' (corrected replacement).\n\n"
-                    "CRITICAL RULES:\n"
-                    "- Fix spelling errors, grammar mistakes, and missing apostrophes in contractions.\n"
-                    "- Capitalize first letter of sentences, proper nouns, and 'I'.\n"
-                    "- Fix apostrophes: dont→don't, its→it's (when meaning 'it is'), im→I'm, doesnt→doesn't.\n"
-                    "- Do NOT add new punctuation (periods, commas, semicolons) that the user did not write.\n"
-                    "- Do NOT split or restructure sentences.\n"
-                    "- Only include words that need changing — omit correct words entirely.\n"
-                    "- Keep patches short: 1-4 words max.\n"
-                    "- If text is perfect, output [].\n"
-                    "- Output ONLY the JSON array, nothing else."
+                # Pick prompt complexity by model size. Small models (<1B) drown
+                # in the detailed rule list below and drift off-task; a stripped
+                # prompt plus the JSON-schema grammar constraint (in
+                # correct_text_patch) is enough to keep them producing valid
+                # patches. Larger models benefit from the richer rules — they
+                # can actually act on the nuances (e.g. "its" vs "it's").
+                _ac_path = (
+                    self.cfg.get("model_path", "")
+                    if self.cfg.get("ac_same_as_chat", True)
+                    else self.cfg.get("ac_model_path", "")
                 )
+                _size_b = _model_size_billions(_ac_path)
+                _is_tiny = _size_b is not None and _size_b < _MIN_RELIABLE_MODEL_B
+
+                # Smart Fix mode: patch-based, aggressive, outputs only changed words
+                if _is_tiny:
+                    patch_system = (
+                        "Fix typos, grammar, apostrophes, and capitalization.\n"
+                        'Output ONLY a JSON array of {"old": "...", "new": "..."} objects.\n'
+                        "Only include words that need changing. Use [] if text is perfect."
+                    )
+                else:
+                    patch_system = (
+                        "You are a text correction engine. Output ONLY a JSON array of patches.\n"
+                        "Each patch has exactly two keys: 'old' (wrong word/phrase) and 'new' (corrected replacement).\n\n"
+                        "CRITICAL RULES:\n"
+                        "- Fix spelling errors, grammar mistakes, and missing apostrophes in contractions.\n"
+                        "- Capitalize first letter of sentences, proper nouns, and 'I'.\n"
+                        "- Fix apostrophes: dont→don't, its→it's (when meaning 'it is'), im→I'm, doesnt→doesn't.\n"
+                        "- Do NOT add new punctuation (periods, commas, semicolons) that the user did not write.\n"
+                        "- Do NOT split or restructure sentences.\n"
+                        "- Only include words that need changing — omit correct words entirely.\n"
+                        "- Keep patches short: 1-4 words max.\n"
+                        "- If text is perfect, output [].\n"
+                        "- Output ONLY the JSON array, nothing else."
+                    )
                 # Inject custom instructions into patch prompt if set
                 if custom_sys:
                     patch_system += f"\n\nAdditional instructions:\n{custom_sys}"
@@ -2448,10 +2720,16 @@ class CorrectionWindow(QWidget):
                 # pass catches what the first missed — similar to how GECToR uses
                 # iterative refinement. Converges quickly: pass 1 fixes most errors,
                 # pass 2 catches stragglers, pass 3 usually returns [].
+                #
+                # Conditional additional passes: 3 passes on every short sentence
+                # is wasteful — most typos are fully fixed in pass 1. Only keep
+                # iterating when pass 1 was a heavy edit (≥3 word-level changes)
+                # OR the text is long (>100 words, where missed edits are likely).
                 MAX_PATCH_PASSES = 3
                 current_text = text
                 patch_failed = False
                 total_passes = 0
+                word_count = len(text.split())
 
                 for pass_num in range(1, MAX_PATCH_PASSES + 1):
                     log(f"[CW] Smart Fix pass {pass_num}/{MAX_PATCH_PASSES}")
@@ -2467,7 +2745,23 @@ class CorrectionWindow(QWidget):
                         # Converged — no more changes found
                         log(f"[CW] Patch converged after {pass_num} pass(es)")
                         break
+
+                    # Approximate word-level edit count: unequal positions plus
+                    # the length delta. Enough precision to distinguish "fixed
+                    # one typo" from "heavily rewrote the sentence".
+                    prev_words = current_text.split()
+                    new_words = result.split()
+                    changes = abs(len(prev_words) - len(new_words)) + sum(
+                        1 for a, b in zip(prev_words, new_words) if a != b
+                    )
                     current_text = result
+
+                    if pass_num == 1 and word_count <= 100 and changes < 3:
+                        log(
+                            f"[CW] Patch pass 1 was light "
+                            f"({changes} edits, {word_count} words) — skipping further passes"
+                        )
+                        break
 
                 if not patch_failed:
                     if current_text == text:
@@ -2498,8 +2792,24 @@ class CorrectionWindow(QWidget):
                     {"role": "assistant", "content": "I don't know if it's gonna work."},
                 ]
                 result = self.ac_model.correct_text(text, system=full_system, examples=full_examples)
+                # Guard against two failure modes seen with undersized models:
+                #   1. Tokenizer garbage ([UNK_BYTE_...], control chars, leaking ▁)
+                #   2. Regurgitating a few-shot example output verbatim
+                # Both corrupt the user's text silently if pasted — return the
+                # original with a clear warning instead.
                 if result is not None and result.strip():
-                    self._correction_ready.emit(result, "Smart Fix (full-text)")
+                    if _is_corrupt_output(result):
+                        log(f"[CW] Corrupt output detected, rejecting: {repr(result[:100])}")
+                        self._correction_ready.emit(
+                            text, "Model output invalid — try a larger model"
+                        )
+                    elif _is_fewshot_echo(result, text):
+                        log(f"[CW] Few-shot echo detected, rejecting: {repr(result[:100])}")
+                        self._correction_ready.emit(
+                            text, "Model echoed example — try a larger model"
+                        )
+                    else:
+                        self._correction_ready.emit(result, "Smart Fix (full-text)")
                 else:
                     self._correction_ready.emit(text, "No changes (model error)")
 
@@ -2525,8 +2835,20 @@ class CorrectionWindow(QWidget):
                 ]
                 log("[CW] Conservative mode: full-text, typos only")
                 result = self.ac_model.correct_text(text, system=full_system, examples=full_examples)
+                # Same guards as Smart Fix fallback — reject corrupt / echoed output
                 if result is not None and result.strip():
-                    self._correction_ready.emit(result, "Conservative")
+                    if _is_corrupt_output(result):
+                        log(f"[CW] Corrupt output detected, rejecting: {repr(result[:100])}")
+                        self._correction_ready.emit(
+                            text, "Model output invalid — try a larger model"
+                        )
+                    elif _is_fewshot_echo(result, text):
+                        log(f"[CW] Few-shot echo detected, rejecting: {repr(result[:100])}")
+                        self._correction_ready.emit(
+                            text, "Model echoed example — try a larger model"
+                        )
+                    else:
+                        self._correction_ready.emit(result, "Conservative")
                 else:
                     self._correction_ready.emit(text, "No changes (model error)")
 
@@ -2610,19 +2932,22 @@ class CorrectionWindow(QWidget):
             "shorten, change tone, or otherwise modify the text. "
             "Respond with ONLY the new text unless the user explicitly asks a question."
         )
+        # On the FIRST chat turn, embed the text directly in the user message
+        # (not via a fake prefilled assistant reply). Small models (<2B)
+        # frequently ignored the prefill trick and replied "Please provide the
+        # text." — because from their point of view the user just asked a
+        # question with no content attached. Putting the text in the actual
+        # user turn is the format every instruction-tuned model handles.
+        # On subsequent turns, the prior assistant reply is in-context already,
+        # so we just append the new instruction.
         if not self.chat_history:
-            self.chat_history = [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": f"Here is the text to work with:\n\n{self.corrected}",
-                },
-                {
-                    "role": "assistant",
-                    "content": "Understood. I'm ready to help modify this text.",
-                },
-            ]
-        self.chat_history.append({"role": "user", "content": msg})
+            self.chat_history = [{"role": "system", "content": system}]
+            self.chat_history.append({
+                "role": "user",
+                "content": f"Task: {msg}\n\nText:\n{self.corrected}",
+            })
+        else:
+            self.chat_history.append({"role": "user", "content": msg})
 
         # When ac_same_as_chat=True, the AC server handles chat too — never kill it to load a second one
         if self.cfg.get("ac_same_as_chat", True) and self.ac_model.is_loaded():
@@ -2795,6 +3120,14 @@ class TextCorrectorApp(QApplication):
         )
         self._window: CorrectionWindow | None = None
         self._old_clip = ""
+        # Hotkey re-entrancy guard — holding the keys or rapid repeat presses
+        # used to spawn overlapping _hotkey_fired threads, each firing its own
+        # "no text selected" notification in a feedback loop. This lock ensures
+        # only one hotkey flow runs at a time.
+        self._hotkey_busy = threading.Lock()
+        # Throttle for the "no text selected" tray notification — prevents the
+        # infinite reappear-on-close glitch the user reported
+        self._last_empty_notify_ts = 0.0
 
         self._trigger.connect(self._show_window)
         self._notify.connect(self._show_notify)
@@ -2803,6 +3136,9 @@ class TextCorrectorApp(QApplication):
         self.ac_model.model_loaded.connect(lambda: self._set_tray_icon("#3b82f6"))
         self.chat_model.model_loaded.connect(lambda: self._set_tray_icon("#a78bfa"))
         self.chat_model.model_unloaded.connect(lambda: self._set_tray_icon("#475569"))
+        # Surface tiny-model warnings to the user once, at load time
+        self.ac_model.model_warning.connect(self._show_model_warning)
+        self.chat_model.model_warning.connect(self._show_model_warning)
 
         self._build_tray()
         self._register_hotkey()
@@ -2822,6 +3158,13 @@ class TextCorrectorApp(QApplication):
         # Check for llama.cpp updates 5 s after boot (non-blocking)
         self._update_checker: UpdateChecker | None = None
         QTimer.singleShot(5000, self._check_llama_update)
+
+        # First-run setup: if no model is configured, prompt the user to
+        # either download the recommended one or browse for an existing file.
+        # Non-technical users who just unzipped the release would otherwise see
+        # a silent tray icon and have no idea what to do next.
+        if not self.cfg.get("model_path", ""):
+            QTimer.singleShot(800, self._show_first_run)
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(make_tray_icon("#475569"), self)
@@ -2940,23 +3283,48 @@ class TextCorrectorApp(QApplication):
             )
 
     def _hotkey_fired(self):
+        # Re-entrancy guard: drop rapid repeat fires (e.g. from holding the
+        # keys down) rather than queueing them up. acquire(blocking=False)
+        # returns immediately so the keyboard thread never stalls.
+        if not self._hotkey_busy.acquire(blocking=False):
+            log("[Hotkey] Fired but already busy — ignoring")
+            return
         log("[Hotkey] Fired")
         try:
+            # If the correction window is already open, just bring it to the
+            # front instead of starting a new copy-and-popup flow. Prevents the
+            # "notification spam" symptom where closing one popup triggers a
+            # second capture that also finds nothing selected.
+            if self._window and self._window.isVisible():
+                log("[Hotkey] Window already open — focusing instead")
+                try:
+                    self._window.raise_()
+                    self._window.activateWindow()
+                except Exception:
+                    pass
+                return
+
             for k in ("ctrl", "shift", "alt"):
                 try:
                     keyboard.release(k)
                 except Exception:
                     pass
-            time.sleep(0.1)
+            # 30 ms is enough for the OS to register modifier release on every
+            # system we've tested. The old 100 ms sleep added up to a full
+            # second of perceived hotkey latency across the full flow.
+            time.sleep(0.03)
 
             self._old_clip = pyperclip.paste()
             pyperclip.copy("")
-            time.sleep(0.05)
+            time.sleep(0.03)
             keyboard.send("ctrl+c")
 
+            # Poll up to ~300 ms (10 × 30 ms) instead of 1 s (20 × 50 ms).
+            # Almost every real copy completes in under 100 ms; the old ceiling
+            # just made the "nothing was copied" case feel slow.
             selected = ""
-            for _ in range(20):
-                time.sleep(0.05)
+            for _ in range(10):
+                time.sleep(0.03)
                 try:
                     clip = pyperclip.paste()
                     if clip:
@@ -2970,12 +3338,35 @@ class TextCorrectorApp(QApplication):
             else:
                 if self._old_clip:
                     pyperclip.copy(self._old_clip)
-                self._notify.emit(
-                    "No text selected. Select text first, then press the hotkey.",
-                    "info",
-                )
+                # Throttle: show "no text selected" at most once every 3 s.
+                # Without this, a stuck-hotkey or focus-loss loop could spawn
+                # dozens of identical toasts that reappear as fast as the user
+                # dismisses them.
+                now = time.monotonic()
+                if now - self._last_empty_notify_ts > 3.0:
+                    self._last_empty_notify_ts = now
+                    self._notify.emit(
+                        "No text selected. Select text first, then press the hotkey.",
+                        "info",
+                    )
+                else:
+                    log("[Hotkey] Empty selection — suppressing notification (throttled)")
         except Exception as e:
             log(f"[Hotkey] Error: {e}")
+        finally:
+            # Always release the lock, even on exception — otherwise the first
+            # error permanently disables the hotkey until app restart.
+            self._hotkey_busy.release()
+
+    def _show_model_warning(self, msg: str):
+        # Longer duration (6s) than standard notifications — this is a sticky
+        # heads-up, not a quick confirmation, and users need time to read it
+        self.tray.showMessage(
+            "TextCorrector — Model warning",
+            msg,
+            QSystemTrayIcon.MessageIcon.Warning,
+            6000,
+        )
 
     def _show_notify(self, msg: str, icon: str):
         ico = (
@@ -3039,6 +3430,70 @@ class TextCorrectorApp(QApplication):
         )
         if path:
             self._select_model(path)
+
+    def _show_first_run(self):
+        # Bail if the user already chose a model while the timer was pending
+        # (e.g. via settings or tray menu), or if they've dismissed this
+        # welcome before and the flag was set.
+        if self.cfg.get("model_path", ""):
+            return
+
+        box = QMessageBox()
+        box.setWindowTitle("Welcome to TextCorrector")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("TextCorrector needs a language model to work.")
+        dl_name = "download_model.bat" if WINDOWS else "download_model.sh"
+        box.setInformativeText(
+            "You can:\n\n"
+            f"  • Download the recommended model (~1.8 GB) — runs {dl_name} in a terminal\n"
+            "  • Browse to an existing .gguf file you already have\n"
+            "  • Skip for now and configure from Settings later"
+        )
+        dl_btn = box.addButton("Download recommended", QMessageBox.ButtonRole.AcceptRole)
+        br_btn = box.addButton("Browse existing…", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(dl_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is dl_btn:
+            self._run_download_script()
+        elif clicked is br_btn:
+            self._browse_model()
+
+    def _run_download_script(self):
+        """Launch the bundled download_model script in a visible terminal so
+        the user can watch progress. Falls back to opening the release folder
+        if the script is missing (e.g. dev launch)."""
+        script = SCRIPT_DIR / ("download_model.bat" if WINDOWS else "download_model.sh")
+        if not script.exists():
+            # Dev mode or corrupted unzip — just reveal the folder so the user
+            # can grab the model manually.
+            self.tray.showMessage(
+                "TextCorrector",
+                f"Download script not found at {script.name}. Please download a GGUF model manually.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
+            return
+        try:
+            if WINDOWS:
+                # start "" opens the .bat in its own console window so the user
+                # sees curl's progress bar instead of a silent background fetch
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", str(script)],
+                    cwd=str(SCRIPT_DIR),
+                )
+            else:
+                subprocess.Popen(["bash", str(script)], cwd=str(SCRIPT_DIR))
+        except Exception as e:
+            log(f"[FirstRun] Failed to launch download script: {e}")
+            self.tray.showMessage(
+                "TextCorrector",
+                f"Could not launch {script.name}: {e}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
 
     def _select_model(self, path: str):
         self.cfg.set("model_path", path)
