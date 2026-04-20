@@ -56,6 +56,18 @@ ROOT = Path(__file__).parent.resolve()
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 
+# ── Venv auto-relaunch ────────────────────────────────────────────────────────
+# If a local venv exists and we're NOT already running from it, re-exec via
+# the venv Python so Nuitka and all app dependencies are available.
+_venv_py = (
+    ROOT / "venv" / "Scripts" / "python.exe"
+    if sys.platform == "win32"
+    else ROOT / "venv" / "bin" / "python"
+)
+if _venv_py.exists() and Path(sys.executable).resolve() != _venv_py.resolve():
+    print(f"[build] Re-launching with venv Python: {_venv_py}")
+    sys.exit(subprocess.run([str(_venv_py)] + sys.argv).returncode)
+
 PLATFORM = {
     "win32": "Windows",
     "darwin": "macOS",

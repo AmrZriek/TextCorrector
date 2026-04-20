@@ -136,7 +136,7 @@ All settings are editable via the Settings dialog. `config.json` is created in t
 | `ac_model_path` | `""` | Path to GGUF model file (autocorrect) |
 | `ac_same_as_chat` | `true` | Reuse the chat model for autocorrect (one server) |
 | `gpu_layers` | `99` | GPU offload layers (0 = CPU only) |
-| `context_size` | `4096` | LLM context window (tokens) |
+| `context_size` | `12800` | LLM context window (tokens) |
 | `keep_model_loaded` | `true` | Keep LLM in memory between uses |
 | `hotkey` | `ctrl+shift+space` | Global trigger hotkey |
 | `correction_mode` | `1` | 0 = conservative, 1 = smart fix (patch-based) |

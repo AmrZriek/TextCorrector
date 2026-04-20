@@ -129,12 +129,14 @@ class UpdateChecker(QThread):
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_log_lock = threading.Lock()
 
 def log(msg: str):
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
+        with _log_lock:
+            with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
 
@@ -541,6 +543,15 @@ def _apply_patches(original: str, patches: list[dict]) -> str:
         post_applied += 1
         log("[PATCH] Post-fix: capitalized after sentence-ending punctuation")
 
+    # 5. Restore trailing punctuation if stripped
+    if original and original[-1] in ".?!":
+        if not result.endswith(original[-1]):
+            # If the result ends with some other punctuation, don't double up
+            if result and result[-1] not in ".?!":
+                result += original[-1]
+                post_applied += 1
+                log(f"[PATCH] Post-fix: restored trailing '{original[-1]}'")
+
     if post_applied:
         log(f"[PATCH] Post-processing applied {post_applied} additional fix(es)")
 
@@ -672,6 +683,21 @@ def _extract_patches_from_response(raw: str) -> list[dict] | None:
     except (json.JSONDecodeError, ValueError):
         pass
 
+    # Salvage valid objects from truncated or malformed output
+    salvaged = []
+    # Match anything that looks like a JSON object { ... }
+    # non-greedy to avoid matching the whole array as one object
+    for match in re.finditer(r'\{[^{}]*\}', cleaned):
+        try:
+            obj = json.loads(match.group(0))
+            if isinstance(obj, dict) and "old" in obj and "new" in obj:
+                salvaged.append(obj)
+        except Exception:
+            pass
+
+    if salvaged:
+        return salvaged
+
     # Try to find JSON array in the text
     array_match = re.search(r"\[[\s\S]*\]", cleaned)
     if array_match:
@@ -763,7 +789,7 @@ DEFAULT_CONFIG: dict = {
     "model_path": "",
     "server_host": "127.0.0.1",
     "server_port": 8080,
-    "context_size": 4096,
+    "context_size": 12800,
     "gpu_layers": 99,
     "temperature": 0.1,
     "top_k": 40,
@@ -1089,7 +1115,7 @@ class ModelManager(QObject):
         return self.server_process is not None and self.server_process.poll() is None
 
     # ── load ──────────────────────────────────────────────────────────────
-    def load_model(self) -> bool:
+    def load_model(self, force_cpu: bool = False) -> bool:
         with self._lock:
             if self.loading:
                 return False
@@ -1122,8 +1148,10 @@ class ModelManager(QObject):
 
         gpu_detected = has_nvidia()
         log(f"[{self.label}] GPU detection: has_nvidia()={gpu_detected}")
-        gpu_layers = self.cfg.get("gpu_layers", 99)
-        if not gpu_detected and gpu_layers > 0:
+        gpu_layers = 0 if force_cpu else self.cfg.get("gpu_layers", 99)
+        if force_cpu:
+            log(f"[{self.label}] force_cpu=True — overriding gpu_layers to 0")
+        elif not gpu_detected and gpu_layers > 0:
             log(f"[{self.label}] nvidia-smi not found but gpu_layers={gpu_layers} from config — attempting GPU (error recovery will retry CPU on failure)")
         log(f"[{self.label}] Using gpu_layers={gpu_layers}")
         ctx = self.cfg.get("context_size", 4096)
@@ -1279,11 +1307,7 @@ class ModelManager(QObject):
             ):
                 log(f"[{self.label}] CUDA error — retrying CPU-only")
                 self.status_changed.emit("GPU error — retrying CPU…")
-                orig = self.cfg.get("gpu_layers", 99)
-                self.cfg.config["gpu_layers"] = 0
-                result = self.load_model()
-                self.cfg.config["gpu_layers"] = orig
-                return result
+                return self.load_model(force_cpu=True)
             self.status_changed.emit(f"Load error: {str(e)[:70]}")
             return False
 
@@ -1468,6 +1492,7 @@ class ModelManager(QObject):
         text: str,
         system: str | None = None,
         examples: list[dict] | None = None,
+        max_passes: int = 3,
     ) -> str | None:
         """Return corrected text by asking the LLM for a JSON patch list.
 
@@ -1479,6 +1504,7 @@ class ModelManager(QObject):
             text: The text to correct.
             system: Complete system prompt (caller builds it per strength level).
             examples: Few-shot message pairs (caller builds per strength level).
+            max_passes: Max number of refinement passes per chunk.
         """
         if not self.is_loaded():
             if not self.load_model():
@@ -1493,53 +1519,37 @@ class ModelManager(QObject):
                 '  "old" — the wrong word or short phrase as it appears in the text\n'
                 '  "new" — the corrected replacement\n\n'
                 "Rules:\n"
-                "- Only include words that are actually wrong\n"
-                "- Preserve correct words exactly as-is — do NOT include them in patches\n"
-                "- Keep each patch short: 1-3 words max for old/new\n"
-                "- If the text is already perfect, output an empty array []\n"
-                "- Output ONLY the JSON array, nothing else\n"
+                "- ONLY INCLUDE WORDS THAT CONTAIN ERRORS (spelling, grammar, punctuation, missing apostrophes).\n"
+                "- DO NOT INCLUDE CORRECT WORDS. If a word is already correct, ignore it completely.\n"
+                "- Keep each patch short: 1-3 words max for old/new.\n"
+                "- If the text is perfectly fine, output an empty array: []\n"
+                "- Output ONLY the JSON array and absolutely nothing else.\n"
             )
 
         # Build message prefix (system + examples) WITHOUT user text yet.
-        # User text is appended per-chunk below so each chunk gets its own request.
         msg_prefix = [{"role": "system", "content": system}]
         if examples:
             msg_prefix.extend(examples)
 
-        # ── Chunking decision ──────────────────────────────────────────────
-        # Problem: with a 4096-token context, a 3000-word text consumes ~4200
-        # input tokens, leaving only the 256-token floor for patch output.
-        # The LLM literally can't generate enough patches to cover the text,
-        # so corrections at the end get silently dropped.
-        #
-        # Fix: estimate how many words fit in one request while still leaving
-        # a generous output budget (1024 tokens ≈ ~50 patches), and split
-        # longer texts into sentence-aligned chunks that each get a full pass.
         word_count = len(text.split())
-        # Prefer the server-reported n_ctx over the user-configured value —
-        # if the GGUF's metadata capped n_ctx below what the user requested,
-        # our math must match reality or we overflow and tail tokens drop.
-        ctx_size = self.actual_ctx_size or self.cfg.get("context_size", 4096)
+        # Ignore actual_ctx_size because some GGUF metadata underreports (e.g. 4096)
+        # when the model can comfortably handle the user's config (e.g. 12800).
+        ctx_size = self.cfg.get("context_size", 12800)
 
-        # Estimate overhead from the actual system prompt + example messages.
-        # 1.6 tokens/word is a safer average than 1.3 for patch-mode traffic:
-        # JSON examples (with quotes, braces, commas) tokenize much denser than
-        # plain English, and the old 1.3 factor underestimated input, causing
-        # context overflow when chunking long texts.
         prefix_text = system + " ".join(
             m.get("content", "") for m in (examples or [])
         )
-        overhead = int(len(prefix_text.split()) * 1.6) + 100
+        
+        # We estimate the token overhead of the prompt here.
+        # Previously we used 1.6 as a conservative ratio of words to tokens,
+        # but to be completely safe against context window overflow (HTTP 500), 
+        # we now use 2.5 to overestimate input and leave more room for output.
+        overhead = int(len(prefix_text.split()) * 2.5) + 100
 
-        # Dynamic output budget: previously hardcoded 1024 which wasted context
-        # on short inputs and sometimes wasn't enough for very dense edits.
-        # Scale with input size (≈40% of input tokens) with sensible floor/ceiling.
-        est_input_tokens = int(word_count * 1.6) + overhead
-        min_output_budget = max(256, min(int(est_input_tokens * 0.4), 2048))
-        max_input_tokens = ctx_size - overhead - min_output_budget
-        # Convert token budget to word budget; floor at 50 so tiny contexts
-        # don't produce degenerate 5-word chunks
-        max_chunk_words = max(int(max_input_tokens / 1.6), 50)
+        # Enforce a smaller max chunk size so the LLM never struggles with
+        # massive walls of text or runs out of output tokens for patches.
+        # Cap chunk words to max 400 (~1.5 pages) to give plenty of output budget
+        max_chunk_words = min(max(int((ctx_size - overhead - 1000) / 2.5), 50), 400)
 
         if word_count > max_chunk_words:
             chunks = _chunk_text_by_sentences(text, max_chunk_words)
@@ -1561,136 +1571,159 @@ class ModelManager(QObject):
                     f"Correcting… ({chunk_idx + 1}/{total_chunks})"
                 )
 
-            messages = msg_prefix + [{"role": "user", "content": chunk_text}]
+            current_chunk = chunk_text
+            chunk_changed_in_any_pass = False
+            chunk_success = False
 
-            # Token budget for THIS chunk (same formula as before, but per-chunk).
-            # 1.6 tokens/word matches the chunking math above.
-            cw = len(chunk_text.split())
-            est_input = int(cw * 1.6) + overhead
-            max_output = max(ctx_size - est_input, 256)
-            # ~20 tokens per input word covers dense-error scenarios
-            patch_tokens = min(max(cw * 20, 128), max_output)
+            for pass_num in range(1, max_passes + 1):
+                messages = msg_prefix + [{"role": "user", "content": current_chunk}]
 
-            # Patch mode intentionally forces temperature=0.0 for deterministic
-            # JSON output — the user's configured temperature is respected for
-            # full-text mode but would destabilize patch extraction here.
-            # All other sampling params come from config so the user's settings
-            # actually apply (previously min_p / repeat_penalty / freq / presence
-            # were silently ignored in patch mode).
-            payload = {
-                "messages": messages,
-                "max_tokens": patch_tokens,
-                "temperature": 0.0,
-                "top_k": self.cfg.get("top_k", 40),
-                "top_p": self.cfg.get("top_p", 0.95),
-                "min_p": self.cfg.get("min_p", 0.05),
-                "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
-                "frequency_penalty": self.cfg.get("frequency_penalty", 0.0),
-                "presence_penalty": self.cfg.get("presence_penalty", 0.0),
-                "stream": False,
-                "think": False,
-            }
+                cw = len(current_chunk.split())
+                
+                # Estimate the input tokens conservatively
+                est_input = int(cw * 2.5) + overhead
+                
+                # The remaining budget for output tokens.
+                # If we request too many tokens (prompt + max_tokens > n_ctx), 
+                # llama-server returns an HTTP 500 error ("Context size has been exceeded").
+                max_output = max(ctx_size - est_input, 1536)
+                
+                # Ask for enough tokens to comfortably fit patches (about 4 tokens per word max).
+                # Bounded by max_output to avoid 500 errors, and capped at 2048 to prevent 
+                # models from going off-rails and generating thousands of no-op tokens.
+                patch_tokens = min(max(cw * 4, 1536), max_output, 4096)
 
-            try:
-                log(
-                    f"[{self.label}] PATCH POST chunk {chunk_idx + 1}/{total_chunks} "
-                    f"payload={json.dumps(payload)[:300]}"
-                )
-                r = requests.post(self._chat_url(), json=payload, timeout=120)
-                if not r.ok:
-                    log(f"[{self.label}] HTTP {r.status_code} — body: {r.text[:500]}")
-                r.raise_for_status()
-                resp = r.json()
-                log(f"[{self.label}] Patch raw response: {json.dumps(resp)[:500]}")
+                payload = {
+                    "messages": messages,
+                    "max_tokens": patch_tokens,
+                    "temperature": 0.0,
+                    "top_k": self.cfg.get("top_k", 40),
+                    "top_p": self.cfg.get("top_p", 0.95),
+                    "min_p": self.cfg.get("min_p", 0.05),
+                    "repeat_penalty": self.cfg.get("repeat_penalty", 1.0),
+                    "frequency_penalty": self.cfg.get("frequency_penalty", 0.0),
+                    "presence_penalty": self.cfg.get("presence_penalty", 0.0),
+                    "stream": False,
+                    "think": False,
+                }
 
-                raw, finish_reason = _extract_content_from_response(resp)
-                log(
-                    f"[{self.label}] Patch raw content: {repr(raw[:300])}, "
-                    f"finish_reason={finish_reason}"
-                )
-
-                # Thinking model consumed all tokens — no usable output
-                if not raw and finish_reason == "length":
+                try:
                     log(
-                        f"[{self.label}] finish_reason=length — "
-                        f"chunk {chunk_idx + 1} produced no output"
+                        f"[{self.label}] PATCH POST chunk {chunk_idx + 1}/{total_chunks} pass {pass_num} "
+                        f"payload={json.dumps(payload)[:300]}"
                     )
-                    if total_chunks == 1:
-                        return None  # single-shot: fall back to full-text
-                    # Multi-chunk: keep original text for this chunk, continue
-                    corrected_parts.append((chunk_text, separator))
-                    continue
+                    r = requests.post(self._chat_url(), json=payload, timeout=120)
+                    if not r.ok:
+                        log(f"[{self.label}] HTTP {r.status_code} — body: {r.text[:500]}")
+                    r.raise_for_status()
+                    resp = r.json()
+                    log(f"[{self.label}] Patch raw response: {json.dumps(resp)[:500]}")
 
-                # Tokenizer-garbage detection: undersized / incompatible models
-                # sometimes emit raw BPE artifacts ([UNK_BYTE_...], ▁, DEL chars)
-                # instead of JSON. Trying to parse patches out of this wastes
-                # time and log space — bail out to the full-text fallback path.
-                if _is_corrupt_output(raw):
+                    raw, finish_reason = _extract_content_from_response(resp)
                     log(
-                        f"[{self.label}] Corrupt patch output from "
-                        f"chunk {chunk_idx + 1}: {repr(raw[:120])}"
+                        f"[{self.label}] Patch raw content: {repr(raw[:300])}, "
+                        f"finish_reason={finish_reason}"
                     )
-                    if total_chunks == 1:
-                        return None
-                    corrected_parts.append((chunk_text, separator))
-                    continue
 
-                patches = _extract_patches_from_response(raw)
+                    if not raw and finish_reason == "length":
+                        log(
+                            f"[{self.label}] finish_reason=length — "
+                            f"chunk {chunk_idx + 1} pass {pass_num} produced no output"
+                        )
+                        break
 
-                if patches is None:
-                    log(f"[{self.label}] No valid patches from chunk {chunk_idx + 1}")
-                    if total_chunks == 1:
-                        return None
-                    corrected_parts.append((chunk_text, separator))
-                    continue
+                    if _is_corrupt_output(raw):
+                        log(
+                            f"[{self.label}] Corrupt patch output from "
+                            f"chunk {chunk_idx + 1} pass {pass_num}: {repr(raw[:120])}"
+                        )
+                        break
 
-                # Filter out no-op patches where old == new
-                real_patches = [
-                    p
-                    for p in patches
-                    if p.get("old", "").strip() != p.get("new", "").strip()
-                ]
+                    patches = _extract_patches_from_response(raw)
 
-                if not real_patches:
-                    log(f"[{self.label}] Chunk {chunk_idx + 1}: no corrections needed")
-                    corrected_parts.append((chunk_text, separator))
-                    continue
+                    if patches is None:
+                        log(f"[{self.label}] No valid patches from chunk {chunk_idx + 1} pass {pass_num}")
+                        break
 
-                log(
-                    f"[{self.label}] Chunk {chunk_idx + 1}: "
-                    f"{len(real_patches)} patches: {real_patches}"
-                )
-                result = _apply_patches(chunk_text, real_patches)
-                log(f"[{self.label}] Chunk {chunk_idx + 1} result: {repr(result[:200])}")
+                    # We successfully got some patches (even if empty)
+                    chunk_success = True
 
-                if result != chunk_text:
-                    any_changed = True
+                    real_patches = [
+                        p
+                        for p in patches
+                        if p.get("old", "").strip() != p.get("new", "").strip()
+                    ]
 
-                corrected_parts.append((result, separator))
+                    if not real_patches:
+                        log(f"[{self.label}] Chunk {chunk_idx + 1} pass {pass_num}: no corrections needed")
+                        break
 
-            except Exception as e:
-                log(
-                    f"[{self.label}] correct_text_patch error "
-                    f"(chunk {chunk_idx + 1}): {e}"
-                )
-                if total_chunks == 1:
-                    self.status_changed.emit(f"Error: {str(e)[:50]}")
-                    return None
-                # Multi-chunk: keep original for this chunk, continue with rest
-                corrected_parts.append((chunk_text, separator))
+                    log(
+                        f"[{self.label}] Chunk {chunk_idx + 1} pass {pass_num}: "
+                        f"{len(real_patches)} patches"
+                    )
+                    result = _apply_patches(current_chunk, real_patches)
+                    log(f"[{self.label}] Chunk {chunk_idx + 1} pass {pass_num} result: {repr(result[:200])}")
+
+                    if result == current_chunk:
+                        break
+
+                    prev_words = current_chunk.split()
+                    new_words = result.split()
+                    changes = abs(len(prev_words) - len(new_words)) + sum(
+                        1 for a, b in zip(prev_words, new_words) if a != b
+                    )
+
+                    current_chunk = result
+                    chunk_changed_in_any_pass = True
+
+                    # Smart pass termination to avoid wasting 40s+ on no-op passes
+                    # If the model starts returning mostly no-op patches, it's done finding real errors.
+                    no_op_count = len(patches) - len(real_patches)
+                    if patches and no_op_count >= len(real_patches):
+                        log(
+                            f"[{self.label}] Chunk {chunk_idx + 1} pass {pass_num} produced "
+                            f"mostly no-ops ({no_op_count} ignored vs {len(real_patches)} applied) — skipping further passes"
+                        )
+                        break
+
+                    # Terminate when the pass was a light edit. On short/medium
+                    # text (≤ 150 words), the first pass usually resolves all
+                    # real errors — additional passes tend to introduce stylistic
+                    # tweaks the user didn't ask for (and add 1–3s each). On
+                    # longer text, allow pass 2 to run so the model can catch
+                    # what pass 1 deprioritized.
+                    if changes < 3 and (cw <= 150 or pass_num >= 2):
+                        log(
+                            f"[{self.label}] Chunk {chunk_idx + 1} pass {pass_num} was light "
+                            f"({changes} edits, {cw} words) — skipping further passes"
+                        )
+                        break
+
+                except Exception as e:
+                    log(
+                        f"[{self.label}] correct_text_patch error "
+                        f"(chunk {chunk_idx + 1} pass {pass_num}): {e}"
+                    )
+                    if total_chunks == 1 and not chunk_success:
+                        self.status_changed.emit(f"Error: {str(e)[:50]}")
+                    break
+
+            if not chunk_success and total_chunks == 1:
+                return None
+
+            if chunk_changed_in_any_pass:
+                any_changed = True
+
+            corrected_parts.append((current_chunk, separator))
 
         # ── Reassemble corrected chunks ────────────────────────────────────
-        # Join each chunk with its trailing separator (preserves original
-        # whitespace/newlines between sentences)
         final = "".join(part + sep for part, sep in corrected_parts)
 
         if not any_changed:
-            if total_chunks == 1:
-                # Single-shot with patches that didn't apply — fall back to
-                # full-text so _do_correction can try the non-patch path
+            if total_chunks == 1 and not chunk_success:
                 log(f"[{self.label}] No patches applied — falling back to full text")
                 return None
-            # Multi-chunk, nothing changed anywhere — text was already correct
             log(f"[{self.label}] No corrections needed across {total_chunks} chunks")
             return text
 
@@ -2341,6 +2374,10 @@ class CorrectionWindow(QWidget):
             | Qt.WindowType.FramelessWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Set window icon so the taskbar entry shows our logo instead of a blank icon
+        logo_path = SCRIPT_DIR / "logo.png"
+        if logo_path.exists():
+            self.setWindowIcon(QIcon(str(logo_path)))
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         sr = screen.geometry()
         w, h = min(740, int(sr.width() * 0.8)), min(860, int(sr.height() * 0.9))
@@ -2681,95 +2718,56 @@ class CorrectionWindow(QWidget):
                 _size_b = _model_size_billions(_ac_path)
                 _is_tiny = _size_b is not None and _size_b < _MIN_RELIABLE_MODEL_B
 
-                # Smart Fix mode: patch-based, aggressive, outputs only changed words
-                if _is_tiny:
-                    patch_system = (
-                        "Fix typos, grammar, apostrophes, and capitalization.\n"
-                        'Output ONLY a JSON array of {"old": "...", "new": "..."} objects.\n'
-                        "Only include words that need changing. Use [] if text is perfect."
-                    )
-                else:
-                    patch_system = (
-                        "You are a text correction engine. Output ONLY a JSON array of patches.\n"
-                        "Each patch has exactly two keys: 'old' (wrong word/phrase) and 'new' (corrected replacement).\n\n"
-                        "CRITICAL RULES:\n"
-                        "- Fix spelling errors, grammar mistakes, and missing apostrophes in contractions.\n"
-                        "- Capitalize first letter of sentences, proper nouns, and 'I'.\n"
-                        "- Fix apostrophes: dont→don't, its→it's (when meaning 'it is'), im→I'm, doesnt→doesn't.\n"
-                        "- Do NOT add new punctuation (periods, commas, semicolons) that the user did not write.\n"
-                        "- Do NOT split or restructure sentences.\n"
-                        "- Only include words that need changing — omit correct words entirely.\n"
-                        "- Keep patches short: 1-4 words max.\n"
-                        "- If text is perfect, output [].\n"
-                        "- Output ONLY the JSON array, nothing else."
-                    )
+                patch_system = (
+                    "You are an elite, meticulous copyeditor. Review the user's text word by word.\n"
+                    "Find and fix typos, spelling mistakes (e.g. 'graphisc' -> 'graphic'), clearly wrong capitalization, and missing terminal punctuation. For a missing end-of-sentence mark, add whichever fits the meaning: '?' for questions, '!' for exclamations, '.' otherwise — never force a period.\n"
+                    "NEVER change numbers, dates, URLs, code, or specific values — copy them exactly as written (e.g. do not round 0.0735 to 0.074).\n"
+                    "NEVER alter intentional styling: preserve ALL CAPS words, initialisms (NASA, USA), and Title Case exactly as the user wrote them. Only fix capitalization that is clearly a typing mistake (e.g. 'i' as a pronoun, or a lowercase word at the start of a sentence).\n"
+                    "Output your corrections as a JSON array of replacements. Do NOT include text that is already correct."
+                )
+
                 # Inject custom instructions into patch prompt if set
                 if custom_sys:
                     patch_system += f"\n\nAdditional instructions:\n{custom_sys}"
+                
                 patch_examples = [
-                    {"role": "user", "content": _EX1_INPUT},
-                    {"role": "assistant", "content": '[{"old": "the", "new": "The"}, {"old": "were", "new": "was"}, {"old": "wether", "new": "weather"}]'},
-                    {"role": "user", "content": _EX2_INPUT},
-                    {"role": "assistant", "content": '[{"old": "i", "new": "I"}, {"old": "dont", "new": "don\'t"}, {"old": "its", "new": "it\'s"}, {"old": "gona", "new": "gonna"}]'},
-                    {"role": "user", "content": "samsung released a new phone"},
-                    {"role": "assistant", "content": '[{"old": "samsung", "new": "Samsung"}]'},
+                    {"role": "user", "content": "the project were delayed because of bad wether"},
+                    {"role": "assistant", "content": '[\n  {"old": "the project were", "new": "The project was"},\n  {"old": "wether", "new": "weather."}\n]'},
+                    {"role": "user", "content": "i dont know if its gona work"},
+                    {"role": "assistant", "content": '[\n  {"old": "i dont", "new": "I don\'t"},\n  {"old": "its gona", "new": "it\'s gonna"},\n  {"old": "work", "new": "work."}\n]'},
+                    {"role": "user", "content": "heavy motion graphisc design fast paced"},
+                    {"role": "assistant", "content": '[\n  {"old": "graphisc", "new": "graphic"},\n  {"old": "fast paced", "new": "fast-paced"}\n]'},
+                    {"role": "user", "content": "can you beleive they came late agian"},
+                    {"role": "assistant", "content": '[\n  {"old": "can you beleive", "new": "Can you believe"},\n  {"old": "came late agian", "new": "came late again?"}\n]'},
+                    {"role": "user", "content": "thats AMAZING i cant wait"},
+                    {"role": "assistant", "content": '[\n  {"old": "thats AMAZING i cant", "new": "That\'s AMAZING! I can\'t"},\n  {"old": "wait", "new": "wait!"}\n]'},
+                    {"role": "user", "content": "the p-value is 0.0735 which isnt below 0.05"},
+                    {"role": "assistant", "content": '[\n  {"old": "the p-value", "new": "The p-value"},\n  {"old": "isnt", "new": "isn\'t"},\n  {"old": "0.05", "new": "0.05."}\n]'}
                 ]
-                # Multi-pass patch correction: small LLMs often miss subtle errors
-                # on the first pass (e.g. "verifable") because they focus on the most
-                # obvious mistakes. By re-running on the corrected text, the second
-                # pass catches what the first missed — similar to how GECToR uses
-                # iterative refinement. Converges quickly: pass 1 fixes most errors,
-                # pass 2 catches stragglers, pass 3 usually returns [].
-                #
-                # Conditional additional passes: 3 passes on every short sentence
-                # is wasteful — most typos are fully fixed in pass 1. Only keep
-                # iterating when pass 1 was a heavy edit (≥3 word-level changes)
-                # OR the text is long (>100 words, where missed edits are likely).
+                # Multi-pass patch correction is now handled per-chunk inside
+                # correct_text_patch. This dramatically reduces the number of
+                # requests since converged chunks don't get sent again.
                 MAX_PATCH_PASSES = 3
-                current_text = text
-                patch_failed = False
-                total_passes = 0
                 word_count = len(text.split())
 
-                for pass_num in range(1, MAX_PATCH_PASSES + 1):
-                    log(f"[CW] Smart Fix pass {pass_num}/{MAX_PATCH_PASSES}")
-                    result = self.ac_model.correct_text_patch(
-                        current_text, system=patch_system, examples=patch_examples
-                    )
-                    if result is None:
-                        # Patch extraction/request failed — break out to full-text fallback
-                        patch_failed = True
-                        break
-                    total_passes = pass_num
-                    if result == current_text:
-                        # Converged — no more changes found
-                        log(f"[CW] Patch converged after {pass_num} pass(es)")
-                        break
-
-                    # Approximate word-level edit count: unequal positions plus
-                    # the length delta. Enough precision to distinguish "fixed
-                    # one typo" from "heavily rewrote the sentence".
-                    prev_words = current_text.split()
-                    new_words = result.split()
-                    changes = abs(len(prev_words) - len(new_words)) + sum(
-                        1 for a, b in zip(prev_words, new_words) if a != b
-                    )
+                log(f"[CW] Smart Fix (max passes: {MAX_PATCH_PASSES})")
+                result = self.ac_model.correct_text_patch(
+                    text, system=patch_system, examples=patch_examples, max_passes=MAX_PATCH_PASSES
+                )
+                
+                if result is None:
+                    # Patch extraction/request failed completely — break out to full-text fallback
+                    patch_failed = True
+                else:
+                    patch_failed = False
                     current_text = result
-
-                    if pass_num == 1 and word_count <= 100 and changes < 3:
-                        log(
-                            f"[CW] Patch pass 1 was light "
-                            f"({changes} edits, {word_count} words) — skipping further passes"
-                        )
-                        break
 
                 if not patch_failed:
                     if current_text == text:
                         self._correction_ready.emit(text, "Already correct")
                     else:
-                        passes_label = f" ({total_passes}x)" if total_passes > 1 else ""
                         self._correction_ready.emit(
-                            current_text, f"Smart Fix (patch{passes_label})"
+                            current_text, "Smart Fix (patch)"
                         )
                     return
                 # Patch failed — fall back to full-text with aggressive prompt
@@ -3145,6 +3143,7 @@ class TextCorrectorApp(QApplication):
 
         self._idle_timer = QTimer()
         self._idle_timer.timeout.connect(self.chat_model.check_idle)
+        self._idle_timer.timeout.connect(self.ac_model.check_idle)
         self._idle_timer.start(60_000)
 
         # Load autocorrect model at boot
@@ -3271,7 +3270,16 @@ class TextCorrectorApp(QApplication):
             pass
         hk = self.cfg.get("hotkey", "ctrl+shift+space")
         try:
-            keyboard.add_hotkey(hk, self._hotkey_fired, suppress=False)
+            # suppress=True consumes the key combination so it does NOT pass
+            # through to the focused app. Without this, a hotkey ending in a
+            # printable key (e.g. space) types that character into the user's
+            # text field before the clipboard flow runs — the user sees their
+            # selection replaced by a space. trigger_on_release=True waits for
+            # modifier release so the callback fires once per intentional press
+            # instead of repeating while keys are held.
+            keyboard.add_hotkey(
+                hk, self._hotkey_fired, suppress=True, trigger_on_release=True
+            )
             log(f"[Hotkey] Registered: {hk}")
         except Exception as e:
             log(f"[Hotkey] Failed to register '{hk}': {e}")
@@ -3290,6 +3298,12 @@ class TextCorrectorApp(QApplication):
             log("[Hotkey] Fired but already busy — ignoring")
             return
         log("[Hotkey] Fired")
+        
+        # Do not block the global keyboard hook thread. If we sleep or do heavy UI logic here, 
+        # it lags the user's keyboard input system-wide or breaks shortcuts completely.
+        threading.Thread(target=self._hotkey_worker, daemon=True).start()
+
+    def _hotkey_worker(self):
         try:
             # If the correction window is already open, just bring it to the
             # front instead of starting a new copy-and-popup flow. Prevents the

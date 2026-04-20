@@ -66,12 +66,11 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - `build.py` uses PyInstaller → single-folder release + ZIP
 - `build.py` auto-detects the llama-server folder from `config.json`, not hardcoded `llama_cpp/`
 
-### 9. No punctuation insertion in patch mode
-- Patch prompts and few-shot examples must NEVER instruct the LLM to add new punctuation (periods, commas, semicolons) that the user did not write
-- Few-shot example patches must NOT append periods to the last word (e.g. `"phone"→"phone."` is wrong)
-- Post-processing (`_apply_patches`) must NOT add trailing periods or commas — only fix contractions, capitalization, and standalone 'i'
-- This was added after the LLM kept inserting periods/commas mid-sentence when told to "add missing punctuation"
-- Punctuation *correction* (fixing wrong punctuation) is fine; punctuation *insertion* is not
+### 9. Patch mode: terminal punctuation uses best-fit mark, not always a period
+- When a sentence is missing end-of-sentence punctuation, the patch prompt instructs the model to add whichever mark fits the meaning: `?` for questions, `!` for exclamations, `.` otherwise
+- The phrase "like periods at the ends of sentences" was removed from the prompt — it biased the model to always append a period even on question/exclamation sentences
+- Few-shot examples include a question-mark case (`"came late agian?"`) and an exclamation case (`"wait!"`) to give the model clear precedent
+- Punctuation *correction* (fixing wrong punctuation) is fine; punctuation *insertion that changes meaning* (forcing `.` on a question) is not
 
 ### 10. Custom system prompt is appended, never replaces
 - When `system_prompt` config is set, it is appended to the base prompt as `"\n\nAdditional instructions:\n{custom_sys}"` — never replaces the base constraints
@@ -125,13 +124,30 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - **DO NOT re-add `response_format.json_schema` to `correct_text_patch()` payload** — grammar-constrained decoding in llama.cpp filters every sampled token, causing 3–10× slowdown that made autocorrect hang on any text. Removed 2026-04-17. The existing output guards are sufficient.
 - Recommended model: Gemma 4 E2B Unsloth UD Q4_K_XL (bundled via `download_model.bat/.sh`, defined as `_RECOMMENDED_MODEL_URL` in `build.py`)
 
-### 18. Context-window math uses server-reported n_ctx + 1.6 tok/word
-- After a successful load, `ModelManager` fetches `/props` and stores `actual_ctx_size` — may be lower than the user-requested `--ctx-size` if the GGUF's metadata caps n_ctx
-- `correct_text_patch()` prefers `actual_ctx_size` over `cfg["context_size"]` so chunking math matches reality
-- Tokens-per-word estimate is **1.6** (not 1.3) — JSON examples with quotes/braces tokenize densely, and the old 1.3 factor underestimated input and caused overflow
-- Output budget is `clamp(estimated_input_tokens × 0.4, 256, 2048)` — scales with input, not a fixed 1024 that wasted ctx on short texts
+### 18. Context-window math uses config value
+- The system uses the user's configured `context_size` (default 12800) for all chunking math.
+- The `actual_ctx_size` from `/props` is logged for diagnostic purposes but ignored for math because some GGUF metadata underreports capacity (e.g. Gemma 4 E2B reports 4096 but handles 12800 perfectly).
+- Output budget is `clamp(estimated_input_words × 4, 256, 2048)` to prevent models from generating thousands of no-op patches and hitting `finish_reason=length`.
 
-### 19. Chat first turn embeds user text inline
+### 20. Patch prompt must not modify numbers, dates, or intentional ALL CAPS
+- The patch system prompt contains explicit rules: "NEVER change numbers, dates, URLs, code, or specific values" and "NEVER alter intentional styling: preserve ALL CAPS words, initialisms (NASA, USA), and Title Case exactly as the user wrote them"
+- Root cause: without these rules the model interpreted `ALL CAPS` as incorrect capitalization and lowercased it, and treated a value like `0.0735` as needing to "match" context clues (user writing "3 decimals" → model rounds to `0.074`)
+- Only fix capitalization that is clearly a typing mistake (lowercase `i` pronoun, lowercase first word of sentence)
+- Do NOT remove these rules — they were added after confirmed user-visible bugs
+
+### 21. Hotkey registered with suppress=True and trigger_on_release=True
+- `keyboard.add_hotkey(hk, self._hotkey_fired, suppress=True, trigger_on_release=True)`
+- `suppress=True` consumes the key combination so it does NOT pass through to the focused app. Without it, a hotkey ending in a printable key (Space) typed that character into the user's text field before the callback ran — the selected text was replaced by a space
+- `trigger_on_release=True` fires the callback once per intentional press-release cycle rather than on every auto-repeat tick while keys are held — complements the `_hotkey_busy` re-entrancy lock
+- Do NOT revert to `suppress=False` — that is the direct cause of the "hotkey replaces text with a space" bug
+
+### 22. Pass termination: skip further passes for short text with light edits
+- In `correct_text_patch()`, the pass-termination condition is `if changes < 3 and (cw <= 150 or pass_num >= 2)`
+- For short/medium texts (≤ 150 words), if pass 1 made fewer than 3 word-level changes, additional passes are skipped — they typically just add stylistic tweaks the user didn't request and cost 1–3 s each
+- For longer texts, at least 2 passes run before the light-edit early-exit applies
+- Do NOT revert to `if pass_num >= 2 and changes < 3` — that old check always ran pass 2 even for short, already-converged texts
+
+### 23. Chat first turn embeds user text inline
 - `_send_chat()` when `self.chat_history` is empty builds a single user message: `f"Task: {msg}\n\nText:\n{self.corrected}"`
 - Do NOT revert to the old 3-message prefill (system + fake-user "Here is the text" + fake-assistant "Understood") — that caused Gemma 4 / Qwen to reply "Please provide the text" because the conversation history claimed the text was already acknowledged
 
@@ -303,7 +319,21 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-17 (latest)
+### 2026-04-20 (latest)
+- **Fixed: hotkey replaces selected text with a space** — Root cause: `suppress=False` let Ctrl+Shift+Space pass through to the focused app, which typed a space before the callback could run. Fix: `suppress=True, trigger_on_release=True`. Added locked rule #21.
+- **Fixed: terminal punctuation always forced to period** — Prompt said "missing punctuation (like periods at the ends of sentences)", biasing the model to append `.` even on questions and exclamations. Fix: prompt now says "add whichever fits the meaning: `?` for questions, `!` for exclamations, `.` otherwise". Added few-shot examples with `?` and `!`. Updated locked rule #9.
+- **Fixed: model rounding numbers it shouldn't touch** — Model was "correcting" `0.0735` to `0.074` based on surrounding context clues ("3 decimals"). Fix: patch prompt now includes explicit rule "NEVER change numbers, dates, URLs, code, or specific values". Added few-shot p-value example that leaves numbers unchanged. Added locked rule #20.
+- **Fixed: ALL CAPS text being lowercased** — Model interpreted intentional ALL CAPS as "incorrect capitalization". Fix: patch prompt now includes "NEVER alter intentional styling: preserve ALL CAPS words, initialisms (NASA, USA), and Title Case exactly". Added few-shot example showing ALL CAPS preserved with exclamation. Added locked rule #20.
+- **Improved: patch multi-pass termination for short texts** — Pass 2/3 were always running on short texts even when pass 1 fully resolved all errors, adding 1–3 s per unnecessary pass. Fix: early-exit now applies after any pass (not just pass 2+) when text ≤ 150 words and changes < 3. Added locked rule #22.
+
+### 2026-04-18
+- **Fixed: patch algorithm performance & no-op floods** — Root cause: `cw * 20` output token budget was massive (e.g. 3400 tokens), and `actual_ctx_size` override forced chunk math to assume 4096 total context. The model would spend 40-50 seconds per pass generating thousands of `{"old":"Hey", "new":"Hey"}` patches until it hit `finish_reason=length`. Fix: Reduced patch output budget to `min(max(cw * 4, 256), max_output, 2048)` and added an early-exit check to break the multi-pass loop if >50% of generated patches are no-ops.
+- **Fixed: missing trailing periods in patch mode** — Model was stripping terminal punctuation because the prompt said "Do NOT add new punctuation". Fix: added explicit instruction to "Preserve all existing punctuation including trailing periods" and added a post-processing step in `_apply_patches()` to explicitly restore trailing `.?!` if it was in the original text but stripped from the result.
+- **Changed: dynamic context window math override removed** — `actual_ctx_size` from `/props` is no longer used for chunk math because GGUF metadata often underreports (Gemma 4 E2B reports 4096 but runs fine at 12800). Hardcoded `DEFAULT_CONFIG` default raised from 4096 to 12800. Updated locked rule #18.
+- **Fixed: Smart Fix prompt didn't add missing periods or fix incorrect capitalization** — The prompt said "Do NOT add new punctuation" which prevented the model from inserting sentence-ending periods. Also, the model was never told to de-capitalize incorrectly capitalized mid-sentence words. Fix: Smart Fix prompt now instructs to add missing sentence-ending periods and fix incorrect mid-sentence capitalization. Added a 4th few-shot example demonstrating de-capitalization (`the Meeting was Great` → `The meeting was great`). Conservative mode remains unchanged (typos only, no punctuation changes).
+- **Fixed: CorrectionWindow had no taskbar icon** — The popup window never called `setWindowIcon()`, so the Windows taskbar showed a blank/generic icon. Fix: `_position_window()` now sets the window icon from `logo.png`.
+
+### 2026-04-17
 - **Fixed: hotkey unreliable — slow to open, occasionally dead, "no text" spam** — Root cause trio: (a) no re-entrancy guard, so holding the hotkey spawned overlapping `_hotkey_fired` threads that each re-notified; (b) the flow always restarted the clipboard dance even when a window was already open; (c) sleeps were too long (0.1 s / 0.05 s / 20×50 ms polling). Fix: added `threading.Lock` with non-blocking acquire, early-exit raising an existing window, shortened sleeps to 0.03 s and polling to 10×30 ms, throttled "no text selected" notifications to 3 s intervals. Added locked rule #13.
 - **Fixed: sampling params silently ignored** — `load_model()` only passed `--ctx-size` / `--n-gpu-layers`, and `correct_text_patch()` / `make_stream_worker()` payloads only included `top_k` / `top_p`. User changes to `min_p`, `repeat_penalty`, `frequency_penalty`, `presence_penalty` had no effect. Fix: wired all seven sampling params through the CLI plus every request payload. Added locked rule #14.
 - **Fixed: built release output "I don' know if its gona work." for every input** — User had loaded a 270M grammar model that produced tokenizer garbage (`[UNK_BYTE_0xe29681▁released]`, DEL chars). Patch extraction failed → fell back to full-text → model echoed a few-shot example verbatim. Fix: `_is_corrupt_output()` (rejects tokenizer artifacts), `_is_fewshot_echo()` (rejects verbatim example echoes with Jaccard overlap check), both applied in patch and full-text paths. Also added `model_warning` signal that tray-notifies on load when `_model_size_billions() < 1.0`. Added locked rule #17.
@@ -311,7 +341,7 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - **Fixed: built app had no logo** — `datas=[(f, '.')]` in the PyInstaller spec routes files to `_internal/`, but code at `SCRIPT_DIR / "logo.png"` looks next to the EXE when frozen. Fix: `build.py` explicitly `shutil.copy2`'s `logo.png` / `logo.ico` / `_checkmark.svg` into `out_dir`.
 - **Fixed: download_model script pointed at ancient Qwen 2.5 3B** — Replaced with Gemma 4 E2B (Unsloth UD Q4_K_XL, ~1.8 GB). Constants `_RECOMMENDED_MODEL_URL` / `_FILE` in `build.py` drive both `.bat` and `.sh` scripts.
 - **Fixed: settings panel sometimes taller than screen** — Hardcoded `setMinimumSize(580, 680)` + `resize(680, 820)` ignored small/laptop screens. Fix: screen-relative clamping via `QApplication.primaryScreen().availableGeometry()` (min = min(hardcoded, 80/85% screen), resize = min(hardcoded, 90% screen), then re-center).
-- **Fixed: chat replied "Please provide the text" despite being given text** — Old prefill used system + fake-user "Here is the text: …" + fake-assistant "Understood. Ready for your question." The model read the history as "text already delivered and acknowledged" and asked the user for new text. Fix: first turn is now a single real user message `"Task: {msg}\n\nText:\n{self.corrected}"`. Added locked rule #19.
+- **Fixed: chat replied "Please provide the text" despite being given text** — Old prefill used system + fake-user "Here is the text: …" + fake-assistant "Understood. Ready for your question." The model read the history as "text already delivered and acknowledged" and asked the user for new text. Fix: first turn is now a single real user message `"Task: {msg}\n\nText:\n{self.corrected}"`. Added locked rule #23.
 - **Added: first-run setup dialog** — `TextCorrectorApp._show_first_run()` fires via `QTimer.singleShot(800, ...)` when `model_path` is blank. Offers "Download recommended" (launches bundled script in a visible terminal), "Browse existing…", or "Skip". Added locked rule #15.
 - **Added: llama-server auto-detect** — `_find_shipped_llama_server()` scans `SCRIPT_DIR` for any `llama*/llama-server[.exe]`. Makes unzipped releases plug-and-play. `load_model()` persists the discovered path to config.json on first success.
 - **Reverted: JSON-schema-constrained patch decoding** — Added then removed same session. Grammar-constrained decoding caused 3–10× slowdown (every token filtered against schema), making autocorrect hang on longer texts and become extremely slow on shorter ones. `response_format` removed from `correct_text_patch()` payload. Output guards (`_is_corrupt_output`, `_is_fewshot_echo`) remain as the protection layer instead.
