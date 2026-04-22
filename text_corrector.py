@@ -27,6 +27,7 @@ os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 # ── third-party ─────────────────────────────────────────────────────────────
 from pynput import keyboard as pynput_keyboard
 from pynput.keyboard import Key, Listener, Controller
+import keyboard
 import queue
 import pyperclip
 import requests
@@ -3204,17 +3205,22 @@ class TextCorrectorApp(QApplication):
         self._set_tray_icon(color)
 
     def _register_hotkey(self):
-        """Register global hotkey using pynput with Qt-safe event ferrying."""
+        """Register global hotkey using keyboard with Qt-safe event ferrying."""
         # Stop existing listener
-        if self._pynput_listener:
+        if hasattr(self, "_pynput_listener") and self._pynput_listener:
             try:
                 self._pynput_listener.stop()
             except Exception:
                 pass
             self._pynput_listener = None
+            
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
         
         # Stop existing timer
-        if self._hotkey_timer:
+        if hasattr(self, "_hotkey_timer") and self._hotkey_timer:
             try:
                 self._hotkey_timer.stop()
             except Exception:
@@ -3222,52 +3228,15 @@ class TextCorrectorApp(QApplication):
         
         hk = self.cfg.get("hotkey", "ctrl+shift+space").lower().strip()
         
-        # Parse hotkey string to pynput key objects
-        self._hotkey_keys = set()
-        key_map = {
-            'ctrl': Key.ctrl_l, 'shift': Key.shift_l, 'alt': Key.alt_l,
-            'space': Key.space, 'enter': Key.enter, 'tab': Key.tab,
-            'backspace': Key.backspace, 'delete': Key.delete,
-            'home': Key.home, 'end': Key.end, 'pageup': Key.page_up,
-            'pagedown': Key.page_down, 'up': Key.up, 'down': Key.down,
-            'left': Key.left, 'right': Key.right,
-            'f1': Key.f1, 'f2': Key.f2, 'f3': Key.f3, 'f4': Key.f4,
-            'f5': Key.f5, 'f6': Key.f6, 'f7': Key.f7, 'f8': Key.f8,
-            'f9': Key.f9, 'f10': Key.f10, 'f11': Key.f11, 'f12': Key.f12,
-        }
-        
-        for part in hk.split('+'):
-            part = part.strip()
-            if part in key_map:
-                self._hotkey_keys.add(key_map[part])
-            elif len(part) == 1:
-                self._hotkey_keys.add(pynput_keyboard.KeyCode.from_char(part))
-        
-        if not self._hotkey_keys:
-            log("[Hotkey] Failed to parse hotkey")
-            return
-        
-        log(f"[Hotkey] pynput registering: {hk}")
-        
-        def on_press(key):
-            self._current_keys.add(key)
-            if self._hotkey_keys.issubset(self._current_keys):
-                if not self._hotkey_triggered:
-                    self._hotkey_triggered = True
-                    # Put event in queue — DO NOT touch Qt from this thread
-                    try:
-                        self._hotkey_queue.put_nowait("trigger")
-                    except queue.Full:
-                        pass
-        
-        def on_release(key):
-            self._current_keys.discard(key)
-            if key in self._hotkey_keys:
-                self._hotkey_triggered = False
+        def on_hotkey():
+            try:
+                self._hotkey_queue.put_nowait("trigger")
+            except queue.Full:
+                pass
         
         try:
-            self._pynput_listener = Listener(on_press=on_press, on_release=on_release)
-            self._pynput_listener.start()
+            keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=True)
+            log(f"[Hotkey] keyboard registering: {hk}")
             
             # Poll queue from main Qt thread every 50ms
             self._hotkey_timer = QTimer(self)
@@ -3275,7 +3244,7 @@ class TextCorrectorApp(QApplication):
             self._hotkey_timer.start(50)
             
         except Exception as e:
-            log(f"[Hotkey] pynput failed: {e}")
+            log(f"[Hotkey] keyboard failed: {e}")
             self.tray.showMessage(
                 "TextCorrector",
                 f"Could not register hotkey '{hk}'. Try running as administrator.",
@@ -3340,6 +3309,14 @@ class TextCorrectorApp(QApplication):
 
             # Small delay for natural key release
             time.sleep(0.05)
+            
+            # Explicitly force the OS to lift modifiers so injection doesn't combine with them
+            for mod in ['shift', 'ctrl', 'alt']:
+                try:
+                    keyboard.release(mod)
+                except Exception:
+                    pass
+            time.sleep(0.01)
 
             self._old_clip = self._safe_paste()
             self._safe_copy("")
@@ -3347,6 +3324,8 @@ class TextCorrectorApp(QApplication):
             
             # Use pynput Controller for Ctrl+C — guaranteed cleanup
             ctrl = Controller()
+            for mod in [Key.shift, Key.shift_l, Key.shift_r, Key.alt, Key.alt_l, Key.alt_r]:
+                ctrl.release(mod)
             with ctrl.pressed(Key.ctrl):
                 ctrl.press('c')
                 ctrl.release('c')
@@ -3615,12 +3594,16 @@ class TextCorrectorApp(QApplication):
         )
 
     def _quit(self):
-        if self._pynput_listener:
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+        if hasattr(self, "_pynput_listener") and self._pynput_listener:
             try:
                 self._pynput_listener.stop()
             except Exception:
                 pass
-        if self._hotkey_timer:
+        if hasattr(self, "_hotkey_timer") and self._hotkey_timer:
             try:
                 self._hotkey_timer.stop()
             except Exception:

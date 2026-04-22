@@ -319,7 +319,13 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-21 (latest)
+### 2026-04-22 (latest)
+- **Fixed: Hotkey modifier leakage and hook execution errors** — The previous migration to `pynput` caused modifier leakage (e.g. `Ctrl+Shift+Space` causing `Ctrl+Shift+C` to trigger the browser inspector) and space characters to leak into text. Reverted hotkey detection back to `keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=True)` to honor Rule 21, but maintained `pynput.keyboard.Controller` for reliable `Ctrl+C` / `Ctrl+V` injection. Fixed the Graphify `BeforeTool` hook in `.gemini/settings.json` which failed on Windows due to bash syntax (`[ -f ... ]`); rewritten to use cross-platform `python -c`.
+- **Refactored Hotkey System**: Replaced the `keyboard` module with `pynput` to resolve severe bugs where the app would hold modifier keys (Ctrl) at the OS level, causing erratic zooming and scrolling. Implemented a Qt-safe queue + `QTimer` polling architecture so that the pynput background listener does not emit Qt signals directly, preventing cross-thread crashes. The clipboard capture now correctly utilizes `pynput.keyboard.Controller` for simulated Ctrl+C/Ctrl+V presses.
+- **Refactor Clean**: Ran dead code analysis (vulture) and surgically removed unused Qt imports (`QSlider`, `QPoint`, `QSize`), redundant OS variables, unreachable code, and an entirely unused `chat_with_model` non-streaming method.
+- **Graphify Global Alias**: Fixed a global issue where the `graphify` command was not recognized on Windows. Added a global memory alias mapping `graphify` to `python -m graphify`.
+
+### 2026-04-21
 - **Indexed Codebase with Graphify**: Ran `python -m graphify update .` to generate a topology-based knowledge graph for the TextCorrector codebase. The resulting graph contains 181 nodes and 383 edges, exported to `graphify-out/`. This graph provides the AI with structured relationship context.
 
 ### 2026-04-20
