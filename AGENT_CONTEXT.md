@@ -319,7 +319,10 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-20 (latest)
+### 2026-04-21 (latest)
+- **Indexed Codebase with Graphify**: Ran `python -m graphify update .` to generate a topology-based knowledge graph for the TextCorrector codebase. The resulting graph contains 181 nodes and 383 edges, exported to `graphify-out/`. This graph provides the AI with structured relationship context.
+
+### 2026-04-20
 - **Fixed: hotkey replaces selected text with a space** — Root cause: `suppress=False` let Ctrl+Shift+Space pass through to the focused app, which typed a space before the callback could run. Fix: `suppress=True, trigger_on_release=True`. Added locked rule #21.
 - **Fixed: terminal punctuation always forced to period** — Prompt said "missing punctuation (like periods at the ends of sentences)", biasing the model to append `.` even on questions and exclamations. Fix: prompt now says "add whichever fits the meaning: `?` for questions, `!` for exclamations, `.` otherwise". Added few-shot examples with `?` and `!`. Updated locked rule #9.
 - **Fixed: model rounding numbers it shouldn't touch** — Model was "correcting" `0.0735` to `0.074` based on surrounding context clues ("3 decimals"). Fix: patch prompt now includes explicit rule "NEVER change numbers, dates, URLs, code, or specific values". Added few-shot p-value example that leaves numbers unchanged. Added locked rule #20.

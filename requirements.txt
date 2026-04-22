@@ -5,7 +5,7 @@
 PyQt6>=6.6.0
 
 # Global hotkey capture
-keyboard>=0.13.5
+pynput>=1.7.6
 
 # Clipboard access
 pyperclip>=1.8.2

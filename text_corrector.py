@@ -25,7 +25,9 @@ os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
 # ── third-party ─────────────────────────────────────────────────────────────
-import keyboard
+from pynput import keyboard as pynput_keyboard
+from pynput.keyboard import Key, Listener, Controller
+import queue
 import pyperclip
 import requests
 
@@ -202,6 +204,42 @@ def _find_shipped_llama_server() -> str:
     return ""
 
 
+_COMPILED_THINKING_PATTERNS = [
+    re.compile(r"<think>.*?</think>", re.DOTALL),
+    re.compile(r"<thinking>.*?</thinking>", re.DOTALL),
+    re.compile(r"<reasoning>.*?</reasoning>", re.DOTALL),
+]
+
+_COMPILED_UNCLOSED_PATTERNS = [
+    re.compile(r"<think>.*", re.DOTALL),
+    re.compile(r"<thinking>.*", re.DOTALL),
+    re.compile(r"<reasoning>.*", re.DOTALL),
+]
+
+_PREAMBLE_PATTERNS = [
+    r"^(?:Here(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:Sure[,!]? [Hh]ere(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:Corrected (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:The corrected (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:I(?:\'ve| have) corrected the (?:text|text for you)[:\.]?\s*\n?)",
+    r"^(?:Below is the corrected (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:This is the corrected (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:I\'ve proofread and refined the text[:\.]?\s*\n?)",
+    r"^(?:I\'ve made the following corrections[:\.]?\s*\n?)",
+    r"^\*\*Corrected(?: text)?\*\*[:\.]?\s*\n?",
+    r"^#+\s*Corrected(?: text)?[:\.]?\s*\n?",
+    r"^[-*]{3,}\s*\n?",
+    r"^(?:Here are the corrections?[:\.]?\s*\n?)",
+    r"^(?:The refined (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:I\'ve reviewed and corrected[:\.]?\s*\n?)",
+    r"^(?:I\'ve proofread (?:and refined )?your text[:\.]?\s*\n?)",
+    r"^(?:Here is the refined (?:text|version)[:\.]?\s*\n?)",
+    r"^(?:The text has been corrected[:\.]?\s*\n?)",
+    r"^(?:Your text,? corrected[:\.]?\s*\n?)",
+]
+_COMPILED_PREAMBLES = [re.compile(p, re.IGNORECASE) for p in _PREAMBLE_PATTERNS]
+
+
 def has_nvidia() -> bool:
     try:
         r = subprocess.run(
@@ -244,25 +282,14 @@ def strip_thinking_tokens(text: str) -> str:
     if not text:
         return text
 
-    # Remove various thinking block formats (including multiline content)
-    thinking_patterns = [
-        (r"<think>.*?</think>", re.DOTALL),  # Qwen3, DeepSeek
-        (r"<thinking>.*?</thinking>", re.DOTALL),  # Alternative format
-        (r"<reasoning>.*?</reasoning>", re.DOTALL),  # Alternative format
-    ]
-
     cleaned = text
-    for pattern, flags in thinking_patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=flags)
+    # Remove various thinking block formats (including multiline content)
+    for pattern in _COMPILED_THINKING_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
 
     # Also handle unclosed thinking tags (model may not close them)
-    unclosed_patterns = [
-        r"<think>.*",
-        r"<thinking>.*",
-        r"<reasoning>.*",
-    ]
-    for pattern in unclosed_patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL)
+    for pattern in _COMPILED_UNCLOSED_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
 
     return cleaned.strip()
 
@@ -271,31 +298,9 @@ def strip_meta_commentary(text: str, original: str = "") -> str:
     """Strip common meta-commentary prefixes that models add."""
     if not text:
         return text
-    # Comprehensive list of preamble patterns models add
-    preamble_patterns = [
-        r"^(?:Here(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:Sure[,!]? [Hh]ere(?:\'s| is) the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:Corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:The corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I(?:\'ve| have) corrected the (?:text|text for you)[:\.]?\s*\n?)",
-        r"^(?:Below is the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:This is the corrected (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I\'ve proofread and refined the text[:\.]?\s*\n?)",
-        r"^(?:I\'ve made the following corrections[:\.]?\s*\n?)",
-        r"^\*\*Corrected(?: text)?\*\*[:\.]?\s*\n?",  # Markdown bold
-        r"^#+\s*Corrected(?: text)?[:\.]?\s*\n?",  # Markdown headers
-        r"^[-*]{3,}\s*\n?",  # Separator lines
-        r"^(?:Here are the corrections?[:\.]?\s*\n?)",
-        r"^(?:The refined (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:I\'ve reviewed and corrected[:\.]?\s*\n?)",
-        r"^(?:I\'ve proofread (?:and refined )?your text[:\.]?\s*\n?)",
-        r"^(?:Here is the refined (?:text|version)[:\.]?\s*\n?)",
-        r"^(?:The text has been corrected[:\.]?\s*\n?)",
-        r"^(?:Your text,? corrected[:\.]?\s*\n?)",
-    ]
     cleaned = text
-    for pattern in preamble_patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    for pattern in _COMPILED_PREAMBLES:
+        cleaned = pattern.sub("", cleaned)
     # Strip wrapping quotes if the entire output is quoted
     cleaned = cleaned.strip()
     if len(cleaned) > 2 and cleaned[0] == '"' and cleaned[-1] == '"':
@@ -418,6 +423,42 @@ def _is_fewshot_echo(raw: str, original: str) -> bool:
         if overlap_ratio > 0.5:
             return False
     return True
+    return True
+
+
+_CONTRACTIONS_MAP = {
+    r"(?<![a-zA-Z])dont(?![a-zA-Z])": "don't",
+    r"(?<![a-zA-Z])doesnt(?![a-zA-Z])": "doesn't",
+    r"(?<![a-zA-Z])didnt(?![a-zA-Z])": "didn't",
+    r"(?<![a-zA-Z])cant(?![a-zA-Z])": "can't",
+    r"(?<![a-zA-Z])couldnt(?![a-zA-Z])": "couldn't",
+    r"(?<![a-zA-Z])wouldnt(?![a-zA-Z])": "wouldn't",
+    r"(?<![a-zA-Z])shouldnt(?![a-zA-Z])": "shouldn't",
+    r"(?<![a-zA-Z])wont(?![a-zA-Z])": "won't",
+    r"(?<![a-zA-Z])wasnt(?![a-zA-Z])": "wasn't",
+    r"(?<![a-zA-Z])werent(?![a-zA-Z])": "weren't",
+    r"(?<![a-zA-Z])isnt(?![a-zA-Z])": "isn't",
+    r"(?<![a-zA-Z])arent(?![a-zA-Z])": "aren't",
+    r"(?<![a-zA-Z])hasnt(?![a-zA-Z])": "hasn't",
+    r"(?<![a-zA-Z])havent(?![a-zA-Z])": "haven't",
+    r"(?<![a-zA-Z])hadnt(?![a-zA-Z])": "hadn't",
+    r"(?<![a-zA-Z])Im(?![a-zA-Z])": "I'm",
+    r"(?<![a-zA-Z])Ive(?![a-zA-Z])": "I've",
+    r"(?<![a-zA-Z])Id(?![a-zA-Z])": "I'd",
+    r"(?<![a-zA-Z])Ill(?![a-zA-Z])": "I'll",
+    r"(?<![a-zA-Z])youre(?![a-zA-Z])": "you're",
+    r"(?<![a-zA-Z])theyre(?![a-zA-Z])": "they're",
+    r"(?<![a-zA-Z])were(?![a-zA-Z])(?=\s+(?:going|gonna|not|still|just|also|always|never|almost|about))": "we're",
+    r"(?<![a-zA-Z])hes(?![a-zA-Z])": "he's",
+    r"(?<![a-zA-Z])shes(?![a-zA-Z])": "she's",
+    r"(?<![a-zA-Z])thats(?![a-zA-Z])": "that's",
+    r"(?<![a-zA-Z])whats(?![a-zA-Z])": "what's",
+    r"(?<![a-zA-Z])lets(?![a-zA-Z])(?=\s+(?:\w))": "let's",
+    r"(?<![a-zA-Z])theres(?![a-zA-Z])": "there's",
+}
+_COMPILED_CONTRACTIONS = [(re.compile(p, re.IGNORECASE), r) for p, r in _CONTRACTIONS_MAP.items()]
+_I_PATTERN = re.compile(r"(?<![a-zA-Z])i(?![a-zA-Z'])")
+_CAP_PATTERN = re.compile(r'([.?!]\s+)([a-z])')
 
 
 def _apply_patches(original: str, patches: list[dict]) -> str:
@@ -475,9 +516,8 @@ def _apply_patches(original: str, patches: list[dict]) -> str:
     post_applied = 0
 
     # 1. Standalone lowercase 'i' → 'I' (when LLM missed it)
-    i_pattern = re.compile(r"(?<![a-zA-Z])i(?![a-zA-Z'])")
-    if i_pattern.search(result):
-        result = i_pattern.sub("I", result)
+    if _I_PATTERN.search(result):
+        result = _I_PATTERN.sub("I", result)
         post_applied += 1
         log("[PATCH] Post-fix: standalone 'i' → 'I'")
 
@@ -488,38 +528,7 @@ def _apply_patches(original: str, patches: list[dict]) -> str:
         log("[PATCH] Post-fix: capitalized first letter")
 
     # 3. Fix common contractions missing apostrophes
-    _contractions = {
-        r"(?<![a-zA-Z])dont(?![a-zA-Z])": "don't",
-        r"(?<![a-zA-Z])doesnt(?![a-zA-Z])": "doesn't",
-        r"(?<![a-zA-Z])didnt(?![a-zA-Z])": "didn't",
-        r"(?<![a-zA-Z])cant(?![a-zA-Z])": "can't",
-        r"(?<![a-zA-Z])couldnt(?![a-zA-Z])": "couldn't",
-        r"(?<![a-zA-Z])wouldnt(?![a-zA-Z])": "wouldn't",
-        r"(?<![a-zA-Z])shouldnt(?![a-zA-Z])": "shouldn't",
-        r"(?<![a-zA-Z])wont(?![a-zA-Z])": "won't",
-        r"(?<![a-zA-Z])wasnt(?![a-zA-Z])": "wasn't",
-        r"(?<![a-zA-Z])werent(?![a-zA-Z])": "weren't",
-        r"(?<![a-zA-Z])isnt(?![a-zA-Z])": "isn't",
-        r"(?<![a-zA-Z])arent(?![a-zA-Z])": "aren't",
-        r"(?<![a-zA-Z])hasnt(?![a-zA-Z])": "hasn't",
-        r"(?<![a-zA-Z])havent(?![a-zA-Z])": "haven't",
-        r"(?<![a-zA-Z])hadnt(?![a-zA-Z])": "hadn't",
-        r"(?<![a-zA-Z])Im(?![a-zA-Z])": "I'm",
-        r"(?<![a-zA-Z])Ive(?![a-zA-Z])": "I've",
-        r"(?<![a-zA-Z])Id(?![a-zA-Z])": "I'd",
-        r"(?<![a-zA-Z])Ill(?![a-zA-Z])": "I'll",
-        r"(?<![a-zA-Z])youre(?![a-zA-Z])": "you're",
-        r"(?<![a-zA-Z])theyre(?![a-zA-Z])": "they're",
-        r"(?<![a-zA-Z])were(?![a-zA-Z])(?=\s+(?:going|gonna|not|still|just|also|always|never|almost|about))": "we're",
-        r"(?<![a-zA-Z])hes(?![a-zA-Z])": "he's",
-        r"(?<![a-zA-Z])shes(?![a-zA-Z])": "she's",
-        r"(?<![a-zA-Z])thats(?![a-zA-Z])": "that's",
-        r"(?<![a-zA-Z])whats(?![a-zA-Z])": "what's",
-        r"(?<![a-zA-Z])lets(?![a-zA-Z])(?=\s+(?:\w))": "let's",
-        r"(?<![a-zA-Z])theres(?![a-zA-Z])": "there's",
-    }
-    for pat, repl in _contractions.items():
-        c_pat = re.compile(pat, re.IGNORECASE)
+    for c_pat, repl in _COMPILED_CONTRACTIONS:
         if c_pat.search(result):
             # Preserve original case for the replacement where sensible
             def _contraction_repl(m, _repl=repl):
@@ -532,14 +541,13 @@ def _apply_patches(original: str, patches: list[dict]) -> str:
                 return _repl
             result = c_pat.sub(_contraction_repl, result)
             post_applied += 1
-            log(f"[PATCH] Post-fix: contraction '{pat}' → '{repl}'")
+            log(f"[PATCH] Post-fix: contraction '{c_pat.pattern}' → '{repl}'")
 
     # 4. Capitalize first word after sentence-ending punctuation (.?!)
     def _cap_after_sentence(m):
         return m.group(1) + m.group(2).upper()
-    cap_pattern = re.compile(r'([.?!]\s+)([a-z])')
-    if cap_pattern.search(result):
-        result = cap_pattern.sub(_cap_after_sentence, result)
+    if _CAP_PATTERN.search(result):
+        result = _CAP_PATTERN.sub(_cap_after_sentence, result)
         post_applied += 1
         log("[PATCH] Post-fix: capitalized after sentence-ending punctuation")
 
@@ -949,21 +957,14 @@ class HotkeyEdit(QLineEdit):
             self._recording = True
             self.setStyleSheet(self._REC)
             super().setText("Press keys…")
-            try:
-                keyboard.unhook_all_hotkeys()
-            except Exception:
-                pass
+            # pynput doesn't need unhooking — just ignore global hotkey
 
     def focusOutEvent(self, e):
         if self._recording:
             self._recording = False
             self.setStyleSheet(self._IDLE)
             self._refresh()
-            if self._re_register_cb:
-                try:
-                    self._re_register_cb()
-                except Exception:
-                    pass
+            # pynput doesn't need re-registration
         super().focusOutEvent(e)
 
     def keyPressEvent(self, e):
@@ -3100,6 +3101,7 @@ class TextCorrectorApp(QApplication):
         log(f"[APP] Boot — Autocorrect model: {_ac_path_boot}")
         log(f"[APP] Boot — Chat model: {self.cfg.get('model_path', '')}")
         log(f"[APP] Boot — keep_model_loaded: {self.cfg.get('keep_model_loaded', True)}")
+        log(f"[APP] Boot — gpu_layePP] Boot — keep_model_loaded: {self.cfg.get('keep_model_loaded', True)}")
         log(f"[APP] Boot — gpu_layers: {self.cfg.get('gpu_layers', 99)}")
         log(f"[APP] Boot — correction_mode: {self.cfg.get('correction_mode', 0)}")
         self.ac_model = ModelManager(
@@ -3123,9 +3125,15 @@ class TextCorrectorApp(QApplication):
         # "no text selected" notification in a feedback loop. This lock ensures
         # only one hotkey flow runs at a time.
         self._hotkey_busy = threading.Lock()
-        # Throttle for the "no text selected" tray notification — prevents the
-        # infinite reappear-on-close glitch the user reported
         self._last_empty_notify_ts = 0.0
+        
+        # pynput hotkey system
+        self._pynput_listener: Listener | None = None
+        self._current_keys: set = set()
+        self._hotkey_triggered = False
+        self._hotkey_queue: queue.Queue = queue.Queue()
+        self._hotkey_timer: QTimer | None = None
+        self._hotkey_keys: set = set()
 
         self._trigger.connect(self._show_window)
         self._notify.connect(self._show_notify)
@@ -3264,98 +3272,167 @@ class TextCorrectorApp(QApplication):
         self._set_tray_icon(color)
 
     def _register_hotkey(self):
+        """Register global hotkey using pynput with Qt-safe event ferrying."""
+        # Stop existing listener
+        if self._pynput_listener:
+            try:
+                self._pynput_listener.stop()
+            except Exception:
+                pass
+            self._pynput_listener = None
+        
+        # Stop existing timer
+        if self._hotkey_timer:
+            try:
+                self._hotkey_timer.stop()
+            except Exception:
+                pass
+        
+        hk = self.cfg.get("hotkey", "ctrl+shift+space").lower().strip()
+        
+        # Parse hotkey string to pynput key objects
+        self._hotkey_keys = set()
+        key_map = {
+            'ctrl': Key.ctrl_l, 'shift': Key.shift_l, 'alt': Key.alt_l,
+            'space': Key.space, 'enter': Key.enter, 'tab': Key.tab,
+            'backspace': Key.backspace, 'delete': Key.delete,
+            'home': Key.home, 'end': Key.end, 'pageup': Key.page_up,
+            'pagedown': Key.page_down, 'up': Key.up, 'down': Key.down,
+            'left': Key.left, 'right': Key.right,
+            'f1': Key.f1, 'f2': Key.f2, 'f3': Key.f3, 'f4': Key.f4,
+            'f5': Key.f5, 'f6': Key.f6, 'f7': Key.f7, 'f8': Key.f8,
+            'f9': Key.f9, 'f10': Key.f10, 'f11': Key.f11, 'f12': Key.f12,
+        }
+        
+        for part in hk.split('+'):
+            part = part.strip()
+            if part in key_map:
+                self._hotkey_keys.add(key_map[part])
+            elif len(part) == 1:
+                self._hotkey_keys.add(pynput_keyboard.KeyCode.from_char(part))
+        
+        if not self._hotkey_keys:
+            log("[Hotkey] Failed to parse hotkey")
+            return
+        
+        log(f"[Hotkey] pynput registering: {hk}")
+        
+        def on_press(key):
+            self._current_keys.add(key)
+            if self._hotkey_keys.issubset(self._current_keys):
+                if not self._hotkey_triggered:
+                    self._hotkey_triggered = True
+                    # Put event in queue — DO NOT touch Qt from this thread
+                    try:
+                        self._hotkey_queue.put_nowait("trigger")
+                    except queue.Full:
+                        pass
+        
+        def on_release(key):
+            self._current_keys.discard(key)
+            if key in self._hotkey_keys:
+                self._hotkey_triggered = False
+        
         try:
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
-        hk = self.cfg.get("hotkey", "ctrl+shift+space")
-        try:
-            # suppress=True consumes the key combination so it does NOT pass
-            # through to the focused app. Without this, a hotkey ending in a
-            # printable key (e.g. space) types that character into the user's
-            # text field before the clipboard flow runs — the user sees their
-            # selection replaced by a space. trigger_on_release=True waits for
-            # modifier release so the callback fires once per intentional press
-            # instead of repeating while keys are held.
-            keyboard.add_hotkey(
-                hk, self._hotkey_fired, suppress=True, trigger_on_release=True
-            )
-            log(f"[Hotkey] Registered: {hk}")
+            self._pynput_listener = Listener(on_press=on_press, on_release=on_release)
+            self._pynput_listener.start()
+            
+            # Poll queue from main Qt thread every 50ms
+            self._hotkey_timer = QTimer(self)
+            self._hotkey_timer.timeout.connect(self._check_hotkey_queue)
+            self._hotkey_timer.start(50)
+            
         except Exception as e:
-            log(f"[Hotkey] Failed to register '{hk}': {e}")
+            log(f"[Hotkey] pynput failed: {e}")
             self.tray.showMessage(
                 "TextCorrector",
                 f"Could not register hotkey '{hk}'. Try running as administrator.",
                 QSystemTrayIcon.MessageIcon.Warning,
                 4000,
             )
+    
+    def _check_hotkey_queue(self):
+        """Called every 50ms from main Qt thread — safe to call Qt methods."""
+        try:
+            while True:
+                event = self._hotkey_queue.get_nowait()
+                if event == "trigger":
+                    self._hotkey_fired()
+        except queue.Empty:
+            pass
+
+    def _safe_paste(self, retries=5, delay=0.03) -> str:
+        for i in range(retries):
+            try:
+                return pyperclip.paste()
+            except Exception as e:
+                if i == retries - 1:
+                    log(f"[Clipboard] paste failed: {e}")
+                    return ""
+                time.sleep(delay)
+        return ""
+
+    def _safe_copy(self, text: str, retries=5, delay=0.03):
+        for i in range(retries):
+            try:
+                pyperclip.copy(text)
+                return
+            except Exception as e:
+                if i == retries - 1:
+                    log(f"[Clipboard] copy failed: {e}")
+                    return
+                time.sleep(delay)
 
     def _hotkey_fired(self):
-        # Re-entrancy guard: drop rapid repeat fires (e.g. from holding the
-        # keys down) rather than queueing them up. acquire(blocking=False)
-        # returns immediately so the keyboard thread never stalls.
+        """Called from main Qt thread via queue polling."""
+        # Re-entrancy guard
         if not self._hotkey_busy.acquire(blocking=False):
             log("[Hotkey] Fired but already busy — ignoring")
             return
-        log("[Hotkey] Fired")
         
-        # Do not block the global keyboard hook thread. If we sleep or do heavy UI logic here, 
-        # it lags the user's keyboard input system-wide or breaks shortcuts completely.
+        # Run actual work in background thread so Qt stays responsive
         threading.Thread(target=self._hotkey_worker, daemon=True).start()
 
     def _hotkey_worker(self):
         try:
-            # If the correction window is already open, just bring it to the
-            # front instead of starting a new copy-and-popup flow. Prevents the
-            # "notification spam" symptom where closing one popup triggers a
-            # second capture that also finds nothing selected.
+            # If window already open, just focus it
             if self._window and self._window.isVisible():
-                log("[Hotkey] Window already open — focusing instead")
+                log("[Hotkey] Window already open — focusing")
                 try:
+                    # Use invokeMethod to ensure thread safety
                     self._window.raise_()
                     self._window.activateWindow()
                 except Exception:
                     pass
                 return
 
-            for k in ("ctrl", "shift", "alt"):
-                try:
-                    keyboard.release(k)
-                except Exception:
-                    pass
-            # 30 ms is enough for the OS to register modifier release on every
-            # system we've tested. The old 100 ms sleep added up to a full
-            # second of perceived hotkey latency across the full flow.
-            time.sleep(0.03)
+            # Small delay for natural key release
+            time.sleep(0.05)
 
-            self._old_clip = pyperclip.paste()
-            pyperclip.copy("")
+            self._old_clip = self._safe_paste()
+            self._safe_copy("")
             time.sleep(0.03)
-            keyboard.send("ctrl+c")
+            
+            # Use pynput Controller for Ctrl+C — guaranteed cleanup
+            ctrl = Controller()
+            with ctrl.pressed(Key.ctrl):
+                ctrl.press('c')
+                ctrl.release('c')
 
-            # Poll up to ~300 ms (10 × 30 ms) instead of 1 s (20 × 50 ms).
-            # Almost every real copy completes in under 100 ms; the old ceiling
-            # just made the "nothing was copied" case feel slow.
+            # Poll clipboard
             selected = ""
             for _ in range(10):
                 time.sleep(0.03)
-                try:
-                    clip = pyperclip.paste()
-                    if clip:
-                        selected = clip
-                        break
-                except Exception:
-                    pass
+                clip = self._safe_paste()
+                if clip:
+                    selected = clip
+                    break
 
             if selected.strip():
                 self._trigger.emit(selected.strip())
             else:
                 if self._old_clip:
-                    pyperclip.copy(self._old_clip)
-                # Throttle: show "no text selected" at most once every 3 s.
-                # Without this, a stuck-hotkey or focus-loss loop could spawn
-                # dozens of identical toasts that reappear as fast as the user
-                # dismisses them.
+                    self._safe_copy(self._old_clip)
                 now = time.monotonic()
                 if now - self._last_empty_notify_ts > 3.0:
                     self._last_empty_notify_ts = now
@@ -3364,12 +3441,10 @@ class TextCorrectorApp(QApplication):
                         "info",
                     )
                 else:
-                    log("[Hotkey] Empty selection — suppressing notification (throttled)")
+                    log("[Hotkey] Empty selection — throttled")
         except Exception as e:
             log(f"[Hotkey] Error: {e}")
         finally:
-            # Always release the lock, even on exception — otherwise the first
-            # error permanently disables the hotkey until app restart.
             self._hotkey_busy.release()
 
     def _show_model_warning(self, msg: str):
@@ -3414,12 +3489,17 @@ class TextCorrectorApp(QApplication):
             log(f"[Window] CRASH in _show_window: {e}\n{traceback.format_exc()}")
 
     def _paste_text(self, text: str):
-        pyperclip.copy(text)
+        self._safe_copy(text)
         time.sleep(0.15)
-        keyboard.send("ctrl+v")
+        # Use pynput to paste
+        ctrl = Controller()
+        with ctrl.pressed(Key.ctrl):
+            ctrl.press('v')
+            ctrl.release('v')
         time.sleep(0.1)
         if self._old_clip and self._old_clip != text:
-            QTimer.singleShot(500, lambda: pyperclip.copy(self._old_clip))
+            clip_to_restore = self._old_clip
+            QTimer.singleShot(500, lambda: self._safe_copy(clip_to_restore))
 
     def _open_settings(self):
         dlg = SettingsDialog(self.cfg, re_register_cb=self._register_hotkey)
@@ -3603,12 +3683,18 @@ class TextCorrectorApp(QApplication):
         )
 
     def _quit(self):
+        if self._pynput_listener:
+            try:
+                self._pynput_listener.stop()
+            except Exception:
+                pass
+        if self._hotkey_timer:
+            try:
+                self._hotkey_timer.stop()
+            except Exception:
+                pass
         self.ac_model.unload_model()
         self.chat_model.unload_model()
-        try:
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
         self.quit()
 
 

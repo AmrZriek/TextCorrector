@@ -32,5 +32,6 @@ llama-*/
 build/
 dist/
 TextCorrector_Release/
+graphify-out/
 *.spec
 *.zip
