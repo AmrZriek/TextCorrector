@@ -20,16 +20,16 @@ TextCorrector lives in the system tray. Select text in any app, press the hotkey
 
 | Layer | Technology | Role |
 |---|---|---|
-| **Autocorrect** | llama.cpp (GGUF model, local) | Primary — loaded at boot, instant on subsequent presses |
-| **AI Chat** | Same llama.cpp server, reused | No second model load when `ac_same_as_chat = true` |
-| GUI | PyQt6, dark navy frameless | — |
-| Hotkey | `keyboard` library (global hook) | — |
+| **Autocorrect** | llama.cpp (GGUF model, local) | **Three-Phase Pipeline**: 1. Dict pre-pass, 2. Parallel sentence rewrite, 3. Hallucination guard. |
+| **AI Chat** | Same llama.cpp server, reused | No second model load when `ac_same_as_chat = true`. Supports streaming. |
+| GUI | PyQt6, dark navy frameless | Premium dark UI with diff highlighting. |
+| Hotkey | `keyboard` library (global hook) | Instant capture with re-entrancy protection. |
 
 **Design philosophy — Samsung AI keyboard style:**
-- A small GGUF model (2–4 B params, quantized) is loaded once at boot.
-- The same server handles both autocorrect patches and the chat/rewrite feature.
-- Thinking mode is explicitly disabled server-side (`--reasoning off`) so every token goes to output, not internal reasoning.
-- GPU acceleration via CUDA 12 — CUDA runtime DLLs must be alongside `llama-server.exe` on Windows.
+- **Patch Pipeline**: Unlike simple "find-and-replace", TextCorrector uses a parallel sentence-rewrite pipeline. It splits text into sentence-sized units, rewrites them in parallel using multiple LLM slots (`--parallel 4`), and validates each rewrite with a hallucination ratio guard.
+- **Deterministic Pre-pass**: A built-in dictionary handles ~150 common typos instantly with zero LLM latency.
+- **Thinking Mode Suppression**: Uses `--reasoning-budget 0` to ensure models like Gemma 4 or Qwen 2.5/3.5 don't waste time on internal chain-of-thought during correction.
+- **GPU Acceleration**: Native CUDA 12 support on Windows via DLL injection — corrections are typically sub-second for most paragraphs.
 
 ---
 
@@ -135,15 +135,13 @@ All settings are editable via the Settings dialog. `config.json` is created in t
 | `model_path` | `""` | Path to GGUF model file (chat/rewrite) |
 | `ac_model_path` | `""` | Path to GGUF model file (autocorrect) |
 | `ac_same_as_chat` | `true` | Reuse the chat model for autocorrect (one server) |
+| `correction_method` | `"patch"` | `"patch"` (parallel rewrite) or `"stream"` (tokens stream into pane) |
+| `streaming_strength` | `"smart_fix"` | `"conservative"` (typos only) or `"smart_fix"` (grammar/style) |
 | `gpu_layers` | `99` | GPU offload layers (0 = CPU only) |
 | `context_size` | `12800` | LLM context window (tokens) |
 | `keep_model_loaded` | `true` | Keep LLM in memory between uses |
 | `hotkey` | `ctrl+shift+space` | Global trigger hotkey |
-| `correction_mode` | `1` | 0 = conservative, 1 = smart fix (patch-based) |
 | `temperature` | `0.1` | LLM temperature |
-| `top_k` | `40` | Top-K sampling |
-| `top_p` | `0.95` | Top-P sampling |
-| `min_p` | `0.05` | Min-P sampling |
 | `server_port` | `8080` | llama-server HTTP port |
 
 ---
@@ -158,11 +156,10 @@ All settings are editable via the Settings dialog. `config.json` is created in t
 **GPU not being used / slow corrections:**
 - Check `app_debug.log` for `[AC] GPU detection: has_nvidia()=True` and `Using gpu_layers=99`.
 - If CUDA DLLs are missing, the server silently falls back to CPU. Copy `cudart64_12.dll`, `cublas64_12.dll`, and `cublasLt64_12.dll` next to `llama-server.exe`.
-- Ollama users: copy from `%LOCALAPPDATA%\Programs\Ollama\lib\ollama\cuda_v12\`.
 
 **Corrections return unchanged text / empty result:**
-- Check `app_debug.log` for `reasoning_content present` — this means the model entered thinking mode. The server flag `--reasoning off` should prevent this; if you see it, your `llama-server` build may be outdated.
-- Also check for `503 Service Unavailable` — means the model is still loading. Wait a moment and retry.
+- Check `app_debug.log` for `reasoning_content present` — this means the model entered thinking mode. The server flag `--reasoning-budget 0` should prevent this.
+- If drift is too high, the **Hallucination Guard** will reject the LLM output and keep the original text to prevent corruption. Try a larger or higher-quality model.
 
 **Chat shows "loading model" every time:**
 - Enable `ac_same_as_chat = true` in Settings so the chat reuses the already-loaded autocorrect server.
