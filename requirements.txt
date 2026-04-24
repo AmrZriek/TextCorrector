@@ -1,4 +1,4 @@
-# TextCorrector v4.0 — Python dependencies
+# TextCorrector v3.1 — Python dependencies
 # Install with: pip install -r requirements.txt
 
 # GUI framework (Qt 6)

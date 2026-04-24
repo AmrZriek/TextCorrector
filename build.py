@@ -9,7 +9,7 @@ Supports Windows, macOS, Linux.  Must be run on the target platform
 Usage
 -----
     python build.py                  # full release build
-    python build.py --version 4.0.0  # override version tag
+    python build.py --version 3.1.0  # override version tag
     python build.py --no-zip         # skip ZIP, just output the folder
 
 Requirements

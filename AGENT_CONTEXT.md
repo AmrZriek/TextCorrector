@@ -2,7 +2,7 @@
 
 **READ THIS ENTIRE FILE BEFORE TOUCHING ANY CODE.**
 
-This is the authoritative design document for TextCorrector v4.0.
+This is the authoritative design document for TextCorrector v3.1.
 All AI agents working on this codebase must follow the architecture and constraints here.
 
 ---
@@ -78,22 +78,21 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - In patch mode (mode 1), custom instructions are also appended to the patch system prompt so they actually take effect
 - Previously, `custom_sys or (default)` replaced the entire prompt, losing output-format constraints → model added conversational filler → triggered retry → 2x latency
 
-### 11. Long texts are chunked at sentence boundaries, never truncated
-- `correct_text_patch()` splits long texts into sentence-aligned chunks when the input would exceed the context window's safe capacity
-- Each chunk gets its own LLM request with a full output token budget (≥1024 tokens for patches)
-- Chunks are reassembled with their original inter-chunk whitespace/newlines preserved via `_chunk_text_by_sentences()`
-- Overhead is estimated from the actual system prompt + examples (not a fixed constant) — prevents underestimating and starving the output budget
-- If a chunk fails in multi-chunk mode, its original text is kept and processing continues (partial success is better than total failure)
-- Previously, a single-shot request for 3000+ words left only 256 output tokens → patches were truncated → end of text never got corrected
-- The chunking threshold adapts to the user's `context_size` setting — larger contexts allow larger single-shot texts
+### 11. Patch pipeline is a three-phase sentence-rewrite, not an indexed-JSON patch
+- `correct_text_patch()` now runs: **Phase 0** deterministic dict pre-pass → **Phase 1** parallel sentence rewrite → **Phase 2** hallucination guard.
+- **Phase 0** (`_dict_prepass`): ~150-entry `_COMMON_TYPOS_MAP` resolves obvious typos (teh→the, recieve→receive) case-preservingly with zero LLM cost. Fast path: if text ≤ 15 words AND dict made ≥1 fix AND result starts uppercase + ends with `.!?`, return immediately — no LLM call at all.
+- **Phase 1**: `_chunk_text_by_sentences(pre_corrected, 40)` splits at sentence/paragraph boundaries into ~40-word units. `_rewrite_sentence_chunk()` issues one blocking `requests.post` per unit asking the model to rewrite the sentence between `<<<START>>>` / `<<<END>>>` markers. `ThreadPoolExecutor(max_workers=min(chunks, 4))` fires up to 4 in parallel.
+- **Phase 2** (`_hallucination_ratio`): compares `difflib.SequenceMatcher` word-ratio between unit input and LLM output. If drift > `_HALLUCINATION_THRESHOLD_SMARTFIX` (0.6) or `_CONSERVATIVE` (0.4), reject the LLM output and keep the original sentence — per-unit granularity, not global.
+- **Partial success is valid**: failed or rejected units keep their original text; other units proceed. The overall result is only marked "total failure" when dict_fixes == 0 AND no unit ever succeeded.
+- **Server Parallelization:** The `llama-server` MUST be started with `--parallel 4` in the `cmd` list inside `load_model()`. With `--ctx-size 12800 --parallel 4`, per-slot context is ~3200 tokens (confirmed by `/props reports n_ctx=3328`). Sentence-sized units (~60 tokens in, ~60 tokens out) leave massive headroom so `finish_reason=length` is impossible in practice.
+- Chunks are reassembled with their original inter-chunk whitespace/newlines preserved via the `sep` tuple element returned by `_chunk_text_by_sentences()`.
+- `_apply_post_fixes(final, original=original_text)` runs after reassembly as the deterministic safety net (contractions, duplicate-word collapse, standalone-i→I, cap-after-period).
 
-### 12. Patch mode uses iterative multi-pass (max 3), not single-shot
-- `_do_correction()` runs `correct_text_patch()` in a loop (up to `MAX_PATCH_PASSES = 3`), feeding corrected text back as input until no more changes are found
-- This is necessary because small on-device LLMs miss subtle errors on the first pass when focused on obvious ones — the second pass catches stragglers (same principle as GECToR's iterative refinement)
-- The loop terminates early when the result matches the input (converged) or when patch extraction fails (falls back to full-text)
-- For already-correct text, only one pass runs (returns `[]` immediately) — no extra latency
-- The method badge shows pass count when >1 (e.g. "Smart Fix (patch 2x)")
-- Pass 2+ is skipped when pass 1 was a light edit (< 3 word-level changes) on a short text (≤ 100 words) — most typos fully resolve in pass 1, and additional passes on short text just burn latency
+### 12. Patch mode is single-pass — no iterative refinement
+- The multi-pass feedback loop (feed corrected text back up to 3 times) was REMOVED in 2026-04-24. It was the primary source of oscillation on short text ("curse curse", "lady lady" adjacent duplicates) — pass 2 on already-clean text pushed the model to "find something to change".
+- Sentence-scale rewrite makes passes unnecessary: the model sees one full sentence and fixes all its errors at once, not fragmented patch indices that hide higher-order errors.
+- The `_hallucination_ratio` guard in Phase 2 replaces the old `divergence_guard` / `suspicious` / `mostly_echo` heuristics. It's sharper because it measures *output drift* (what the user will see) rather than patch count.
+- The method badge shows unit count when >1 (e.g. "Patch (Smart Fix, 5 units)"). The second element of `correct_text_patch()`'s return tuple is now `units` (sentence count sent to LLM), not `passes_run`. Fast path returns `units=0`.
 
 ### 13. Hotkey re-entrancy guard & notification throttle
 - `TextCorrectorApp._hotkey_busy = threading.Lock()` with non-blocking `acquire(blocking=False)` — rapid repeats from holding the hotkey are dropped, not queued
@@ -103,8 +102,8 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 
 ### 14. Sampling params must flow through CLI AND every request payload
 - `load_model()` passes `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`
-- `correct_text_patch()` payload includes the same set (except `temperature`, which is forced to `0.0` for patch-mode determinism)
-- `correct_text()` and `make_stream_worker()` payloads include all seven
+- `_rewrite_sentence_chunk()` payload includes the same set (except `temperature`, forced to `0.0` and `top_k=1` for patch-mode determinism — we want the same rewrite every time for identical input)
+- `make_stream_worker()` payload includes all seven using config values (user-controlled sampling for chat + streaming fallback)
 - If you add a new sampling setting, wire it through all three paths — leaving any path unwired means the setting silently has no effect
 
 ### 15. First-run setup dialog on blank model_path
@@ -135,21 +134,62 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - Only fix capitalization that is clearly a typing mistake (lowercase `i` pronoun, lowercase first word of sentence)
 - Do NOT remove these rules — they were added after confirmed user-visible bugs
 
-### 21. Hotkey registered with suppress=True and trigger_on_release=True
-- `keyboard.add_hotkey(hk, self._hotkey_fired, suppress=True, trigger_on_release=True)`
-- `suppress=True` consumes the key combination so it does NOT pass through to the focused app. Without it, a hotkey ending in a printable key (Space) typed that character into the user's text field before the callback ran — the selected text was replaced by a space
-- `trigger_on_release=True` fires the callback once per intentional press-release cycle rather than on every auto-repeat tick while keys are held — complements the `_hotkey_busy` re-entrancy lock
-- Do NOT revert to `suppress=False` — that is the direct cause of the "hotkey replaces text with a space" bug
+### 21. Hotkey registered with suppress=True and trigger_on_release=False
+- `keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=False)`
+- `suppress=True` consumes the key combination so it does NOT pass through to the focused app.
+- `trigger_on_release=False` ensures the hotkey triggers instantly without the ~110ms dead time.
+- **CRITICAL:** Do NOT inject artificial `keyboard.release()` calls for modifier keys (Ctrl/Shift/Alt) to "clear" their state while the user might still be physically holding them. This desynchronizes the OS modifier state machine, leaving the `Ctrl` key permanently stuck down in Windows. Instead, use a physical release wait loop (`while keyboard.is_pressed: ...`) with a generous deadline (e.g., 1.5s). Artificial release events are a dead-end fix that breaks system accessibility.
 
-### 22. Pass termination: skip further passes for short text with light edits
-- In `correct_text_patch()`, the pass-termination condition is `if changes < 3 and (cw <= 150 or pass_num >= 2)`
-- For short/medium texts (≤ 150 words), if pass 1 made fewer than 3 word-level changes, additional passes are skipped — they typically just add stylistic tweaks the user didn't request and cost 1–3 s each
-- For longer texts, at least 2 passes run before the light-edit early-exit applies
-- Do NOT revert to `if pass_num >= 2 and changes < 3` — that old check always ran pass 2 even for short, already-converged texts
+### 22. Pass termination — DELETED (superseded by single-pass sentence rewrite, rule #12)
+- The old multi-pass loop and its termination heuristics were removed 2026-04-24 along with the indexed-JSON format. Do NOT re-add any form of "feed corrected text back for another pass" logic — it's the root cause of short-text oscillation.
 
 ### 23. Chat first turn embeds user text inline
 - `_send_chat()` when `self.chat_history` is empty builds a single user message: `f"Task: {msg}\n\nText:\n{self.corrected}"`
 - Do NOT revert to the old 3-message prefill (system + fake-user "Here is the text" + fake-assistant "Understood") — that caused Gemma 4 / Qwen to reply "Please provide the text" because the conversation history claimed the text was already acknowledged
+
+### 24. Reset button: cancel latch is a one-way flag per window
+- `CorrectionWindow._reset()` sets `self._correction_cancelled = True` and `self._cancel_event.set()`. It MUST NOT reset these back to `False` / fresh `Event()` inside `_reset()`.
+- Reason: any `_rewrite_sentence_chunk()` request's `requests.post(timeout=60)` call is blocking and can return up to 60s after the user presses Reset. If the flag were cleared immediately, the late response would slip through `_do_correction`'s post-call gate, triggering `_start_streaming_correction()` and producing the user-reported bug "I was typing in chat and it suddenly started streaming corrected text at me."
+- Lifecycle: the flag is a latch for the window's lifetime. Retry = close + reopen popup (new window instance, new flag).
+- `_do_correction()` MUST check `self._correction_cancelled` after `correct_text_patch()` returns, BEFORE invoking `_start_streaming_correction()` or emitting `_correction_ready`. `_start_streaming_correction()` itself has the same guard at its top as belt-and-braces.
+- `correct_text_patch()` checks `cancel_event` between dispatched future completions so a mid-correction Reset aborts before firing additional units.
+
+### 25. Patch unit size: 40 words max (sentence-scale)
+- `_chunk_text_by_sentences(pre_corrected, 40)` in `correct_text_patch()`.
+- Reason: llama-server is launched with `--parallel 4 --ctx-size 12800`, giving ~3200 tokens per slot (not 12800 — the ctx is divided across slots; confirmed by `/props reports n_ctx=3328`). Sentence units of ~40 words ≈ 60 input tokens + 60 output tokens fit easily with multiple kilotokens to spare.
+- `max_tokens = min(max(int(word_count * 1.6) + 32, 128), 512)` — scales with input, caps at 512 to prevent runaway output if the model loses its way.
+- **Dead-end:** Raising the cap to pre-2026-04-24 levels (180+ words per chunk) re-introduces `finish_reason=length` on dense-edit inputs because the old indexed-JSON format is gone and the model now emits full sentences (output scales with input, not with edit count).
+
+### 26. Corrupt/echo output → keep original for that unit
+- `_rewrite_sentence_chunk()` returns `None` when `_is_corrupt_output()`, `_is_fewshot_echo()`, or marker-extraction fails. The orchestrator then keeps the unit's ORIGINAL text and continues — partial success, not total failure.
+- Do NOT convert unit-level failure into a global streaming fallback. That was the pre-2026-04-24 behavior and produced 24-second stalls on long inputs where a single chunk hit trouble.
+- Only when dict_fixes == 0 AND zero units succeeded does `correct_text_patch()` return `None` (streaming fallback for the whole text).
+
+### 27. Hallucination guard: per-unit edit-distance gate
+- After a unit's LLM output returns, `_hallucination_ratio(orig_unit, corr_unit)` computes `1 - difflib.SequenceMatcher(None, orig_words, corr_words).ratio()`.
+- If ratio > `_HALLUCINATION_THRESHOLD_SMARTFIX` (0.6) or `_HALLUCINATION_THRESHOLD_CONSERVATIVE` (0.4), the LLM output is REJECTED and the unit's original text is kept (logged as `hallucination rejected`).
+- This replaces the deleted `divergence_guard`, `suspicious_rewrite`, `mostly_echo`, and consecutive-duplicate patch filters. All four measured the wrong thing (patch count, not output drift). Edit-distance measures what the user actually sees change, at sentence scope.
+- `_DUP_WORD_PATTERN` in `_apply_post_fixes` STAYS — it's the final safety net for any surviving `\b(\w+)\s+\1\b` duplicates, preserving intentional "had had" / "that that is" by checking the original.
+
+### 28. Dict pre-pass thresholds
+- Fast-path skip-LLM condition: `dict_fixes > 0 AND total_words ≤ 15 AND candidate[0].isupper() AND candidate.rstrip()[-1] in ".!?"`. All four must hold.
+- Reason: the dict's case-preservation is perfect for flat word-level typos, but it does NOT fix capitalization errors, missing sentence-ending punctuation, or grammar. The structural checks ensure we only skip the LLM when the dict-corrected text is already well-formed at the sentence level. Without them, "i beleive it" would skip the LLM and return "i believe it" — still wrong.
+- Longer texts (>15 words) ALWAYS go through the LLM pass because (a) the dict alone won't catch grammar/cap errors scattered through the text, and (b) parallel sentence rewrite is fast enough that skipping is not worth the complexity risk.
+- `_COMMON_TYPOS_MAP` is a frozen dict of ~150 entries kept in `text_corrector.py` — no external dep. Add entries conservatively: only unambiguous single-word typos whose correction is context-independent. Ambiguous ones ("wa" → "was"? "what"? "a"?) should NOT be in this dict — the LLM handles context.
+
+---
+
+## Instincts & Dead Ends (For AI Agents)
+
+- **Dead-end:** Reintroducing indexed-JSON patches (`[{"i":N,"new":"..."}]`) or any structured-enumeration output format. It fails on 2B-class models under load — output scales with input, hits `finish_reason=length`, produces duplicate-word patches. Stick with sentence rewrite.
+- **Dead-end:** Adding a multi-pass feedback loop (feed corrected text back in for another round). It oscillates on already-clean short text (pass-2 "finds" things to change that aren't wrong). Single pass only.
+- **Dead-end:** Refactoring `_rewrite_sentence_chunk` return signatures without updating `correct_text_patch`'s future-collection logic. Keep return as `str | None`.
+- **Dead-end:** Using `keyboard.release()` for hotkeys. It breaks Windows modifier state.
+- **Dead-end:** Sequential patching. Latency for 1000+ words exceeds 60s. Use `ThreadPoolExecutor(max_workers=4)` + `--parallel 4` server flag.
+- **Dead-end:** Global edit-distance gates spanning the whole text. Apply `_hallucination_ratio` PER UNIT — short single-sentence units legitimately have high edit ratios (1 typo in 3-word sentence = 33%) and global gates falsely reject them.
+- **Instinct:** If corrections are slow on long text, verify the server log for `--parallel 4` and ensure `max_workers=4` is actually what the ThreadPoolExecutor is using. More workers just queues requests without speedup.
+- **Instinct:** If a sentence comes back looking "mostly original but one word changed" when it should be more, check whether the hallucination guard rejected a legitimate rewrite. Tune `_HALLUCINATION_THRESHOLD_SMARTFIX` up (toward 0.8) for heavy-edit expected inputs; DO NOT disable the guard.
+
 
 ---
 
@@ -159,11 +199,16 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 User selects text → presses hotkey
         │
         ▼
-  ac_model (ModelManager)
+  CorrectionWindow._do_correction()
   ┌─────────────────────────────────────────────────────────────┐
-  │ 1. correct_text_patch() — asks LLM for JSON patches         │
-  │    [{"old": "wether", "new": "weather"}, ...]               │
-  │ 2. If patch fails → correct_text() — full corrected text    │
+  │ correction_method == "patch" (default):                     │
+  │   correct_text_patch() — indexed-word patches, up to 3      │
+  │   passes; [{"i":3,"new":"weather"},...]                     │
+  │   On malformed JSON → falls back to streaming smart_fix     │
+  │                                                             │
+  │ correction_method == "stream":                              │
+  │   _start_streaming_correction() — streams full corrected    │
+  │   text token-by-token; strength = "conservative"|"smart_fix"│
   └─────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -204,9 +249,12 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - `strip_meta_commentary(text)` — strips LLM preambles ("Here is the corrected text:", code fences)
 - `contains_meta_commentary(text)` — detects if output contains conversational filler
 - `_extract_content_from_response(resp)` — extracts `(content, finish_reason)` from API response; detects thinking models where `content` is empty and `reasoning_content` has output
-- `_extract_patches_from_response(raw)` — extracts JSON patches; returns `None` on parse failure (triggers fallback), `[]` for valid empty (text already correct)
-- `_apply_patches(original, patches)` — word-level regex patches with case-insensitive fallback + post-processing (contractions, capitalization, standalone 'i')
-- `_chunk_text_by_sentences(text, max_words)` — splits text at sentence/paragraph boundaries into chunks of ≤ max_words; returns `(chunk_text, separator)` tuples for lossless reassembly; used by `correct_text_patch()` to avoid context window overflow on long texts
+- `_tokenize_with_ws(text)` — splits text into `(leading_ws, [(word, trailing_ws), ...])` for lossless reassembly (still used by word counting helpers)
+- `_dict_prepass(text)` — Phase 0 deterministic typo pre-pass; applies `_COMMON_TYPOS_MAP` with case preservation; returns `(fixed_text, n_fixes)`
+- `_hallucination_ratio(orig, corr)` — Phase 2 edit-distance guard; returns `1 - difflib.SequenceMatcher(None, orig.split(), corr.split()).ratio()`; per-unit, not global
+- `_extract_rewritten_sentence(raw)` — pulls sentence content from `<<<START>>>…<<<END>>>` markers; returns `None` on missing/ambiguous output so caller keeps the original unit
+- `_apply_post_fixes(text, original)` — deterministic safety net: standalone `i`→`I`, first-letter cap, contractions, cap after `.?!`, restore trailing punct from original, collapse word duplicates (preserving "had had")
+- `_chunk_text_by_sentences(text, max_words)` — splits text at sentence/paragraph boundaries into chunks of ≤ max_words; returns `(chunk_text, separator)` tuples for lossless reassembly; called with `max_words=40` by `correct_text_patch()` to produce sentence-scale units
 - `_checkbox_css()` — generates QSS for checkbox checkmark using SVG (Qt theme blocks native rendering)
 - `has_nvidia()` — detects NVIDIA GPU via nvidia-smi
 - `log(msg)` — timestamped append to `app_debug.log`
@@ -221,16 +269,17 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - Key methods:
   - `load_model()` — kills orphaned servers, injects CUDA PATH, starts server, polls `/health` up to 180 s
   - `unload_model()` — terminates server process
-  - `correct_text(text, system, examples)` — non-streaming correction
-  - `correct_text_patch(text, system, examples)` — JSON patch correction (preferred, tried first)
-  - `make_stream_worker(messages)` — returns `StreamWorker` for SSE streaming (chat only)
+  - `correct_text_patch(text, custom_sys, strength, cancel_event)` — three-phase sentence rewrite (dict pre-pass → parallel LLM rewrite → hallucination guard). Returns `(text, units)` where `units` is the count of sentence units sent to the LLM (0 on fast-path). Returns `(None, n)` for total failure → caller falls back to streaming
+  - `_rewrite_sentence_chunk(chunk_text, custom_sys, unit_idx, total, strength)` — single sentence rewrite via `<<<START>>>…<<<END>>>` markers; `max_tokens = min(max(word_count*1.6+32, 128), 512)`; returns corrected string or `None`
+  - `make_stream_worker(messages)` — returns `StreamWorker` for SSE streaming (chat and streaming correction)
   - `check_idle()` — QTimer every 60 s; unloads if idle > timeout (skip if `keep_model_loaded`)
 - All API payloads send `"think": False`
 - Server launched with `--reasoning off` and `--no-warmup`
 
 ### `CorrectionWindow(QWidget)`
 - Main popup; appears near cursor on hotkey press
-- `_do_correction()` — background thread; tries patch → falls back to full-text
+- `_do_correction()` — dispatches to `correct_text_patch()` or `_start_streaming_correction()` based on `correction_method` config; patch malformed output auto-falls back to streaming
+- `_start_streaming_correction(text, custom_sys, strength)` — minimal system prompt + user message; no few-shot examples; streams into `corr_edit` live via `StreamWorker`
 - `_send_chat()` — routes to `ac_model` when `ac_same_as_chat=True` and AC is loaded
 - `_do_stream()` — picks correct ModelManager backend, creates StreamWorker
 - `_render_diff(text)` — word-level diff with `\x00NL\x00` newline placeholder → `<br>` in HTML
@@ -272,8 +321,8 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 | `idle_timeout_seconds` | `300` | Unload after N seconds idle (only if `keep_model_loaded=false`) |
 | `hotkey` | `ctrl+shift+space` | Global hotkey |
 | `system_prompt` | `""` | Override LLM system prompt (blank = use built-in) |
-| `correction_mode` | `1` | 0 = conservative, 1 = Smart Fix (patch-based) |
-| `correction_strength` | `4` | 0=Minimal, 1=Light, 2=Standard, 3=Thorough, 4=Full Rewrite |
+| `correction_method` | `"patch"` | `"patch"` = indexed-word patches; `"stream"` = full text streamed token-by-token |
+| `streaming_strength` | `"smart_fix"` | `"conservative"` = typos only; `"smart_fix"` = full grammar/punct/caps (only applies when `correction_method="stream"`) |
 | `custom_templates` | `[]` | User-defined chat/rewrite templates |
 
 ---
@@ -314,12 +363,26 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - `--reasoning-budget 0` server flag (replaced by `--reasoning off`)
 - All test scripts (`test_*.py`, `check_*.py`, `inspect_*.py`)
 - `build.ps1`, `download_models.bat`, `update_llama_cpp.bat`
+- Indexed-word JSON patch format (`[{"i":N,"new":"..."}]`) — replaced 2026-04-24 by sentence rewrite. The format exceeded what 2B-class models could reliably hold; output scaled with input not edit count; pass-2 oscillation produced duplicate words. Do not reintroduce indexed patches, few-shot JSON examples, `_parse_indexed_patches`, or any multi-pass feedback loop.
+- `response_format.json_schema` grammar-constrained decoding — 3–10× slowdown from per-token schema filtering (removed 2026-04-17). The new sentence-rewrite format doesn't need it.
+- `_patch_correct_chunk()` method signature and `_apply_indexed_patches()` helper — replaced by `_rewrite_sentence_chunk()` + plain string diff.
 
 ---
 
 ## Session History
 
-### 2026-04-22 (latest)
+### 2026-04-24 (latest)
+- **Patch method full rewrite — indexed-JSON → parallel sentence rewrite.** The indexed-word patch format (`[{"i":3,"new":"..."}]`) was failing in both directions observed in `app_debug.log`: short texts produced no-op floods and adjacent-word duplicates (pass-2 oscillation: "curse curse", "lady lady"), long texts hit `finish_reason=length` on truncated JSON and fell back to 24-second streaming. Root cause: (a) per-slot ctx is only ~3200 tokens (`--ctx-size 12800 / --parallel 4`), not the assumed full ctx; (b) the structured-enumeration format exceeds what 2B-class instruct models can reliably hold; (c) multi-pass feedback amplifies errors on already-clean text.
+- **New pipeline** (Phase 0 → Phase 1 → Phase 2): `_dict_prepass()` resolves ~150 common typos (teh→the, recieve→receive) case-preservingly with zero LLM cost and a fast-path skip for short well-formed texts. `_rewrite_sentence_chunk()` rewrites each sentence unit between `<<<START>>>`/`<<<END>>>` markers, with up to 4 units running concurrently through the existing `--parallel 4` llama-server slots. `_hallucination_ratio()` rejects any unit whose edit-distance drift exceeds threshold (0.4 conservative / 0.6 smart_fix), keeping the original text for that unit. Single pass only — no feedback loop.
+- **Deleted**: `_parse_indexed_patches()`, `_apply_indexed_patches()`, `_PATCH_SYSTEM_PROMPT`, `_PATCH_SYSTEM_PROMPT_CONSERVATIVE`, `_PATCH_FEW_SHOT`, `_patch_correct_chunk()`, the multi-pass loop, `prev_changes`/`prev_text` divergence guard, `mostly_echo`/`suspicious` heuristics, consecutive-duplicate patch filter. Replaced by: `_COMMON_TYPOS_MAP`, `_dict_prepass()`, `_HALLUCINATION_THRESHOLD_*`, `_hallucination_ratio()`, `_SENTENCE_REWRITE_PROMPT`, `_SENTENCE_REWRITE_PROMPT_CONSERVATIVE`, `_REWRITE_MARKER_RE`, `_extract_rewritten_sentence()`, `_rewrite_sentence_chunk()`.
+- **Locked rules updated**: #11 (three-phase pipeline), #12 (single-pass, no multi-pass), #14 (param-flow path renamed), #22 (explicitly deleted/superseded), #25 (40-word units not 180), #26 (unit-failure kept-original not global fallback), #27 (edit-distance hallucination guard replaces divergence guard), #28 (dict pre-pass fast-path conditions).
+- **Return-tuple semantics**: `correct_text_patch()` second element is now `units` (sentence count) instead of `passes_run`. Fast path returns `units=0`. `_do_correction()` badge updated to show "Patch (Smart Fix, N units)".
+
+### 2026-04-22
+
+- **Correction engine complete rewrite** — Old patch format `{"old":"...","new":"..."}` allowed whole-sentence rewrites (model ignored "1-3 words" rule) and mandatory pass-2 verification → ~4× slower than streaming for same text. New indexed-word format: words numbered `[1] w [2] w`, model outputs `[{"i":N,"new":"...","span":M?}]`. Output tokens scale with edit count, not text length. Single-pass indexed patches are ~50 tokens for a 200-word text vs ~932 tokens for old 2-pass.
+- **Two delivery modes in settings**: (1) Patch — indexed-word patches, up to 3 passes until converged; (2) Streaming Conservative / Streaming Smart Fix — full text streamed token-by-token with minimal system prompt only (no few-shot examples). Config keys changed from `correction_mode` (int) to `correction_method` ("patch"|"stream") + `streaming_strength` ("conservative"|"smart_fix"). One-time migration in `ConfigManager._load` handles old `correction_mode` keys.
+- **Deleted**: `correct_text()` (full non-streaming correction), `_apply_patches()`, `_extract_patches_from_response()`. Replaced by `_tokenize_with_ws()`, `_parse_indexed_patches()`, `_apply_indexed_patches()`, `_apply_post_fixes()`.
 - **Fixed: Hotkey modifier leakage and hook execution errors** — The previous migration to `pynput` caused modifier leakage (e.g. `Ctrl+Shift+Space` causing `Ctrl+Shift+C` to trigger the browser inspector) and space characters to leak into text. Reverted hotkey detection back to `keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=True)` to honor Rule 21, but maintained `pynput.keyboard.Controller` for reliable `Ctrl+C` / `Ctrl+V` injection. Fixed the Graphify `BeforeTool` hook in `.gemini/settings.json` which failed on Windows due to bash syntax (`[ -f ... ]`); rewritten to use cross-platform `python -c`.
 - **Refactored Hotkey System**: Replaced the `keyboard` module with `pynput` to resolve severe bugs where the app would hold modifier keys (Ctrl) at the OS level, causing erratic zooming and scrolling. Implemented a Qt-safe queue + `QTimer` polling architecture so that the pynput background listener does not emit Qt signals directly, preventing cross-thread crashes. The clipboard capture now correctly utilizes `pynput.keyboard.Controller` for simulated Ctrl+C/Ctrl+V presses.
 - **Refactor Clean**: Ran dead code analysis (vulture) and surgically removed unused Qt imports (`QSlider`, `QPoint`, `QSize`), redundant OS variables, unreachable code, and an entirely unused `chat_with_model` non-streaming method.
@@ -374,7 +437,7 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - **Fixed: line breaks lost in output** — `_render_diff()` now uses `\x00NL\x00` placeholder around `\n` before word-splitting; renders as `<br>` in HTML. Preserves email/paragraph formatting.
 - **Fixed: chat "loading model" message every time** — `_send_chat()` now checks `ac_same_as_chat` and routes to `ac_model` directly, skipping chat model load.
 - **build.py rewritten** — Auto-detects llama-server from config; bundles CUDA DLLs; complete `RELEASE_CONFIG`; platform checks use `PLATFORM` variable (not `sys.platform`) to avoid Pylance unreachable-code hints.
-- **README.md rewritten** — Updated to v4.0, removed LanguageTool/Java references, documents CUDA DLL requirement.
+- **README.md rewritten** — Updated to v3.1, removed LanguageTool/Java references, documents CUDA DLL requirement.
 
 ### 2026-04-08
 - **Fixed: thinking models broke all corrections** — Added `"think": false` to all API payloads; added `_extract_content_from_response()` helper to detect empty-content thinking responses.
@@ -396,7 +459,7 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 | Version | Summary |
 |---------|---------|
-| **v4.0** | CUDA DLL injection, `--reasoning off`, read-only output boxes, line break preservation in diff, single-server chat routing, build.py auto-detect |
+| **v3.1** | CUDA DLL injection, `--reasoning off`, read-only output boxes, line break preservation in diff, single-server chat routing, build.py auto-detect |
 | **v2.10** | Patch-based autocorrect (JSON `{old,new}` patches), fallback to full-text |
 | **v2.9** | LanguageTool removed; LLM-only; dual model (AC eager + chat lazy); correction strength 0–4 |
 | **v2.8** | Bug fixes: nativeEvent segfault, scroll wheel spinboxes, HTML escaping, global exception hook |

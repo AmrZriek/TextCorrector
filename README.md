@@ -1,4 +1,4 @@
-# TextCorrector v4.0
+# TextCorrector v3.1
 
 **Instant AI-powered text correction — select text anywhere, press a hotkey, done.**
 
