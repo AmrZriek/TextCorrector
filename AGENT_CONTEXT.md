@@ -66,11 +66,12 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - `build.py` uses PyInstaller → single-folder release + ZIP
 - `build.py` auto-detects the llama-server folder from `config.json`, not hardcoded `llama_cpp/`
 
-### 9. Patch mode: terminal punctuation uses best-fit mark, not always a period
-- When a sentence is missing end-of-sentence punctuation, the patch prompt instructs the model to add whichever mark fits the meaning: `?` for questions, `!` for exclamations, `.` otherwise
-- The phrase "like periods at the ends of sentences" was removed from the prompt — it biased the model to always append a period even on question/exclamation sentences
-- Few-shot examples include a question-mark case (`"came late agian?"`) and an exclamation case (`"wait!"`) to give the model clear precedent
-- Punctuation *correction* (fixing wrong punctuation) is fine; punctuation *insertion that changes meaning* (forcing `.` on a question) is not
+### 9. Sentence rewrite handles punctuation implicitly — no forced period
+- `_SENTENCE_REWRITE_PROMPT` (line ~737) says "Fix typos, spelling, grammar, punctuation, and capitalization" — the model adds whichever mark fits the meaning because it rewrites the full sentence
+- There is no explicit "add period / question mark / exclamation" instruction; the sentence-rewrite format lets the model see the full sentence and choose the correct terminal mark
+- Do NOT add a rule "always append a period" — it causes the same bias that was removed in 2026-04-20
+- Punctuation *correction* (fixing wrong marks) is fine; punctuation *insertion that changes meaning* (forcing `.` on a question) is not
+- NOTE: The old `_PATCH_SYSTEM_PROMPT` and few-shot examples were deleted in 2026-04-24. The rules about punctuation are now enforced solely through `_SENTENCE_REWRITE_PROMPT`.
 
 ### 10. Custom system prompt is appended, never replaces
 - When `system_prompt` config is set, it is appended to the base prompt as `"\n\nAdditional instructions:\n{custom_sys}"` — never replaces the base constraints
@@ -101,10 +102,10 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - Do NOT remove any of these guards — without them, holding the keys spawned overlapping threads, each firing its own notification in a feedback loop
 
 ### 14. Sampling params must flow through CLI AND every request payload
-- `load_model()` passes `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty`
-- `_rewrite_sentence_chunk()` payload includes the same set (except `temperature`, forced to `0.0` and `top_k=1` for patch-mode determinism — we want the same rewrite every time for identical input)
-- `make_stream_worker()` payload includes all seven using config values (user-controlled sampling for chat + streaming fallback)
-- If you add a new sampling setting, wire it through all three paths — leaving any path unwired means the setting silently has no effect
+- `load_model()` passes `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--frequency-penalty`, `--presence-penalty` (all from config)
+- `_rewrite_sentence_chunk()` payload **hardcodes ALL sampling params** for full determinism: `temperature=0.0`, `top_k=1`, `top_p=0.95`, `min_p=0.05`, `repeat_penalty=1.0`, `frequency_penalty=0.0`, `presence_penalty=0.0`. None come from config — we want the same rewrite every time for identical input, regardless of user settings.
+- `make_stream_worker()` payload includes all seven **from config values** (user-controlled sampling for chat + streaming fallback)
+- If you add a new sampling setting, wire it through `load_model()` CLI and `make_stream_worker()`. Do NOT wire it into `_rewrite_sentence_chunk()` — that path must stay fully deterministic.
 
 ### 15. First-run setup dialog on blank model_path
 - `TextCorrectorApp.__init__` schedules `_show_first_run()` via `QTimer.singleShot(800, ...)` when `model_path` is blank
@@ -116,17 +117,17 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - `--keep-folder` opts out for local debugging; `--no-zip` also preserves folders
 - Reason: users saw `build/TextCorrector/TextCorrector.exe`, double-clicked it, and got "Failed to load Python DLL python313.dll" because that folder is PyInstaller's intermediate scratch (missing assets and python3*.dll). A single ZIP removes the footgun.
 
-### 17. Tiny-model (<1B) safeguards — three layers remain
-- **Load-time warning:** `ModelManager.model_warning` signal + tray popup when `_model_size_billions() < 1.0`
-- **Output guards:** `_is_corrupt_output()` (rejects `[UNK_BYTE_...]`, control chars, ≥2 `▁` artifacts) and `_is_fewshot_echo()` (rejects verbatim few-shot example outputs) apply in both patch and full-text paths
-- **Simplified prompt branch:** when `_is_tiny` (size_b < 1.0), Smart Fix uses a minimal 3-line system prompt instead of the full rule list
-- **DO NOT re-add `response_format.json_schema` to `correct_text_patch()` payload** — grammar-constrained decoding in llama.cpp filters every sampled token, causing 3–10× slowdown that made autocorrect hang on any text. Removed 2026-04-17. The existing output guards are sufficient.
+### 17. Tiny-model (<1B) safeguards — two layers remain
+- **Load-time warning:** `ModelManager.model_warning` signal + tray popup when `_model_size_billions() < 1.0` (line ~1354). This is a heads-up only; correction still proceeds.
+- **Output guards:** `_is_corrupt_output()` (rejects `[UNK_BYTE_...]`, control chars, ≥2 `▁` artifacts) and `_is_fewshot_echo()` (rejects verbatim few-shot example outputs) are called inside `_rewrite_sentence_chunk()`. On rejection the unit returns `None` and the caller keeps the original unit text.
+- **Simplified prompt branch (`_is_tiny`) was removed in 2026-04-24** when the patch method was fully rewritten to sentence-rewrite. `_rewrite_sentence_chunk()` has no model-size check — it uses `_SENTENCE_REWRITE_PROMPT` / `_SENTENCE_REWRITE_PROMPT_CONSERVATIVE` unconditionally. Do NOT re-add a size branch without verifying it's still needed; the current prompts are already compact.
+- **DO NOT re-add `response_format.json_schema` to `correct_text_patch()` payload** — grammar-constrained decoding in llama.cpp filters every sampled token, causing 3–10× slowdown. Removed 2026-04-17. The output guards are sufficient.
 - Recommended model: Gemma 4 E2B Unsloth UD Q4_K_XL (bundled via `download_model.bat/.sh`, defined as `_RECOMMENDED_MODEL_URL` in `build.py`)
 
 ### 18. Context-window math uses config value
-- The system uses the user's configured `context_size` (default 12800) for all chunking math.
-- The `actual_ctx_size` from `/props` is logged for diagnostic purposes but ignored for math because some GGUF metadata underreports capacity (e.g. Gemma 4 E2B reports 4096 but handles 12800 perfectly).
-- Output budget is `clamp(estimated_input_words × 4, 256, 2048)` to prevent models from generating thousands of no-op patches and hitting `finish_reason=length`.
+- The system uses the user's configured `context_size` (default 12800) for the `--ctx-size` CLI flag passed to llama-server.
+- The `actual_ctx_size` from `/props` is logged for diagnostic purposes but ignored for chunking math because some GGUF metadata underreports capacity (e.g. Gemma 4 E2B reports 4096 but handles 12800 perfectly).
+- Per-unit output budget in `_rewrite_sentence_chunk()`: `max_tokens = min(max(int(word_count * 1.6) + 32, 128), 512)` — scales with input words, floor 128, hard cap 512. The cap is 512 (not 2048) because sentence units are short and the model emits full sentences, not indexes.
 
 ### 20. Patch prompt must not modify numbers, dates, or intentional ALL CAPS
 - The patch system prompt contains explicit rules: "NEVER change numbers, dates, URLs, code, or specific values" and "NEVER alter intentional styling: preserve ALL CAPS words, initialisms (NASA, USA), and Title Case exactly as the user wrote them"
@@ -134,11 +135,13 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - Only fix capitalization that is clearly a typing mistake (lowercase `i` pronoun, lowercase first word of sentence)
 - Do NOT remove these rules — they were added after confirmed user-visible bugs
 
-### 21. Hotkey registered with suppress=True and trigger_on_release=False
-- `keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=False)`
+### 21. Hotkey registered with suppress=True and trigger_on_release=True
+- `keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=True)`
 - `suppress=True` consumes the key combination so it does NOT pass through to the focused app.
-- `trigger_on_release=False` ensures the hotkey triggers instantly without the ~110ms dead time.
-- **CRITICAL:** Do NOT inject artificial `keyboard.release()` calls for modifier keys (Ctrl/Shift/Alt) to "clear" their state while the user might still be physically holding them. This desynchronizes the OS modifier state machine, leaving the `Ctrl` key permanently stuck down in Windows. Instead, use a physical release wait loop (`while keyboard.is_pressed: ...`) with a generous deadline (e.g., 1.5s). Artificial release events are a dead-end fix that breaks system accessibility.
+- `trigger_on_release=True` — the callback fires after the user has fully released all keys in the chord. This ensures the `keyboard` library's internal modifier-state machine is clean when the callback runs.
+- **CRITICAL — do NOT change back to `trigger_on_release=False`:** On Windows, firing on PRESS means the library's low-level hook (`WH_KEYBOARD_LL`) holds its modifier state machine in "match in progress" while the user still physically holds Ctrl+Shift. Under timing quirks this leaks a phantom "Ctrl held" state into every other application's input queue for the entire session. The app appearing to hold Ctrl down system-wide (causing accidental Ctrl+C, zooming, DevTools openings) is the confirmed symptom. Closing the app removes the hook and clears the phantom state. Rebooting resets OS input state — making any artificial-release workaround regress after restart. **trigger_on_release=True is the correct value.**
+- **Also CRITICAL:** Do NOT inject artificial `keyboard.release()` calls for modifier keys. This desynchronizes the OS modifier state machine and the phantom Ctrl state returns after any process restart. Dead-end — confirmed multiple times.
+- Cost: ~100ms delay between pressing the hotkey and the popup appearing (callback fires on key release, not press). This is an acceptable trade for a working system.
 
 ### 22. Pass termination — DELETED (superseded by single-pass sentence rewrite, rule #12)
 - The old multi-pass loop and its termination heuristics were removed 2026-04-24 along with the indexed-JSON format. Do NOT re-add any form of "feed corrected text back for another pass" logic — it's the root cause of short-text oscillation.
@@ -371,7 +374,11 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-24 (latest)
+### 2026-04-25 (latest)
+- **Fixed: Ctrl key permanently held down system-wide while app is running** — Root cause: `trigger_on_release=False` in `keyboard.add_hotkey(suppress=True)` caused the library's `WH_KEYBOARD_LL` low-level hook to hold its modifier-state machine in "match in progress" while the user still physically held Ctrl+Shift after the hotkey fired on PRESS. Under Windows timing quirks, the hook's replay logic leaked a phantom "Ctrl pressed" event into every other app's input queue for the app's lifetime. Closing the app uninstalled the hook and immediately resolved the symptom; rebooting reset OS input state which caused artificial-release workarounds (tried by prior agents) to regress. Fix: changed `trigger_on_release=False` → `trigger_on_release=True` at `text_corrector.py:3156`. Callback now fires after user releases all keys so the state machine is clean. Cost: ~100ms latency on hotkey press (acceptable trade).
+- **Audited all 28 locked rules against current code.** Corrections: Rule 9 updated to reference `_SENTENCE_REWRITE_PROMPT` (old `_PATCH_SYSTEM_PROMPT` was deleted 2026-04-24). Rule 14 clarified that `_rewrite_sentence_chunk` hardcodes ALL sampling params for determinism (not just temp/top_k). Rule 17 updated to remove the `_is_tiny` simplified prompt branch which was deleted in the 2026-04-24 sentence-rewrite refactor. Rule 18 corrected max_tokens formula to match actual code (`min(max(word_count*1.6+32, 128), 512)`, cap is 512 not 2048). Rule 21 updated to reflect `trigger_on_release=True` with full explanation of why False is a permanent dead-end.
+
+### 2026-04-24
 - **Patch method full rewrite — indexed-JSON → parallel sentence rewrite.** The indexed-word patch format (`[{"i":3,"new":"..."}]`) was failing in both directions observed in `app_debug.log`: short texts produced no-op floods and adjacent-word duplicates (pass-2 oscillation: "curse curse", "lady lady"), long texts hit `finish_reason=length` on truncated JSON and fell back to 24-second streaming. Root cause: (a) per-slot ctx is only ~3200 tokens (`--ctx-size 12800 / --parallel 4`), not the assumed full ctx; (b) the structured-enumeration format exceeds what 2B-class instruct models can reliably hold; (c) multi-pass feedback amplifies errors on already-clean text.
 - **New pipeline** (Phase 0 → Phase 1 → Phase 2): `_dict_prepass()` resolves ~150 common typos (teh→the, recieve→receive) case-preservingly with zero LLM cost and a fast-path skip for short well-formed texts. `_rewrite_sentence_chunk()` rewrites each sentence unit between `<<<START>>>`/`<<<END>>>` markers, with up to 4 units running concurrently through the existing `--parallel 4` llama-server slots. `_hallucination_ratio()` rejects any unit whose edit-distance drift exceeds threshold (0.4 conservative / 0.6 smart_fix), keeping the original text for that unit. Single pass only — no feedback loop.
 - **Deleted**: `_parse_indexed_patches()`, `_apply_indexed_patches()`, `_PATCH_SYSTEM_PROMPT`, `_PATCH_SYSTEM_PROMPT_CONSERVATIVE`, `_PATCH_FEW_SHOT`, `_patch_correct_chunk()`, the multi-pass loop, `prev_changes`/`prev_text` divergence guard, `mostly_echo`/`suspicious` heuristics, consecutive-duplicate patch filter. Replaced by: `_COMMON_TYPOS_MAP`, `_dict_prepass()`, `_HALLUCINATION_THRESHOLD_*`, `_hallucination_ratio()`, `_SENTENCE_REWRITE_PROMPT`, `_SENTENCE_REWRITE_PROMPT_CONSERVATIVE`, `_REWRITE_MARKER_RE`, `_extract_rewritten_sentence()`, `_rewrite_sentence_chunk()`.

@@ -3151,10 +3151,12 @@ class TextCorrectorApp(QApplication):
                 pass
 
         try:
-            # suppress=True   -> chord is consumed, never reaches focused app (Rule 21)
-            # trigger_on_release=False -> fire on press, removes the ~110ms latency
-            keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=False)
-            log(f"[Hotkey] registered on-press: {hk}")
+            # suppress=True        -> chord is consumed, never reaches focused app (Rule 21)
+            # trigger_on_release=True -> fire on release so library's modifier-state machine
+            #                           is already clean when callback runs; avoids leaking
+            #                           phantom Ctrl-held state to other apps (see Rule 21)
+            keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=True)
+            log(f"[Hotkey] registered on-release: {hk}")
             self._hotkey_timer = QTimer(self)
             self._hotkey_timer.timeout.connect(self._check_hotkey_queue)
             self._hotkey_timer.start(20)  # 20ms (was 50ms)
