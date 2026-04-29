@@ -307,7 +307,7 @@ FIRST RUN
 2. Run download_model.bat to get a recommended model
 3. Launch TextCorrector.exe
 4. Open Settings → set Server Path and Model Path
-5. Press Ctrl+Shift+Space anywhere to correct selected text
+5. Press F9 anywhere to correct selected text
 """
 
 SETUP_NOTES_UNIX = """TextCorrector — Setup
@@ -325,7 +325,7 @@ FIRST RUN
 2. Run ./download_model.sh to get a recommended model
 3. ./run.sh
 4. Open Settings → set Server Path and Model Path
-5. Press Ctrl+Shift+Space anywhere to correct selected text
+5. Press F9 anywhere to correct selected text
 """
 
 

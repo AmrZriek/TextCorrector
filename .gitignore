@@ -35,3 +35,7 @@ TextCorrector_Release/
 graphify-out/
 *.spec
 *.zip
+
+# Tests
+tests/
+.pytest_cache/

@@ -25,9 +25,7 @@ os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
 # ── third-party ─────────────────────────────────────────────────────────────
-from pynput.keyboard import Key, Controller
 import keyboard
-import queue
 import pyperclip
 import requests
 
@@ -252,6 +250,172 @@ def has_nvidia() -> bool:
         return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
         return False
+
+
+# ── Windows input + clipboard helpers ──────────────────────────────────────
+# Bypass the `keyboard` and `pyperclip` Python wrappers and call Win32
+# directly. The wrappers layer their own state on top of the OS, which on
+# Windows manifests as (a) Ctrl getting "stuck" after `keyboard.send`
+# (synthesized keyup occasionally dropped) and (b) clipboard reads losing
+# Unicode beyond the BMP (emojis = surrogate pairs). SendInput +
+# CF_UNICODETEXT round-trip handle both cleanly.
+VK_CONTROL = 0x11
+VK_C = 0x43
+VK_V = 0x56
+KEYEVENTF_KEYUP = 0x0002
+INPUT_KEYBOARD = 1
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+if WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    ULONG_PTR = ctypes.c_size_t
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ULONG_PTR),
+        ]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ULONG_PTR),
+        ]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        ]
+
+    class _INPUT_I(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _anonymous_ = ("i",)
+        _fields_ = [("type", wintypes.DWORD), ("i", _INPUT_I)]
+
+    _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+    _user32.SendInput.restype = wintypes.UINT
+
+    _user32.OpenClipboard.argtypes = (wintypes.HWND,)
+    _user32.OpenClipboard.restype = wintypes.BOOL
+    _user32.CloseClipboard.argtypes = ()
+    _user32.CloseClipboard.restype = wintypes.BOOL
+    _user32.EmptyClipboard.argtypes = ()
+    _user32.EmptyClipboard.restype = wintypes.BOOL
+    _user32.GetClipboardData.argtypes = (wintypes.UINT,)
+    _user32.GetClipboardData.restype = wintypes.HANDLE
+    _user32.SetClipboardData.argtypes = (wintypes.UINT, wintypes.HANDLE)
+    _user32.SetClipboardData.restype = wintypes.HANDLE
+
+    _kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    _kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    _kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+    _kernel32.GlobalLock.restype = wintypes.LPVOID
+    _kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+    _kernel32.GlobalUnlock.restype = wintypes.BOOL
+    _kernel32.GlobalSize.argtypes = (wintypes.HGLOBAL,)
+    _kernel32.GlobalSize.restype = ctypes.c_size_t
+
+
+def _open_clipboard_retry(retries: int = 10, delay: float = 0.01) -> bool:
+    for _ in range(retries):
+        if _user32.OpenClipboard(None):
+            return True
+        time.sleep(delay)
+    return False
+
+
+def _clipboard_read_text() -> str:
+    """Read CF_UNICODETEXT from the system clipboard.
+
+    Decodes as UTF-16-LE, so emoji and other astral-plane characters
+    (surrogate pairs) round-trip cleanly. Returns "" if no text is present
+    or the clipboard cannot be opened.
+    """
+    if not WINDOWS:
+        return pyperclip.paste()
+    if not _open_clipboard_retry():
+        return ""
+    try:
+        h = _user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return ""
+        ptr = _kernel32.GlobalLock(h)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            _kernel32.GlobalUnlock(h)
+    finally:
+        _user32.CloseClipboard()
+
+
+def _clipboard_write_text(text: str) -> None:
+    """Write text to the system clipboard as CF_UNICODETEXT (UTF-16-LE).
+
+    Encoding via `utf-16-le` preserves astral-plane characters as surrogate
+    pairs, which CF_UNICODETEXT consumers expect.
+    """
+    if not WINDOWS:
+        pyperclip.copy(text)
+        return
+    if not _open_clipboard_retry():
+        return
+    try:
+        _user32.EmptyClipboard()
+        data = text.encode("utf-16-le") + b"\x00\x00"
+        h = _kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not h:
+            return
+        ptr = _kernel32.GlobalLock(h)
+        if not ptr:
+            return
+        try:
+            ctypes.memmove(ptr, data, len(data))
+        finally:
+            _kernel32.GlobalUnlock(h)
+        if not _user32.SetClipboardData(CF_UNICODETEXT, h):
+            return
+    finally:
+        _user32.CloseClipboard()
+
+
+def _send_ctrl_chord(vk: int) -> None:
+    """Press Ctrl, press `vk`, release `vk`, release Ctrl — atomically.
+
+    Uses a single SendInput call on Windows so the OS sees the four events
+    in one batch. On other platforms falls back to `keyboard.send`.
+    """
+    if WINDOWS:
+        arr = (INPUT * 4)()
+        for idx, (code, flags) in enumerate((
+            (VK_CONTROL, 0),
+            (vk, 0),
+            (vk, KEYEVENTF_KEYUP),
+            (VK_CONTROL, KEYEVENTF_KEYUP),
+        )):
+            arr[idx].type = INPUT_KEYBOARD
+            arr[idx].ki = _KEYBDINPUT(code, 0, flags, 0, 0)
+        _user32.SendInput(4, arr, ctypes.sizeof(INPUT))
+    else:
+        keyboard.send("ctrl+c" if vk == VK_C else "ctrl+v")
 
 
 def friendly_name(path: str) -> str:
@@ -858,7 +1022,7 @@ DEFAULT_CONFIG: dict = {
     "ac_model_path": "",
     "ac_same_as_chat": True,
     # Hotkey
-    "hotkey": "ctrl+shift+space",
+    "hotkey": "f9",
     # Misc
     "system_prompt": "",
     # Correction delivery: "patch" (fast word-level edits) | "stream" (token-by-token full text)
@@ -964,6 +1128,11 @@ _QT_KEYS = {
     Qt.Key.Key_F10: "f10",
     Qt.Key.Key_F11: "f11",
     Qt.Key.Key_F12: "f12",
+    Qt.Key.Key_Pause: "pause",
+    Qt.Key.Key_Insert: "insert",
+    Qt.Key.Key_ScrollLock: "scroll lock",
+    Qt.Key.Key_Print: "print screen",
+    Qt.Key.Key_Menu: "menu",
 }
 _MOD_KEYS = {
     Qt.Key.Key_Control,
@@ -971,6 +1140,16 @@ _MOD_KEYS = {
     Qt.Key.Key_Alt,
     Qt.Key.Key_Meta,
     Qt.Key.Key_AltGr,
+}
+# Keys that don't insert text into a focused field, so they're safe as a
+# standalone hotkey without a Ctrl/Shift/Alt modifier (the chord leaks to
+# the focused app under our `keyboard.add_hotkey` defaults).
+_STANDALONE_OK = {
+    Qt.Key.Key_F1, Qt.Key.Key_F2, Qt.Key.Key_F3, Qt.Key.Key_F4,
+    Qt.Key.Key_F5, Qt.Key.Key_F6, Qt.Key.Key_F7, Qt.Key.Key_F8,
+    Qt.Key.Key_F9, Qt.Key.Key_F10, Qt.Key.Key_F11, Qt.Key.Key_F12,
+    Qt.Key.Key_Pause, Qt.Key.Key_Insert, Qt.Key.Key_ScrollLock,
+    Qt.Key.Key_Print, Qt.Key.Key_Menu,
 }
 
 
@@ -1019,14 +1198,12 @@ class HotkeyEdit(QLineEdit):
             self._recording = True
             self.setStyleSheet(self._REC)
             super().setText("Press keys…")
-            # pynput doesn't need unhooking — just ignore global hotkey
 
     def focusOutEvent(self, e):
         if self._recording:
             self._recording = False
             self.setStyleSheet(self._IDLE)
             self._refresh()
-            # pynput doesn't need re-registration
         super().focusOutEvent(e)
 
     def keyPressEvent(self, e):
@@ -1053,10 +1230,24 @@ class HotkeyEdit(QLineEdit):
             parts.append("shift")
         if mods & Qt.KeyboardModifier.AltModifier:
             parts.append("alt")
+        kn = _QT_KEYS.get(key) or (e.text().lower() or None)
         if not parts:
+            if key in _STANDALONE_OK and kn:
+                parts.append(kn)
+                combo = kn
+                self._recording = False
+                self._combo = combo
+                self.setStyleSheet(self._IDLE)
+                self._refresh()
+                self.shortcut_changed.emit(combo)
+                if self._re_register_cb:
+                    try:
+                        self._re_register_cb()
+                    except Exception:
+                        pass
+                return
             super().setText("Add Ctrl / Shift / Alt…")
             return
-        kn = _QT_KEYS.get(key) or (e.text().lower() or None)
         if not kn:
             return
         parts.append(kn)
@@ -2946,6 +3137,7 @@ def make_tray_icon(color: str) -> QIcon:
 class TextCorrectorApp(QApplication):
     _trigger = pyqtSignal(str)
     _notify = pyqtSignal(str, str)
+    _hotkey_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__(sys.argv)
@@ -2984,13 +3176,10 @@ class TextCorrectorApp(QApplication):
         # only one hotkey flow runs at a time.
         self._hotkey_busy = threading.Lock()
         self._last_empty_notify_ts = 0.0
-        
-        self._hotkey_queue: queue.Queue = queue.Queue()
-        self._hotkey_timer: QTimer | None = None
-        self._hotkey_suppress_until: float = 0.0  # debounce window after a press
 
         self._trigger.connect(self._show_window)
         self._notify.connect(self._show_notify)
+        self._hotkey_signal.connect(self._hotkey_fired)
         self.ac_model.status_changed.connect(self._on_ac_status)
         self.chat_model.status_changed.connect(self._on_chat_status)
         self.ac_model.model_loaded.connect(lambda: self._set_tray_icon("#3b82f6"))
@@ -3126,40 +3315,23 @@ class TextCorrectorApp(QApplication):
         self._set_tray_icon(color)
 
     def _register_hotkey(self):
-        """Register global hotkey on PRESS (not release) with suppression."""
+        """Register global hotkey using `keyboard` library defaults.
+
+        No `suppress` (would arm a chord matcher that swallows every Ctrl/Shift
+        press system-wide) and no `trigger_on_release` (would drop short presses).
+        Callback runs on the library's background thread and only emits
+        `_hotkey_signal`; Qt's queued connection marshals work to the main thread.
+        """
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        if self._hotkey_timer:
-            try:
-                self._hotkey_timer.stop()
-            except Exception:
-                pass
 
-        hk = self.cfg.get("hotkey", "ctrl+shift+space").lower().strip()
-
-        def on_hotkey():
-            # Coalesce auto-repeat fires while the chord is still held.
-            now = time.monotonic()
-            if now < self._hotkey_suppress_until:
-                return
-            self._hotkey_suppress_until = now + 0.75
-            try:
-                self._hotkey_queue.put_nowait("trigger")
-            except queue.Full:
-                pass
+        hk = self.cfg.get("hotkey", "f9").lower().strip()
 
         try:
-            # suppress=True        -> chord is consumed, never reaches focused app (Rule 21)
-            # trigger_on_release=True -> fire on release so library's modifier-state machine
-            #                           is already clean when callback runs; avoids leaking
-            #                           phantom Ctrl-held state to other apps (see Rule 21)
-            keyboard.add_hotkey(hk, on_hotkey, suppress=True, trigger_on_release=True)
-            log(f"[Hotkey] registered on-release: {hk}")
-            self._hotkey_timer = QTimer(self)
-            self._hotkey_timer.timeout.connect(self._check_hotkey_queue)
-            self._hotkey_timer.start(20)  # 20ms (was 50ms)
+            keyboard.add_hotkey(hk, self._hotkey_signal.emit)
+            log(f"[Hotkey] registered: {hk}")
         except Exception as e:
             log(f"[Hotkey] register failed: {e}")
             self.tray.showMessage(
@@ -3168,21 +3340,11 @@ class TextCorrectorApp(QApplication):
                 QSystemTrayIcon.MessageIcon.Warning,
                 4000,
             )
-    
-    def _check_hotkey_queue(self):
-        """Called every 50ms from main Qt thread — safe to call Qt methods."""
-        try:
-            while True:
-                event = self._hotkey_queue.get_nowait()
-                if event == "trigger":
-                    self._hotkey_fired()
-        except queue.Empty:
-            pass
 
     def _safe_paste(self, retries=5, delay=0.03) -> str:
         for i in range(retries):
             try:
-                return pyperclip.paste()
+                return _clipboard_read_text()
             except Exception as e:
                 if i == retries - 1:
                     log(f"[Clipboard] paste failed: {e}")
@@ -3193,7 +3355,7 @@ class TextCorrectorApp(QApplication):
     def _safe_copy(self, text: str, retries=5, delay=0.03):
         for i in range(retries):
             try:
-                pyperclip.copy(text)
+                _clipboard_write_text(text)
                 return
             except Exception as e:
                 if i == retries - 1:
@@ -3223,34 +3385,16 @@ class TextCorrectorApp(QApplication):
                     pass
                 return
 
-            # Wait until the user physically releases all modifiers, max 1.5s.
-            # `keyboard.is_pressed()` queries the OS key state, not internal records.
-            # This prevents Ctrl+Shift+C being injected while user still holds Ctrl+Shift,
-            # which on most apps triggers DevTools/inspectors instead of copying.
-            deadline = time.monotonic() + 1.5
-            while time.monotonic() < deadline:
-                held = False
-                for mod in ("ctrl", "shift", "alt", "windows", "cmd"):
-                    try:
-                        if keyboard.is_pressed(mod):
-                            held = True
-                            break
-                    except Exception:
-                        pass
-                if not held:
-                    break
-                time.sleep(0.01)
+            # Brief settle so the OS finishes processing the trigger key
+            # release before we synthesize Ctrl+C.
+            time.sleep(0.03)
 
             # Save then clear the clipboard so we can detect "no selection".
             self._old_clip = self._safe_paste()
             self._safe_copy("")
             time.sleep(0.02)
 
-            # Inject Ctrl+C via pynput (more reliable than keyboard.send across OSes).
-            ctrl = Controller()
-            with ctrl.pressed(Key.ctrl):
-                ctrl.press('c')
-                ctrl.release('c')
+            _send_ctrl_chord(VK_C)
 
             # Poll clipboard for the selection (max 12 * 25ms = 300ms).
             selected = ""
@@ -3326,11 +3470,7 @@ class TextCorrectorApp(QApplication):
     def _paste_text(self, text: str):
         self._safe_copy(text)
         time.sleep(0.15)
-        # Use pynput to paste
-        ctrl = Controller()
-        with ctrl.pressed(Key.ctrl):
-            ctrl.press('v')
-            ctrl.release('v')
+        _send_ctrl_chord(VK_V)
         time.sleep(0.1)
         if self._old_clip and self._old_clip != text:
             clip_to_restore = self._old_clip
@@ -3522,11 +3662,6 @@ class TextCorrectorApp(QApplication):
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        if hasattr(self, "_hotkey_timer") and self._hotkey_timer:
-            try:
-                self._hotkey_timer.stop()
-            except Exception:
-                pass
         self.ac_model.unload_model()
         self.chat_model.unload_model()
         self.quit()
