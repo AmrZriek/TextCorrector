@@ -85,10 +85,9 @@ def _get_version() -> str:
     import re
     try:
         text = MAIN_SCRIPT.read_text(encoding="utf-8")
-        for line in text.splitlines()[:8]:
-            m = re.search(r"v(\d+\.\d+(?:\.\d+)?)", line, re.I)
-            if m:
-                return m.group(1)
+        m = re.search(r'APP_VERSION\s*=\s*[\'"]([0-9\.]+)[\'"]', text)
+        if m:
+            return m.group(1)
     except Exception:
         pass
     return datetime.now().strftime("%Y.%m.%d")
@@ -391,6 +390,10 @@ def build(version: str, make_zip: bool, keep_folder: bool):
     # Release config (blank model paths)
     (out_dir / "config.json").write_text(json.dumps(RELEASE_CONFIG, indent=2))
     print("  Written config.json (blank model paths)")
+
+    # VERSION file
+    (out_dir / "VERSION").write_text(version)
+    print(f"  Written VERSION ({version})")
 
     # LICENSE
     if LICENSE_FILE.exists():

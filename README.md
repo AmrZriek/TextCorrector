@@ -1,4 +1,4 @@
-# TextCorrector v3.1
+# TextCorrector v3.2
 
 **Instant AI-powered text correction — select text anywhere, press a hotkey, done.**
 
@@ -9,7 +9,7 @@ TextCorrector lives in the system tray. Select text in any app, press the hotkey
 ## How it works
 
 1. Select text in any application.
-2. Press the hotkey (default `Ctrl + Shift + Space`).
+2. Press the hotkey (default `F9`).
 3. The correction popup appears with grammar/spelling fixes highlighted in blue.
 4. Press **Accept & Paste** (`Ctrl+Enter`) — corrected text is pasted back. Done.
 5. Optionally, type in the **Ask AI** box to make bigger changes (rewrite, shorten, change tone).
@@ -105,7 +105,8 @@ sudo usermod -aG input $USER
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+Shift+Space` | Trigger correction (configurable in Settings) |
+| `F9` | Trigger correction (configurable in Settings) |
+| `F10` | Silent correction — correct & paste with no popup |
 | `Ctrl+Enter` | Accept & paste corrected text |
 | `Escape` | Close popup |
 | `Enter` (in chat box) | Send chat message |
@@ -122,6 +123,27 @@ python build.py
 Produces `dist/TextCorrector_<version>_<platform>.zip` — self-contained, no Python required.
 Uses Nuitka (compiles Python → C → native binary) instead of PyInstaller to avoid Windows Defender false-positive trojan warnings.
 On Windows, `build.py` automatically detects and bundles CUDA 12 runtime DLLs if found.
+
+---
+
+## Automatic updates
+
+Starting from v3.2, TextCorrector checks for new releases on GitHub automatically, 5 seconds after launch. When a newer version is available, the system tray menu changes to:
+
+> **⬆️ TextCorrector vX.Y.Z available — click to update**
+
+Clicking the item downloads the release ZIP, extracts it over the current installation, and restarts the app — all in one step. **Your `config.json`, AI models, and `llama-server` binary are never touched.**
+
+You can also update manually from the command line:
+
+```bash
+python update.py --app   # download and apply the latest release
+```
+
+> [!WARNING]
+> **Do not update `llama-server` independently** from a TextCorrector release.
+> `llama.cpp` ships new builds multiple times per day and frequently makes breaking changes to CLI flags (e.g. `--reasoning-budget`, `--parallel`). Updating it separately from TextCorrector risks the app failing to start the server or producing empty corrections with no error message.
+> Each TextCorrector release bundles a specific, tested `llama-server` build. Let the app's built-in updater handle everything together.
 
 ---
 
@@ -163,6 +185,9 @@ All settings are editable via the Settings dialog. `config.json` is created in t
 
 **Chat shows "loading model" every time:**
 - Enable `ac_same_as_chat = true` in Settings so the chat reuses the already-loaded autocorrect server.
+
+**App updated but corrections are broken / server won't start:**
+- If you manually upgraded `llama-server` outside of a TextCorrector release, that is the likely cause. Restore the `llama-server` binary that shipped with your version of TextCorrector. See the [Automatic updates](#automatic-updates) section.
 
 **App crashes / disappears:**
 - Check `app_debug.log` in the TextCorrector folder — all errors are logged there.

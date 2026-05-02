@@ -14,6 +14,8 @@ Cross-platform: Windows / macOS / Linux.
 Single-file deployment (plus llama_cpp/ binary folder and LLM model .gguf).
 """
 
+APP_VERSION = "3.1.1"
+
 # ── stdlib ─────────────────────────────────────────────────────────────────
 import sys, re, os, threading, time, subprocess, json, socket
 from datetime import datetime
@@ -74,30 +76,12 @@ DEBUG_LOG = SCRIPT_DIR / "app_debug.log"
 
 SERVER_EXE = "llama-server.exe" if WINDOWS else "llama-server"
 
-GITHUB_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+GITHUB_RELEASES_API = "https://api.github.com/repos/AmrZriek/TextCorrector/releases/latest"
 
 
-def _get_local_build_number() -> int:
-    """Return the local llama-server build number (e.g. 8196), or 0 on failure."""
-    try:
-        exe = LLAMA_CPP_DIR / SERVER_EXE
-        if not exe.exists():
-            return 0
-        r = subprocess.run(
-            [str(exe), "--version"],
-            capture_output=True, text=True, timeout=8,
-            **{"creationflags": 0x08000000} if WINDOWS else {},
-        )
-        # Output: "version: 8196 (c99909dd0)"
-        m = re.search(r"version:\s*(\d+)", r.stderr + r.stdout)
-        return int(m.group(1)) if m else 0
-    except Exception:
-        return 0
-
-
-class UpdateChecker(QThread):
-    """Background thread — checks GitHub for a newer llama.cpp release."""
-    update_available = pyqtSignal(str, int)   # (new_tag, new_build_number)
+class AppUpdateChecker(QThread):
+    """Background thread — checks GitHub for a newer TextCorrector release."""
+    update_available = pyqtSignal(str, str, str)   # (new_tag, download_url, release_notes)
     check_done = pyqtSignal()
 
     def run(self):
@@ -109,15 +93,59 @@ class UpdateChecker(QThread):
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-            tag = data.get("tag_name", "")           # e.g. "b8690"
-            m = re.search(r"b(\d+)", tag)
-            if not m:
+            
+            tag = data.get("tag_name", "")           # e.g. "v3.2.0"
+            notes = data.get("body", "")
+            assets = data.get("assets", [])
+
+            if not tag:
                 return
-            remote_build = int(m.group(1))
-            local_build = _get_local_build_number()
-            log(f"[Update] local build={local_build}  remote build={remote_build}  tag={tag}")
-            if remote_build > local_build:
-                self.update_available.emit(tag, remote_build)
+
+            # Clean "v" from versions for comparison (e.g. "v3.1.1" -> "3.1.1")
+            remote_ver = tag.lstrip("vV")
+            local_ver = APP_VERSION.lstrip("vV")
+
+            log(f"[Update] local version={local_ver}  remote version={remote_ver}  tag={tag}")
+
+            # Basic semantic version comparison
+            def _parse_version(v_str):
+                # Handle cases like "3.1.0" or "Release_v3.1.0" gracefully
+                v_str = re.sub(r'[^0-9\.]', '', v_str)
+                parts = []
+                for p in v_str.split("."):
+                    try:
+                        parts.append(int(p))
+                    except ValueError:
+                        parts.append(0)
+                # Pad to at least 3 parts (major.minor.patch)
+                while len(parts) < 3:
+                    parts.append(0)
+                return tuple(parts)
+
+            remote_tuple = _parse_version(remote_ver)
+            local_tuple = _parse_version(local_ver)
+
+            if remote_tuple > local_tuple:
+                # Find the Windows ZIP asset
+                download_url = ""
+                for asset in assets:
+                    name = asset.get("name", "").lower()
+                    if name.endswith(".zip") and "windows" in name:
+                        download_url = asset.get("browser_download_url", "")
+                        break
+                
+                # Fallback if specific windows zip not found, grab any zip
+                if not download_url:
+                    for asset in assets:
+                        if asset.get("name", "").lower().endswith(".zip"):
+                            download_url = asset.get("browser_download_url", "")
+                            break
+
+                if download_url:
+                    self.update_available.emit(tag, download_url, notes)
+                else:
+                    log(f"[Update] New version {tag} found, but no matching ZIP asset.")
+
         except Exception as e:
             log(f"[Update] Check failed: {e}")
         finally:
@@ -587,7 +615,6 @@ def _is_fewshot_echo(raw: str, original: str) -> bool:
         if overlap_ratio > 0.5:
             return False
     return True
-    return True
 
 
 _CONTRACTIONS_MAP = {
@@ -816,9 +843,6 @@ def _chunk_text_by_sentences(text: str, max_words: int) -> list[tuple[str, str]]
     """
     import re
 
-    if len(text.split()) <= max_words:
-        return [(text, "")]
-
     # Split at sentence-ending punctuation followed by whitespace, OR at newlines.
     # The capturing group keeps separators in the result so we can preserve them
     # when reassembling. Sentence boundaries are chosen because they're natural
@@ -846,8 +870,12 @@ def _chunk_text_by_sentences(text: str, max_words: int) -> list[tuple[str, str]]
         candidate = cur_text + cur_sep + sent if cur_text else sent
         candidate_words = cur_words + wc
 
-        if candidate_words > max_words and cur_text:
-            # Adding this sentence would exceed budget — finalize current chunk
+        # Force a chunk boundary on newline separators (formatting-significant)
+        # OR when the word budget would be exceeded.
+        force_split = cur_text and cur_sep.startswith("\n")
+        if (candidate_words > max_words and cur_text) or force_split:
+            # Finalize current chunk; the separator between it and the next chunk
+            # is cur_sep (the newline or whitespace that preceded this sentence).
             chunks.append((cur_text, cur_sep))
             cur_text = sent
             cur_sep = sep
@@ -1032,7 +1060,23 @@ DEFAULT_CONFIG: dict = {
     "streaming_strength": "smart_fix",
     # Custom templates: list of {"name": str, "prompt": str}
     "custom_templates": [],
+    # Silent correction hotkey (F10 default): corrects + auto-pastes without popup
+    "silent_hotkey": "f10",
+    # Silent correction strength: "conservative" (typos) or "smart_fix" (full grammar)
+    "silent_strength": "smart_fix",
 }
+
+
+# Core template definitions shared between CorrectionWindow and the silent
+# correction action selector. Module-level so both consumers reference the same
+# list without duplication.
+CORE_TEMPLATES: list[tuple[str, str]] = [
+    ("📧 Email", "Rewrite this as a professional email with a proper greeting, clear body, and closing. Keep the core message."),
+    ("💬 Social", "Rewrite this as a social media post. Keep the casual tone, original capitalization style, and personality. Make it engaging but don't over-polish it."),
+    ("📝 Formal", "Rewrite this in formal English. Expand contractions, use complete sentences, maintain professional tone."),
+    ("⚡ Tighten", "Optimize this text. Make it tighter, straight to the point, without cutting details or meaning."),
+    ("📢 Headline", "Rewrite this as a punchy, engaging headline or short tagline. Title case."),
+]
 
 
 class ConfigManager:
@@ -1165,16 +1209,22 @@ class HotkeyEdit(QLineEdit):
         QLineEdit { background: rgba(37,99,235,0.15); border: 2px solid rgba(96,165,250,0.8);
                     border-radius: 8px; padding: 8px 14px; color: #93c5fd; font-size: 13px; }
     """
+    _EDIT = """
+        QLineEdit { background: rgba(5,40,20,0.8); border: 2px solid rgba(74,222,128,0.7);
+                    border-radius: 8px; padding: 8px 14px; color: #86efac; font-size: 13px; }
+    """
 
     def __init__(self, parent=None, re_register_cb=None):
         super().__init__(parent)
         self._combo = ""
         self._recording = False
+        self._manual_editing = False
         self._re_register_cb = re_register_cb
         self.setReadOnly(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(self._IDLE)
         self._refresh()
+        self.returnPressed.connect(self._commit_manual_edit)
 
     def text(self) -> str:
         return self._combo
@@ -1204,9 +1254,63 @@ class HotkeyEdit(QLineEdit):
             self._recording = False
             self.setStyleSheet(self._IDLE)
             self._refresh()
+        elif self._manual_editing:
+            self._commit_manual_edit()
         super().focusOutEvent(e)
 
+    def enable_manual_edit(self):
+        """Enter manual-typing mode so the user can type a hotkey string directly.
+
+        Switches the field to editable (green border), populates it with the
+        current combo string (e.g. "ctrl+f9"), and awaits Enter or focus-loss
+        to commit. Escape cancels back to the previous value.
+        """
+        self._recording = False
+        self._manual_editing = True
+        self.setReadOnly(False)
+        self.setStyleSheet(self._EDIT)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        super().setText(self._combo)
+        self.selectAll()
+
+    def _commit_manual_edit(self):
+        """Validate and save the manually typed hotkey string.
+
+        Accepts any non-empty string that contains at least one word character
+        (the `keyboard` library is permissive and will raise on registration if
+        it's bad — the user will see a tray error rather than a crash here).
+        """
+        if not self._manual_editing:
+            return
+        self._manual_editing = False
+        self.setReadOnly(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        typed = super().text().strip().lower()
+        if typed and re.search(r"\w", typed):
+            self._combo = typed
+            self.shortcut_changed.emit(typed)
+            if self._re_register_cb:
+                try:
+                    self._re_register_cb()
+                except Exception:
+                    pass
+        # Restore display (reverts to previous _combo if typed was invalid/empty)
+        self.setStyleSheet(self._IDLE)
+        self._refresh()
+
     def keyPressEvent(self, e):
+        if self._manual_editing:
+            key = e.key()
+            if key == Qt.Key.Key_Escape:
+                self._manual_editing = False
+                self.setReadOnly(True)
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                self.setStyleSheet(self._IDLE)
+                self._refresh()
+                return
+            # Let Qt handle normal character input; Enter is caught by returnPressed
+            super().keyPressEvent(e)
+            return
         if not self._recording:
             return
         key = e.key()
@@ -2123,10 +2227,13 @@ class SettingsDialog(QDialog):
             )
         )
         srv_row = QHBoxLayout()
+        srv_row.setContentsMargins(0, 0, 0, 0)
         srv_row.addWidget(self.server_edit, 1)
         srv_row.addWidget(btn_s)
         srv_w = QWidget()
         srv_w.setLayout(srv_row)
+        from PyQt6.QtWidgets import QSizePolicy
+        srv_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         form.addLayout(self._row("Server binary", srv_w))
 
         # Chat model ─────────────────────────────────────────────────────
@@ -2141,10 +2248,12 @@ class SettingsDialog(QDialog):
             )
         )
         mod_row = QHBoxLayout()
+        mod_row.setContentsMargins(0, 0, 0, 0)
         mod_row.addWidget(self.model_edit, 1)
         mod_row.addWidget(btn_m)
         mod_w = QWidget()
         mod_w.setLayout(mod_row)
+        mod_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         form.addLayout(self._row("Chat model", mod_w))
 
         self.recent_combo = QComboBox()
@@ -2169,10 +2278,12 @@ class SettingsDialog(QDialog):
             )
         )
         ac_row = QHBoxLayout()
+        ac_row.setContentsMargins(0, 0, 0, 0)
         ac_row.addWidget(self.ac_model_edit, 1)
         ac_row.addWidget(btn_ac)
         self.ac_row_w = QWidget()
         self.ac_row_w.setLayout(ac_row)
+        self.ac_row_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         form.addLayout(self._row("Autocorrect model", self.ac_row_w))
 
         self.port_spin = no_scroll(QSpinBox())
@@ -2227,9 +2338,55 @@ class SettingsDialog(QDialog):
         form.addLayout(self._row("Idle timeout (s)", self.idle_spin))
 
         # Hotkey ──────────────────────────────────────────────────────────
-        section("HOTKEY")
+        section("HOTKEYS")
         self.hotkey_edit = HotkeyEdit(re_register_cb=self._re_register_cb)
-        form.addLayout(self._row("Trigger hotkey", self.hotkey_edit))
+        hk_pencil = QPushButton("✏")
+        hk_pencil.setObjectName("ghost")
+        hk_pencil.setFixedSize(30, 30)
+        hk_pencil.setToolTip("Type hotkey manually")
+        hk_pencil.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);"
+            "border-radius:6px;font-size:14px;padding:0;color:#cbd5e1;}"
+            "QPushButton:hover{background:rgba(59,130,246,0.25);color:#93c5fd;"
+            "border:1px solid rgba(96,165,250,0.4);}"
+        )
+        hk_pencil.clicked.connect(self.hotkey_edit.enable_manual_edit)
+        hk_row_w = QWidget()
+        hk_row_lay = QHBoxLayout(hk_row_w)
+        hk_row_lay.setContentsMargins(0, 0, 0, 0)
+        hk_row_lay.setSpacing(6)
+        hk_row_lay.addWidget(self.hotkey_edit, 1)
+        hk_row_lay.addWidget(hk_pencil)
+        hk_row_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        form.addLayout(self._row("Trigger hotkey", hk_row_w))
+
+        self.silent_hotkey_edit = HotkeyEdit(re_register_cb=self._re_register_cb)
+        shk_pencil = QPushButton("✏")
+        shk_pencil.setObjectName("ghost")
+        shk_pencil.setFixedSize(30, 30)
+        shk_pencil.setToolTip("Type hotkey manually")
+        shk_pencil.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);"
+            "border-radius:6px;font-size:14px;padding:0;color:#cbd5e1;}"
+            "QPushButton:hover{background:rgba(59,130,246,0.25);color:#93c5fd;"
+            "border:1px solid rgba(96,165,250,0.4);}"
+        )
+        shk_pencil.clicked.connect(self.silent_hotkey_edit.enable_manual_edit)
+        shk_row_w = QWidget()
+        shk_row_lay = QHBoxLayout(shk_row_w)
+        shk_row_lay.setContentsMargins(0, 0, 0, 0)
+        shk_row_lay.setSpacing(6)
+        shk_row_lay.addWidget(self.silent_hotkey_edit, 1)
+        shk_row_lay.addWidget(shk_pencil)
+        shk_row_w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        form.addLayout(self._row("Silent hotkey", shk_row_w))
+
+        self.silent_strength_combo = no_scroll(QComboBox())
+        self.silent_strength_combo.addItems([
+            "Conservative \u2014 typos only",
+            "Smart Fix \u2014 full grammar",
+        ])
+        form.addLayout(self._row("Silent strength", self.silent_strength_combo))
 
         # System prompt ───────────────────────────────────────────────────
         section("SYSTEM PROMPT  (override)")
@@ -2307,11 +2464,14 @@ class SettingsDialog(QDialog):
         self.keep_cb.setChecked(self.cfg.get("keep_model_loaded", True))
         self.idle_spin.setValue(self.cfg.get("idle_timeout_seconds", 300))
         self.hotkey_edit.setText(self.cfg.get("hotkey", "ctrl+shift+space"))
+        self.silent_hotkey_edit.setText(self.cfg.get("silent_hotkey", "f10"))
         self.sysprompt_edit.setPlainText(self.cfg.get("system_prompt", ""))
         _method = self.cfg.get("correction_method", "patch")
         _strength = self.cfg.get("streaming_strength", "smart_fix")
         self.method_combo.setCurrentIndex(0 if _method == "patch" else 1)
         self.strength_combo.setCurrentIndex(0 if _strength == "conservative" else 1)
+        _silent_str = self.cfg.get("silent_strength", "smart_fix")
+        self.silent_strength_combo.setCurrentIndex(0 if _silent_str == "conservative" else 1)
         self._on_ac_same_toggled(self.ac_same_cb.isChecked())
 
     def _save(self):
@@ -2332,6 +2492,7 @@ class SettingsDialog(QDialog):
         self.cfg.set("keep_model_loaded", self.keep_cb.isChecked())
         self.cfg.set("idle_timeout_seconds", self.idle_spin.value())
         self.cfg.set("hotkey", self.hotkey_edit.text())
+        self.cfg.set("silent_hotkey", self.silent_hotkey_edit.text())
         self.cfg.set("system_prompt", self.sysprompt_edit.toPlainText().strip())
         self.cfg.set(
             "correction_method",
@@ -2340,6 +2501,10 @@ class SettingsDialog(QDialog):
         self.cfg.set(
             "streaming_strength",
             "conservative" if self.strength_combo.currentIndex() == 0 else "smart_fix",
+        )
+        self.cfg.set(
+            "silent_strength",
+            "conservative" if self.silent_strength_combo.currentIndex() == 0 else "smart_fix",
         )
         model = self.model_edit.text()
         if model:
@@ -2622,13 +2787,6 @@ class CorrectionWindow(QWidget):
             if w:
                 w.deleteLater()
 
-        core_templates = [
-            ("📧 Email", "Rewrite this as a professional email with a proper greeting, clear body, and closing. Keep the core message."),
-            ("💬 Social", "Rewrite this as a social media post. Keep the casual tone, original capitalization style, and personality. Make it engaging but don't over-polish it."),
-            ("📝 Formal", "Rewrite this in formal English. Expand contractions, use complete sentences, maintain professional tone."),
-            ("⚡ Tighten", "Optimize this text. Make it tighter, straight to the point, without cutting details or meaning."),
-            ("📢 Headline", "Rewrite this as a punchy, engaging headline or short tagline. Title case."),
-        ]
         custom_templates = self.cfg.get("custom_templates", [])
 
         btn_style = (
@@ -2645,7 +2803,7 @@ class CorrectionWindow(QWidget):
             b.clicked.connect(lambda _, p=prompt: self._apply_template(p))
             return b
 
-        for name, prompt in core_templates:
+        for name, prompt in CORE_TEMPLATES:
             self.tmp_lay.addWidget(_make_btn(name, prompt))
         for ct in custom_templates:
             self.tmp_lay.addWidget(_make_btn(ct.get("name", "Custom"), ct.get("prompt", "")))
@@ -3039,7 +3197,7 @@ class CorrectionWindow(QWidget):
         self.accepted.emit(text)
 
     def _copy(self):
-        pyperclip.copy(self.corr_edit.toPlainText())
+        _clipboard_write_text(self.corr_edit.toPlainText())
 
     def _reset(self):
         """Cancel any in-flight correction and revert popup to the untouched original.
@@ -3102,6 +3260,151 @@ class CorrectionWindow(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Silent Correction OSD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SilentCorrectionOSD(QWidget):
+    """Frameless floating notification for silent (background) correction results.
+
+    Three visual states:
+    - "loading" — blue accent, animated dots, signals "working on it"
+    - "success" — green accent, checkmark, auto-dismiss
+    - "warning" — amber accent, warning icon, for errors/no-change
+
+    Appears at the bottom-center of the active screen with fade-in/out animation.
+    """
+
+    def __init__(self, message: str, state: str = "success", parent=None):
+        """state: 'loading', 'success', or 'warning'"""
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._state = state
+        self._build_ui(message, state)
+        self._position()
+
+    def _build_ui(self, message: str, state: str):
+        from PyQt6.QtWidgets import QSizePolicy, QGraphicsDropShadowEffect
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        card = QWidget()
+        card.setObjectName("osd_card")
+
+        # State-dependent accent
+        if state == "loading":
+            border_color = "rgba(96, 165, 250, 0.45)"
+            icon_char = "⟳"
+            icon_color = "#60a5fa"
+        elif state == "success":
+            border_color = "rgba(74, 222, 128, 0.35)"
+            icon_char = "✓"
+            icon_color = "#4ade80"
+        else:  # warning
+            border_color = "rgba(251, 191, 36, 0.35)"
+            icon_char = "!"
+            icon_color = "#fbbf24"
+
+        card.setStyleSheet(
+            f"QWidget#osd_card{{"
+            f"background: rgba(15, 23, 42, 0.95);"
+            f"border: 1px solid {border_color};"
+            f"border-radius: 22px;"
+            f"}}"
+        )
+        card.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+
+        # Subtle drop shadow for depth
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        card.setGraphicsEffect(shadow)
+
+        inner = QHBoxLayout(card)
+        inner.setContentsMargins(20, 14, 22, 14)
+        inner.setSpacing(12)
+
+        # Icon
+        icon_lbl = QLabel(icon_char)
+        icon_lbl.setStyleSheet(
+            f"QLabel{{color:{icon_color};font-size:16px;background:transparent;"
+            f"font-weight:800;}}"
+        )
+        icon_lbl.setFixedWidth(20)
+        inner.addWidget(icon_lbl)
+
+        # Message
+        msg_lbl = QLabel(message)
+        msg_lbl.setStyleSheet(
+            "QLabel{color:#e2e8f0;font-size:13px;font-weight:500;"
+            "background:transparent;"
+            "font-family:'Segoe UI',sans-serif;letter-spacing:0.2px;}"
+        )
+        msg_lbl.setWordWrap(False)
+        inner.addWidget(msg_lbl)
+
+        lay.addWidget(card)
+        self.adjustSize()
+
+    def _position(self):
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        sr = screen.availableGeometry()
+        self.adjustSize()
+        w = self.width()
+        h = self.height()
+        x = sr.x() + (sr.width() - w) // 2
+        y = sr.y() + sr.height() - h - 52
+        self.move(x, y)
+
+    def show_animated(self, auto_dismiss: bool = True):
+        """Fade in. If auto_dismiss, hold 2.5 s then fade out and close."""
+        from PyQt6.QtCore import QPropertyAnimation, QEasingCurve, QSequentialAnimationGroup
+
+        self.setWindowOpacity(0.0)
+        self.show()
+
+        fade_in = QPropertyAnimation(self, b"windowOpacity")
+        fade_in.setDuration(160)
+        fade_in.setStartValue(0.0)
+        fade_in.setEndValue(1.0)
+        fade_in.setEasingCurve(QEasingCurve.Type.OutQuart)
+
+        if not auto_dismiss:
+            # Loading state — just fade in and stay visible
+            self._anim_seq = fade_in
+            fade_in.start()
+            return
+
+        hold = QPropertyAnimation(self, b"windowOpacity")
+        hold.setDuration(2500)
+        hold.setStartValue(1.0)
+        hold.setEndValue(1.0)
+
+        fade_out = QPropertyAnimation(self, b"windowOpacity")
+        fade_out.setDuration(400)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.0)
+        fade_out.setEasingCurve(QEasingCurve.Type.InQuart)
+
+        seq = QSequentialAnimationGroup(self)
+        seq.addAnimation(fade_in)
+        seq.addAnimation(hold)
+        seq.addAnimation(fade_out)
+        seq.finished.connect(self.close)
+        self._anim_seq = seq
+        seq.start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Tray icon helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -3138,6 +3441,8 @@ class TextCorrectorApp(QApplication):
     _trigger = pyqtSignal(str)
     _notify = pyqtSignal(str, str)
     _hotkey_signal = pyqtSignal()
+    _silent_hotkey_signal = pyqtSignal()
+    _silent_osd_signal = pyqtSignal(str, str)  # message, state ('loading'|'success'|'warning')
 
     def __init__(self):
         super().__init__(sys.argv)
@@ -3150,7 +3455,6 @@ class TextCorrectorApp(QApplication):
         log(f"[APP] Boot — Autocorrect model: {_ac_path_boot}")
         log(f"[APP] Boot — Chat model: {self.cfg.get('model_path', '')}")
         log(f"[APP] Boot — keep_model_loaded: {self.cfg.get('keep_model_loaded', True)}")
-        log(f"[APP] Boot — gpu_layePP] Boot — keep_model_loaded: {self.cfg.get('keep_model_loaded', True)}")
         log(f"[APP] Boot — gpu_layers: {self.cfg.get('gpu_layers', 99)}")
         log(f"[APP] Boot — correction_method: {self.cfg.get('correction_method', 'patch')}")
         log(f"[APP] Boot — streaming_strength: {self.cfg.get('streaming_strength', 'smart_fix')}")
@@ -3180,6 +3484,8 @@ class TextCorrectorApp(QApplication):
         self._trigger.connect(self._show_window)
         self._notify.connect(self._show_notify)
         self._hotkey_signal.connect(self._hotkey_fired)
+        self._silent_hotkey_signal.connect(self._silent_hotkey_fired)
+        self._silent_osd_signal.connect(self._show_silent_osd)
         self.ac_model.status_changed.connect(self._on_ac_status)
         self.chat_model.status_changed.connect(self._on_chat_status)
         self.ac_model.model_loaded.connect(lambda: self._set_tray_icon("#3b82f6"))
@@ -3205,9 +3511,9 @@ class TextCorrectorApp(QApplication):
         if ac_path:
             threading.Thread(target=self.ac_model.load_model, daemon=True).start()
 
-        # Check for llama.cpp updates 5 s after boot (non-blocking)
-        self._update_checker: UpdateChecker | None = None
-        QTimer.singleShot(5000, self._check_llama_update)
+        # Check for TextCorrector updates 5 s after boot (non-blocking)
+        self._update_checker: AppUpdateChecker | None = None
+        QTimer.singleShot(5000, self._check_app_update)
 
         # First-run setup: if no model is configured, prompt the user to
         # either download the recommended one or browse for an existing file.
@@ -3276,8 +3582,8 @@ class TextCorrectorApp(QApplication):
         act_quit.triggered.connect(self._quit)
 
         # Update checker — shown before Quit; text changes when update found
-        self._update_action = QAction("Check for llama.cpp update", self)
-        self._update_action.triggered.connect(self._check_llama_update)
+        self._update_action = QAction("Check for updates", self)
+        self._update_action.triggered.connect(self._check_app_update)
         menu.addAction(self._update_action)
         menu.addSeparator()
         menu.addAction(act_quit)
@@ -3328,6 +3634,7 @@ class TextCorrectorApp(QApplication):
             pass
 
         hk = self.cfg.get("hotkey", "f9").lower().strip()
+        silent_hk = self.cfg.get("silent_hotkey", "f10").lower().strip()
 
         try:
             keyboard.add_hotkey(hk, self._hotkey_signal.emit)
@@ -3340,6 +3647,13 @@ class TextCorrectorApp(QApplication):
                 QSystemTrayIcon.MessageIcon.Warning,
                 4000,
             )
+
+        if silent_hk and silent_hk != hk:
+            try:
+                keyboard.add_hotkey(silent_hk, self._silent_hotkey_signal.emit)
+                log(f"[Hotkey] silent registered: {silent_hk}")
+            except Exception as e:
+                log(f"[Hotkey] silent register failed: {e}")
 
     def _safe_paste(self, retries=5, delay=0.03) -> str:
         for i in range(retries):
@@ -3425,6 +3739,112 @@ class TextCorrectorApp(QApplication):
             # Belt-and-braces release on EVERY exit path (including exceptions),
             # so a rare failure mid-flow never leaves modifiers held in our state.
             self._hotkey_busy.release()
+
+    def _silent_hotkey_fired(self):
+        """Slot for the silent correction hotkey (F10). Main Qt thread."""
+        if not self._hotkey_busy.acquire(blocking=False):
+            log("[Silent] Fired but hotkey_busy — ignoring")
+            return
+        threading.Thread(target=self._silent_hotkey_worker, daemon=True).start()
+
+    def _silent_hotkey_worker(self):
+        """Background: capture selection → correct via patch → auto-paste.
+
+        Does NOT open CorrectionWindow. The user sees only the OSD notification.
+        Shares _hotkey_busy with _hotkey_worker so both can't run simultaneously.
+        """
+        try:
+            time.sleep(0.03)
+
+            self._old_clip = self._safe_paste()
+            self._safe_copy("")
+            time.sleep(0.02)
+
+            _send_ctrl_chord(VK_C)
+
+            selected = ""
+            for _ in range(12):
+                time.sleep(0.025)
+                clip = self._safe_paste()
+                if clip:
+                    selected = clip
+                    break
+
+            if not selected.strip():
+                self._safe_copy(self._old_clip)
+                now = time.monotonic()
+                if now - self._last_empty_notify_ts > 3.0:
+                    self._last_empty_notify_ts = now
+                    self._notify.emit(
+                        "No text selected. Select text first, then press the hotkey.",
+                        "info",
+                    )
+                return
+
+            text = selected.strip()
+            log(f"[Silent] correcting {len(text.split())} words")
+            self._silent_osd_signal.emit("Correcting…", "loading")
+
+            # Ensure model is loaded
+            if not self.ac_model.is_loaded():
+                self.ac_model.load_model()
+            if not self.ac_model.is_loaded():
+                self._safe_copy(self._old_clip)
+                self._silent_osd_signal.emit("Model not ready", "warning")
+                return
+
+            custom_sys = self.cfg.get("system_prompt", "").strip()
+            strength = self.cfg.get("silent_strength", "smart_fix")
+            result, _units = self.ac_model.correct_text_patch(
+                text, custom_sys=custom_sys or None, strength=strength
+            )
+
+            if result is None:
+                # patch failed — restore clipboard and show error
+                self._safe_copy(self._old_clip)
+                self._silent_osd_signal.emit("Correction failed, try again", "warning")
+                return
+
+            if result == text:
+                # No changes — restore clipboard silently
+                self._safe_copy(self._old_clip)
+                self._silent_osd_signal.emit("No changes needed", "success")
+                return
+
+            # Write corrected text and paste it
+            self._safe_copy(result)
+            time.sleep(0.12)
+            _send_ctrl_chord(VK_V)
+            time.sleep(0.08)
+
+            # Restore original clipboard after paste settles.
+            # We're already in a background thread — just sleep instead of
+            # QTimer.singleShot, which would crash from a non-Qt thread.
+            if self._old_clip and self._old_clip != result:
+                time.sleep(0.5)
+                self._safe_copy(self._old_clip)
+
+            self._silent_osd_signal.emit("Silently corrected", "success")
+            log("[Silent] done")
+
+        except Exception as e:
+            log(f"[Silent] worker error: {e}")
+            self._silent_osd_signal.emit("Error during correction", "warning")
+        finally:
+            self._hotkey_busy.release()
+
+    def _show_silent_osd(self, message: str, state: str):
+        """Called on main Qt thread via _silent_osd_signal. Creates and shows OSD."""
+        prev = getattr(self, "_osd_widget", None)
+        if prev is not None:
+            try:
+                prev.close()
+            except Exception:
+                pass
+        osd = SilentCorrectionOSD(message, state=state)
+        self._osd_widget = osd
+        # Loading state stays visible until replaced; others auto-dismiss
+        osd.show_animated(auto_dismiss=(state != "loading"))
 
     def _show_model_warning(self, msg: str):
         # Longer duration (6s) than standard notifications — this is a sticky
@@ -3638,24 +4058,134 @@ class TextCorrectorApp(QApplication):
                 3000,
             )
 
-    def _check_llama_update(self):
+    def _check_app_update(self):
         """Start background update check. Safe to call multiple times."""
         if self._update_checker and self._update_checker.isRunning():
             return
-        self._update_checker = UpdateChecker()
+        self._update_checker = AppUpdateChecker()
         self._update_checker.update_available.connect(self._on_update_available)
         self._update_checker.start()
 
-    def _on_update_available(self, tag: str, build: int):
-        local = _get_local_build_number()
-        log(f"[Update] New llama.cpp available: {tag} (build {build}, you have {local})")
-        self._update_action.setText(f"⬆️  llama.cpp {tag} available — run update.py --llama")
+    def _on_update_available(self, tag: str, url: str, notes: str):
+        log(f"[Update] New TextCorrector available: {tag}")
+        self._update_action.setText(f"⬆️  TextCorrector {tag} available — click to update")
+        # Disconnect old, connect new to perform update
+        self._update_action.triggered.disconnect()
+        self._update_action.triggered.connect(lambda: self._perform_update(url, tag))
+        
         self.tray.showMessage(
             "TextCorrector — Update available",
-            f"llama.cpp {tag} is out (you have b{local}).\nRun: python update.py --llama",
+            f"Version {tag} is out.\nClick 'Check for updates' in the tray menu to install.",
             QSystemTrayIcon.MessageIcon.Information,
             8000,
         )
+
+    def _perform_update(self, url: str, tag: str):
+        """Download and apply the update."""
+        reply = QMessageBox.question(
+            None,
+            "Update TextCorrector",
+            f"Do you want to update TextCorrector to {tag}?\n\nThis will download the update, close the app, and restart it.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        import zipfile
+        import urllib.request
+        
+        # We need to block the UI and show a small progress dialog, but for now we'll just log
+        # and let the tray notify. A better UX is a simple progress dialog.
+        log(f"[Update] Starting download from {url}")
+        
+        try:
+            staging_dir = SCRIPT_DIR / "_update_staging"
+            staging_dir.mkdir(exist_ok=True)
+            
+            zip_path = staging_dir / "update.zip"
+            
+            # Download
+            req = urllib.request.Request(url, headers={"User-Agent": "TextCorrector-updater"})
+            with urllib.request.urlopen(req) as resp, open(zip_path, "wb") as f:
+                f.write(resp.read())
+            
+            log(f"[Update] Downloaded to {zip_path}")
+            
+            # Extract
+            extract_dir = staging_dir / "extracted"
+            if extract_dir.exists():
+                import shutil
+                shutil.rmtree(extract_dir)
+            extract_dir.mkdir(exist_ok=True)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            
+            log(f"[Update] Extracted to {extract_dir}")
+            
+            # The ZIP contains a folder like "TextCorrector_3.2.0_Windows"
+            # We need to find the actual directory containing TextCorrector.exe
+            app_dir = None
+            for child in extract_dir.iterdir():
+                if child.is_dir() and (child / "TextCorrector.exe").exists():
+                    app_dir = child
+                    break
+            
+            if not app_dir:
+                if (extract_dir / "TextCorrector.exe").exists():
+                    app_dir = extract_dir
+                else:
+                    raise Exception("TextCorrector.exe not found in downloaded ZIP")
+            
+            # Write batch script to do the replacement
+            bat_path = SCRIPT_DIR / "_apply_update.bat"
+            bat_content = f'''@echo off
+echo Updating TextCorrector to {tag}...
+echo Waiting for TextCorrector to close...
+timeout /t 3 /nobreak > nul
+
+REM Copy new files over, excluding user data
+xcopy "{app_dir}\\*" "{SCRIPT_DIR}\\" /E /Y /C /Q /H /R /EXCLUDE:{SCRIPT_DIR}\\_update_exclude.txt
+
+REM Clean up staging
+rmdir /s /q "{staging_dir}"
+del "{SCRIPT_DIR}\\_update_exclude.txt"
+del "%~f0"
+
+echo Restarting TextCorrector...
+start "" "{SCRIPT_DIR}\\TextCorrector.exe"
+'''
+            bat_path.write_text(bat_content, encoding="utf-8")
+            
+            # Write exclude file for xcopy (one substring pattern per line)
+            # xcopy /EXCLUDE skips any file whose full path contains any line as a substring.
+            # We list folder name prefixes and file extensions to protect user data.
+            exclude_path = SCRIPT_DIR / "_update_exclude.txt"
+            exclude_content = (
+                "config.json\n"
+                "llama_cpp\n"
+                "llama-\n"
+                ".gguf\n"
+                ".onnx\n"
+                "_update_staging\n"
+            )
+            exclude_path.write_text(exclude_content, encoding="utf-8")
+            
+            # Launch bat detached from this process, then exit.
+            # shell=False + creationflags=DETACHED_PROCESS ensures the bat
+            # keeps running independently after TextCorrector.exe closes.
+            DETACHED_PROCESS = 0x00000008
+            subprocess.Popen(
+                str(bat_path),
+                creationflags=DETACHED_PROCESS,
+                close_fds=True,
+            )
+            self._quit()
+            
+        except Exception as e:
+            log(f"[Update] Failed to apply update: {e}")
+            QMessageBox.critical(None, "Update Failed", f"Failed to apply update:\n{e}")
 
     def _quit(self):
         try:

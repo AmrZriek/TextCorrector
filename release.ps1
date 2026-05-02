@@ -3,8 +3,8 @@
 #         .\release.ps1 -Version 3.1.2   -> custom version
 [CmdletBinding()]
 param(
-    [string]$Version = "3.1.1",
-    [string]$Message = "fix: rewrite hotkey to standard pattern; F9 default; Win32 clipboard + SendInput; HotkeyEdit accepts standalone keys"
+    [string]$Version = "3.2.0",
+    [string]$Message = "feat: replace llama.cpp updater with full application auto-updater"
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,15 +60,11 @@ Write-Host "==> Creating GitHub release" -ForegroundColor Cyan
 $notes = @"
 ## What's new in v$Version
 
-**Hotkey system rewritten to the standard global-tool pattern:**
-- Default hotkey changed to **F9** (was Ctrl+Shift+Space)
-- Removed ``suppress=True`` (was blocking Ctrl system-wide)
-- Removed ``trigger_on_release=True`` (was missing short presses)
-- Direct Win32 ``SendInput`` for Ctrl+C/V on Windows (no more stuck Ctrl)
-- Direct Win32 clipboard read/write for full Unicode support (math symbols, emojis)
-- Settings hotkey recorder now accepts standalone keys (F1-F12, Pause, Insert, etc.)
-
-**Tests added** under ``tests/`` covering the recorder, input synthesis, and clipboard round-trip.
+**Full Application Auto-Updater:**
+- TextCorrector can now seamlessly update itself when new versions are released.
+- Instead of just checking for \`llama.cpp\` updates, the app now monitors GitHub for full TextCorrector releases.
+- Updates are one-click directly from the system tray menu—no more manual downloads or ZIP extractions.
+- Your existing \`config.json\` and downloaded AI models are strictly preserved during the update process.
 "@
 gh release create "v$Version" $zip.FullName --title "TextCorrector v$Version" --notes $notes
 if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }

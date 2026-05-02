@@ -1,31 +1,32 @@
 """
-update.py — TextCorrector dependency updater
+update.py — TextCorrector app and dependency updater
 =============================================
 Updates all Python dependencies and optionally downloads the latest
-llama-server binaries for the current platform.
+TextCorrector release from GitHub.
 
 Usage
 -----
-    python update.py             # update Python deps only
-    python update.py --llama     # also update llama-server binary
+    python update.py             # update Python deps only (for dev)
+    python update.py --app       # update TextCorrector app to latest release
     python update.py --all       # update everything
 
 What it does
 ------------
 1. Upgrades pip itself
 2. Installs / upgrades all packages from requirements.txt
-3. (Optional) Downloads the latest llama.cpp release binary for your OS/arch
+3. (Optional) Downloads the latest TextCorrector release zip for your OS
+   and extracts it over the current installation (preserving user config/models).
 """
 
-import sys, os, subprocess, platform, urllib.request, zipfile, tarfile, shutil, json
+import sys, os, subprocess, platform, urllib.request, zipfile, tarfile, shutil, json, re
 from pathlib import Path
 
 ROOT      = Path(__file__).parent.resolve()
 VENV_PY   = ROOT / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
 REQ_FILE  = ROOT / "requirements.txt"
-LLAMA_DIR = ROOT / "llama_cpp"
+MAIN_SCRIPT = ROOT / "text_corrector.py"
 
-GITHUB_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+GITHUB_API = "https://api.github.com/repos/AmrZriek/TextCorrector/releases/latest"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def banner(msg: str):
@@ -42,6 +43,30 @@ def pip_path() -> str:
     if VENV_PY.exists():
         return str(VENV_PY)
     return sys.executable
+
+
+def get_local_version() -> str:
+    try:
+        text = MAIN_SCRIPT.read_text(encoding="utf-8")
+        m = re.search(r'APP_VERSION\s*=\s*[\'"]([0-9\.]+)[\'"]', text)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def _parse_version(v_str):
+    v_str = re.sub(r'[^0-9\.]', '', v_str)
+    parts = []
+    for p in v_str.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
 
 
 # ── Python dependencies ───────────────────────────────────────────────────────
@@ -61,56 +86,9 @@ def update_python_deps():
     print("  All packages up to date.")
 
 
-# ── llama.cpp binary ─────────────────────────────────────────────────────────
-def _detect_asset_keyword() -> str:
-    """Pick the right release asset keyword for this platform/arch."""
-    arch = platform.machine().lower()
-    is_arm = arch in ("arm64", "aarch64")
-
-    if sys.platform == "win32":
-        # Prefer CUDA 12.x for broadest driver compatibility.
-        # Falls back to cpu-x64 if no NVIDIA GPU is present.
-        return "win-cuda-12" if _has_nvidia() else "win-cpu-x64"
-    elif sys.platform == "darwin":
-        return "macos-arm64" if is_arm else "macos-x86_64"
-    else:  # Linux
-        return "ubuntu-x64" if not is_arm else "ubuntu-arm64"
-
-
-def _has_nvidia() -> bool:
-    try:
-        r = subprocess.run(["nvidia-smi"], capture_output=True, timeout=4)
-        return r.returncode == 0
-    except Exception: return False
-
-
-def _has_avx2() -> bool:
-    try:
-        import cpuinfo  # type: ignore
-        return "avx2" in cpuinfo.get_cpu_info().get("flags", [])
-    except Exception: return True  # assume modern CPU
-
-
-def _extract_zip_to(zip_path: Path, dest_dir: Path):
-    """Extract llama binaries + all DLLs from a zip into dest_dir."""
-    with zipfile.ZipFile(zip_path) as zf:
-        for member in zf.namelist():
-            mname = Path(member).name
-            if not mname:
-                continue
-            is_binary = mname.startswith("llama-") or mname.startswith("rpc-")
-            is_lib    = mname.endswith((".dll", ".so", ".dylib"))
-            if is_binary or is_lib:
-                data_bytes = zf.read(member)
-                dest = dest_dir / mname
-                dest.write_bytes(data_bytes)
-                if sys.platform != "win32":
-                    dest.chmod(0o755)
-                print(f"    Extracted: {mname}")
-
-
-def update_llama():
-    banner("Updating llama.cpp server binary")
+# ── App updater ─────────────────────────────────────────────────────────────
+def update_app():
+    banner("Updating TextCorrector app")
     print(f"  Fetching latest release info from GitHub…")
 
     try:
@@ -122,90 +100,113 @@ def update_llama():
         print(f"  ERROR: Could not reach GitHub API: {e}")
         return
 
-    tag     = data.get("tag_name", "unknown")
-    assets  = data.get("assets", [])
-    kw      = _detect_asset_keyword()
+    tag = data.get("tag_name", "unknown")
+    assets = data.get("assets", [])
+
+    remote_ver = tag.lstrip("vV")
+    local_ver = get_local_version()
 
     print(f"  Latest release : {tag}")
-    print(f"  Platform hint  : {kw}")
+    print(f"  Local version  : {local_ver}")
 
-    # Find the main binary asset
+    if _parse_version(remote_ver) <= _parse_version(local_ver):
+        print("  You already have the latest version.")
+        return
+
+    # Find the main binary asset for the current OS
+    os_kw = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "linux")
     main_asset = None
     for asset in assets:
         name = asset["name"].lower()
-        # Must start with "llama-b" (not "cudart-") and match the keyword
-        if name.startswith("llama-b") and kw in name and name.endswith((".zip", ".tar.gz")):
+        if name.endswith(".zip") and os_kw in name:
             main_asset = asset
             break
+            
+    if not main_asset and assets:
+        for asset in assets:
+            if asset["name"].lower().endswith(".zip"):
+                main_asset = asset
+                break
 
     if not main_asset:
-        print(f"  No asset matched '{kw}'. Available assets:")
-        for a in assets:
-            print(f"    {a['name']}")
-        print("  Please download manually from: https://github.com/ggerganov/llama.cpp/releases")
+        print(f"  No suitable ZIP asset found in release {tag}.")
         return
 
-    LLAMA_DIR.mkdir(exist_ok=True)
-    downloads: list[tuple] = [(main_asset["browser_download_url"], main_asset["name"])]
+    url = main_asset["browser_download_url"]
+    filename = main_asset["name"]
+    tmp_path = ROOT / filename
 
-    # For CUDA Windows builds, also grab the cudart package (CUDA runtime DLLs).
-    # These are distributed separately since llama-bXXXX-bin-win-cuda-*.zip does NOT
-    # bundle cudart64_*.dll / cublas64_*.dll — without them ggml-cuda.dll won't load.
-    if sys.platform == "win32" and "cuda" in kw:
-        # Extract the CUDA version from the matched asset name, e.g. "cuda-12.4"
-        import re
-        m = re.search(r"cuda-(\d+\.\d+)", main_asset["name"].lower())
-        cuda_ver = m.group(1) if m else None
-        cudart_asset = None
-        for asset in assets:
-            aname = asset["name"].lower()
-            if aname.startswith("cudart-") and aname.endswith(".zip"):
-                if cuda_ver and cuda_ver in aname:
-                    cudart_asset = asset
-                    break
-        if cudart_asset:
-            downloads.append((cudart_asset["browser_download_url"], cudart_asset["name"]))
-            print(f"  Also downloading CUDA runtime package: {cudart_asset['name']}")
-        else:
-            print("  WARNING: cudart package not found — CUDA runtime DLLs will be missing.")
-
-    for url, filename in downloads:
-        tmp_path = ROOT / filename
-        print(f"  Downloading {filename} …")
+    print(f"  Downloading {filename} …")
+    try:
         urllib.request.urlretrieve(url, tmp_path, reporthook=_progress)
         print()
-        print(f"  Extracting to {LLAMA_DIR}/ …")
-        if filename.endswith(".zip"):
-            _extract_zip_to(tmp_path, LLAMA_DIR)
-        elif filename.endswith(".tar.gz"):
-            with tarfile.open(tmp_path) as tf:
-                for member in tf.getmembers():
-                    mname = Path(member.name).name
-                    if mname and (mname.startswith("llama-") or mname.endswith(".so") or
-                                   mname.endswith(".dylib")):
-                        f = tf.extractfile(member)
-                        if f:
-                            dest = LLAMA_DIR / mname
-                            dest.write_bytes(f.read())
-                            dest.chmod(0o755)
-                            print(f"    Extracted: {mname}")
-        tmp_path.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"\n  ERROR downloading update: {e}")
+        return
 
-    print(f"  llama.cpp updated to {tag}.")
+    staging_dir = ROOT / "_update_staging"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir()
+    
+    print(f"  Extracting …")
+    with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
+        zip_ref.extractall(staging_dir)
+        
+    tmp_path.unlink()
+    
+    app_dir = None
+    for child in staging_dir.iterdir():
+        if child.is_dir() and (child / "TextCorrector.exe").exists():
+            app_dir = child
+            break
+            
+    if not app_dir:
+        if (staging_dir / "TextCorrector.exe").exists():
+            app_dir = staging_dir
+        else:
+            print("  ERROR: TextCorrector.exe not found in downloaded ZIP")
+            shutil.rmtree(staging_dir)
+            return
 
-    # Persist build number so in-app update checker knows what is installed
-    cfg_path = ROOT / "config.json"
-    if cfg_path.exists():
+    print("  Applying update…")
+    
+    exclude_prefixes = ("llama_cpp", "llama-")
+    exclude_suffixes = (".gguf", ".onnx")
+    exclude_exact = ("config.json",)
+    
+    for src_path in app_dir.rglob("*"):
+        if not src_path.is_file():
+            continue
+            
+        rel_path = src_path.relative_to(app_dir)
+        dest_path = ROOT / rel_path
+        
+        # Check excludes
+        skip = False
+        parts = rel_path.parts
+        if parts[0].startswith(exclude_prefixes):
+            skip = True
+        elif rel_path.name.endswith(exclude_suffixes):
+            skip = True
+        elif rel_path.name in exclude_exact:
+            skip = True
+            
+        if skip:
+            continue
+            
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            import re as _re
-            m = _re.search(r"b(\d+)", tag)
-            if m:
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                cfg["llama_build"] = int(m.group(1))
-                cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-                print(f"  Saved llama_build={m.group(1)} to config.json")
-        except Exception as e:
-            print(f"  Warning: could not update config.json: {e}")
+            shutil.copy2(src_path, dest_path)
+            # print(f"    Updated: {rel_path}")
+        except PermissionError:
+            print(f"  ERROR: Permission denied replacing {rel_path}.")
+            print("         Please ensure TextCorrector is completely closed before updating.")
+            shutil.rmtree(staging_dir)
+            return
+            
+    shutil.rmtree(staging_dir)
+    print(f"  TextCorrector updated to {tag}.")
 
 
 def _progress(block, block_size, total):
@@ -219,14 +220,19 @@ def _progress(block, block_size, total):
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="TextCorrector updater")
-    p.add_argument("--llama", action="store_true", help="Also update llama-server binary")
-    p.add_argument("--all",   action="store_true", help="Update everything")
+    p.add_argument("--app", action="store_true", help="Update TextCorrector app")
+    p.add_argument("--all", action="store_true", help="Update everything (app + python deps)")
     args = p.parse_args()
 
-    update_python_deps()
+    # Default to updating python deps if no args given (backward compat)
+    if not args.app and not args.all:
+        update_python_deps()
+    
+    if args.all:
+        update_python_deps()
 
-    if args.llama or args.all:
-        update_llama()
+    if args.app or args.all:
+        update_app()
 
     banner("Update complete!")
     print("  Restart TextCorrector to use the new versions.\n")
