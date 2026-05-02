@@ -2,7 +2,7 @@
 
 **READ THIS ENTIRE FILE BEFORE TOUCHING ANY CODE.**
 
-This is the authoritative design document for TextCorrector v3.1.
+This is the authoritative design document for TextCorrector v3.2.
 All AI agents working on this codebase must follow the architecture and constraints here.
 
 ---
@@ -97,6 +97,7 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 
 ### 13. Hotkey re-entrancy guard & notification throttle
 - `TextCorrectorApp._hotkey_busy = threading.Lock()` with non-blocking `acquire(blocking=False)` — rapid repeats from holding the hotkey are dropped, not queued
+- **The lock is shared between standard (F9) and silent (F10) correction flows** so both can't run simultaneously
 - If the correction window is already visible, the hotkey raises/activates it instead of starting a new clipboard flow
 - "No text selected" tray notifications are throttled to ≤ 1 per 3 s via `self._last_empty_notify_ts`
 - Do NOT remove any of these guards — without them, holding the keys spawned overlapping threads, each firing its own notification in a feedback loop
@@ -156,6 +157,33 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - `pyperclip` is the non-Windows fallback inside the helpers; on Windows it is bypassed entirely. The previous direct `pyperclip.paste()` / `pyperclip.copy()` calls in `_safe_paste` / `_safe_copy` failed silently on selections containing math symbols (Σ, Ω, π, etc.) and emoji — confirmed user-reported bug 2026-04-29.
 - `_open_clipboard_retry()` retries `OpenClipboard` up to 10 times at 10ms intervals because the clipboard can be briefly held by another process; `CloseClipboard` is in a `finally` so we never leak the lock.
 
+### 30. Silent Correction (F10 hotkey) — background correct-and-paste
+- `_silent_hotkey_fired()` acquires the **same** `_hotkey_busy` lock (shared with standard hotkey), starts `_silent_hotkey_worker` on a daemon thread.
+- Worker flow: capture selection via Ctrl+C → correct with `correct_text_patch()` → paste result via Ctrl+V → restore original clipboard. No CorrectionWindow popup.
+- **Strength is independent**: `silent_strength` config key ("conservative" or "smart_fix") controls correction intensity separately from the main `streaming_strength`.
+- OSD notification (`SilentCorrectionOSD`) provides user feedback with three visual states: `loading` (blue, stays visible), `success` (green, auto-dismiss), `warning` (amber, auto-dismiss). OSD is created on the main thread via `_silent_osd_signal` (queued connection).
+- **Dead-end: `QTimer.singleShot()` from background thread.** The silent worker runs on a daemon thread. Calling `QTimer.singleShot(500, ...)` from a non-Qt thread violates Qt thread safety and crashes/freezes on Windows. Use `time.sleep(0.5)` + direct call instead. Confirmed crash 2026-04-30.
+
+### 31. HotkeyEdit manual-edit mode
+- The ✏ pencil button next to each hotkey field calls `enable_manual_edit()` which sets `setReadOnly(False)` and lets the user type a hotkey string directly (e.g. "ctrl+f10").
+- Pressing Enter commits the typed value via `_commit_manual_edit()`. Pressing Escape cancels and reverts to the previous value.
+- `shortcut_changed` signal fires on successful commit so callers can re-register.
+- `_manual_editing` flag prevents the keyPressEvent recorder from interfering with normal typing.
+
+### 33. Auto-updater — full app self-update, NOT llama.cpp update
+- `AppUpdateChecker(QThread)` (replaces deleted `UpdateChecker`) polls `https://api.github.com/repos/AmrZriek/TextCorrector/releases/latest` on startup (5 s delay via `QTimer.singleShot`).
+- Semantic version comparison: `APP_VERSION = "3.1.1"` (module-level constant) vs GitHub `tag_name`. Comparison uses tuple of ints: `(3, 1, 1)` — handles `v3.2.0`, `Release_v3.1.0`, `3.1` tag formats.
+- When remote > local: tray menu item changes to `"⬆️  TextCorrector vX.Y.Z available — click to update"`. The action is re-wired to `_perform_update(url, tag)` via `triggered.disconnect() + connect()`.
+- `_perform_update()` flow: confirm dialog → download ZIP to `_update_staging/update.zip` → extract → locate `TextCorrector.exe` in extracted tree → write `_apply_update.bat` → write `_update_exclude.txt` (xcopy substring exclusions: `config.json`, `llama_cpp`, `llama-`, `.gguf`, `.onnx`, `_update_staging`) → launch bat with `DETACHED_PROCESS` (0x00000008, **not** `shell=True`) → `self._quit()`.
+- The bat script waits 3 s for the app to exit, runs `xcopy /E /Y /EXCLUDE:...`, cleans up, then relaunches `TextCorrector.exe`.
+- **NEVER update `llama-server` independently.** `llama.cpp` releases multiple times per day and frequently breaks CLI flags (`--reasoning-budget` → `--reasoning off`, `--parallel`, `--no-warmup`). Each TextCorrector release bundles a specific known-good build. Updating llama.cpp outside of a TextCorrector release will cause silent server startup failures or broken corrections with no error message.
+- `update.py --app` is the standalone equivalent (for dev/CI use).
+- `APP_VERSION` is the single source of truth. `build.py`'s `_get_version()` regex reads it: `r'APP_VERSION\s*=\s*[\'"]([0-9\.]+)[\'"]'`. `build.py` also writes a `VERSION` file into the release folder for fast external version reads.
+
+### 32. CORE_TEMPLATES is a module-level constant
+- `CORE_TEMPLATES` (list of `(name, prompt)` tuples) is defined once at module scope, shared between `CorrectionWindow._refresh_templates()` and any future consumers.
+- Do NOT define template lists inside class methods — it was duplicated before 2026-04-30.
+
 ### 22. Pass termination — DELETED (superseded by single-pass sentence rewrite, rule #12)
 - The old multi-pass loop and its termination heuristics were removed 2026-04-24 along with the indexed-JSON format. Do NOT re-add any form of "feed corrected text back for another pass" logic — it's the root cause of short-text oscillation.
 
@@ -203,6 +231,8 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - **Dead-end:** Using `keyboard.release()` for hotkeys. It breaks Windows modifier state.
 - **Dead-end:** Sequential patching. Latency for 1000+ words exceeds 60s. Use `ThreadPoolExecutor(max_workers=4)` + `--parallel 4` server flag.
 - **Dead-end:** Global edit-distance gates spanning the whole text. Apply `_hallucination_ratio` PER UNIT — short single-sentence units legitimately have high edit ratios (1 typo in 3-word sentence = 33%) and global gates falsely reject them.
+- **Dead-end:** Updating `llama-server` independently of the app. `llama.cpp` builds break CLI flag compatibility multiple times per week. Updating only the backend while keeping the old app code causes silent startup failures (wrong flags rejected → server refuses to start) or broken corrections. Always update the full TextCorrector release together. See Rule #33.
+- **Dead-end:** Using `subprocess.Popen([str(bat_path)], shell=True, ...)` to launch the updater bat. On Windows, `shell=True` with a list ignores the list and passes the path as a cmd.exe argument; the bat never executes. Use `Popen(str(bat_path), creationflags=DETACHED_PROCESS)` instead.
 - **Instinct:** If corrections are slow on long text, verify the server log for `--parallel 4` and ensure `max_workers=4` is actually what the ThreadPoolExecutor is using. More workers just queues requests without speedup.
 - **Instinct:** If a sentence comes back looking "mostly original but one word changed" when it should be more, check whether the hallucination guard rejected a legitimate rewrite. Tune `_HALLUCINATION_THRESHOLD_SMARTFIX` up (toward 0.8) for heavy-edit expected inputs; DO NOT disable the guard.
 
@@ -214,23 +244,34 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 ```
 User selects text → presses hotkey
         │
-        ▼
-  CorrectionWindow._do_correction()
-  ┌─────────────────────────────────────────────────────────────┐
-  │ correction_method == "patch" (default):                     │
-  │   correct_text_patch() — indexed-word patches, up to 3      │
-  │   passes; [{"i":3,"new":"weather"},...]                     │
-  │   On malformed JSON → falls back to streaming smart_fix     │
-  │                                                             │
-  │ correction_method == "stream":                              │
-  │   _start_streaming_correction() — streams full corrected    │
-  │   text token-by-token; strength = "conservative"|"smart_fix"│
-  └─────────────────────────────────────────────────────────────┘
+        ├── F9 (standard): _hotkey_fired → _hotkey_worker
+        │     │
+        │     ▼
+        │   CorrectionWindow._do_correction()
+        │   ┌──────────────────────────────────────────────────────────┐
+        │   │ correction_method == "patch" (default):                  │
+        │   │   correct_text_patch() — sentence rewrite, up to 4      │
+        │   │   parallel units; dict pre-pass → LLM → halluc. guard   │
+        │   │   On total failure → falls back to streaming smart_fix   │
+        │   │                                                          │
+        │   │ correction_method == "stream":                           │
+        │   │   _start_streaming_correction() — streams full corrected │
+        │   │   text token-by-token; strength=conservative|smart_fix   │
+        │   └──────────────────────────────────────────────────────────┘
+        │         │
+        │         ▼
+        │   CorrectionWindow shows diff (changed words highlighted)
+        │   User presses Ctrl+Enter → paste back
         │
-        ▼
-  CorrectionWindow shows diff (changed words highlighted blue)
-  User presses Ctrl+Enter → paste back
-        │
+        └── F10 (silent): _silent_hotkey_fired → _silent_hotkey_worker
+              │
+              ▼
+            correct_text_patch() with silent_strength
+              │
+              ▼
+            Auto-paste result + OSD notification
+            (no CorrectionWindow popup)
+
         │  (only if user types in "Ask AI" chat box)
         ▼
   chat_model = ac_model (same server, when ac_same_as_chat=True)
@@ -243,15 +284,27 @@ User selects text → presses hotkey
 
 ```
 TextCorrector/
-├── text_corrector.py      ← Single Python file. ALL app code lives here (~2900 lines)
-├── build.py               ← PyInstaller release builder (Windows/macOS/Linux ZIPs)
+├── text_corrector.py      ← Single Python file. ALL app code lives here (~4200 lines)
+├── build.py               ← Nuitka release builder (Windows self-contained EXE + ZIP)
+├── update.py              ← Standalone app updater (python update.py --app)
+├── release.ps1            ← Release automation (git tag + gh release create)
 ├── requirements.txt       ← Python deps: PyQt6, keyboard, pyperclip, requests
 ├── config.json            ← User settings (auto-created on first run, gitignored)
 ├── README.md              ← Public GitHub documentation
 ├── AGENT_CONTEXT.md       ← THIS FILE — AI agent context (gitignored, local only)
 ├── llama-<build>-*/       ← llama-server binary + DLLs (gitignored, user-provided)
 ├── venv/                  ← Python venv (gitignored)
-└── logo.png / logo.ico    ← App icons
+├── logo.png / logo.ico    ← App icons
+└── tests/                 ← pytest + pytest-qt test suite (71 tests)
+    ├── conftest.py
+    ├── test_chunking.py / test_chunking_edge_cases.py
+    ├── test_clipboard.py
+    ├── test_hotkey_edit.py / test_manual_edit.py
+    ├── test_input_synth.py
+    ├── test_silent_wiring.py
+    ├── test_constants_and_osd.py
+    ├── test_wiring.py
+    └── test_update.py     ← NEW: 29 tests covering APP_VERSION, version parser, wiring, exclusions
 ```
 
 No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch in this project.
@@ -304,6 +357,18 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - System tray, hotkey registration, window lifecycle
 - `ac_model` loads at boot (eager)
 - `chat_model` loads on first chat use (lazy), reused if `ac_same_as_chat=True`
+- **Silent correction**: `_silent_hotkey_fired()` / `_silent_hotkey_worker()` run the patch pipeline without a popup; `SilentCorrectionOSD` provides visual feedback
+- **Signals**: `_hotkey_signal`, `_silent_hotkey_signal`, `_silent_osd_signal(str, str)`, `_notify(str, str)`
+
+### `SilentCorrectionOSD(QWidget)`
+- Frameless, always-on-top, pill-shaped notification at bottom-center of screen
+- Three states: `loading` (blue ⟳), `success` (green ✓), `warning` (amber !)
+- `show_animated(auto_dismiss)`: fade-in via `QPropertyAnimation`; loading stays visible, others auto-dismiss after 2.5 s
+
+### `HotkeyEdit(QLineEdit)`
+- Custom hotkey recorder supporting both keypress recording and manual text entry
+- `enable_manual_edit()` / `_commit_manual_edit()` toggle between read-only recorder mode and editable text mode
+- `shortcut_changed` signal emits the new hotkey string on commit
 
 ---
 
@@ -336,9 +401,11 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 | `keep_model_loaded` | `true` | Keep model in memory between uses |
 | `idle_timeout_seconds` | `300` | Unload after N seconds idle (only if `keep_model_loaded=false`) |
 | `hotkey` | `ctrl+shift+space` | Global hotkey |
+| `silent_hotkey` | `"f10"` | Silent correction hotkey (correct + auto-paste, no popup) |
 | `system_prompt` | `""` | Override LLM system prompt (blank = use built-in) |
-| `correction_method` | `"patch"` | `"patch"` = indexed-word patches; `"stream"` = full text streamed token-by-token |
-| `streaming_strength` | `"smart_fix"` | `"conservative"` = typos only; `"smart_fix"` = full grammar/punct/caps (only applies when `correction_method="stream"`) |
+| `correction_method` | `"patch"` | `"patch"` = sentence rewrite; `"stream"` = full text streamed token-by-token |
+| `streaming_strength` | `"smart_fix"` | `"conservative"` = typos only; `"smart_fix"` = full grammar/punct/caps (standard correction) |
+| `silent_strength` | `"smart_fix"` | Same as above but for silent correction (F10); independent from `streaming_strength` |
 | `custom_templates` | `[]` | User-defined chat/rewrite templates |
 
 ---
@@ -377,7 +444,7 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 - `nativeEvent` override with ctypes MSG reading (caused segfaults)
 - `_fit_text_boxes()` dynamic resize method (caused abrupt window shrink)
 - `--reasoning-budget 0` server flag (replaced by `--reasoning off`)
-- All test scripts (`test_*.py`, `check_*.py`, `inspect_*.py`)
+- All test scripts (`test_*.py`, `check_*.py`, `inspect_*.py`) — **except the new `tests/` directory**, which was re-added in 2026-04-29 as a proper pytest suite with 42 tests
 - `build.ps1`, `download_models.bat`, `update_llama_cpp.bat`
 - Indexed-word JSON patch format (`[{"i":N,"new":"..."}]`) — replaced 2026-04-24 by sentence rewrite. The format exceeded what 2B-class models could reliably hold; output scaled with input not edit count; pass-2 oscillation produced duplicate words. Do not reintroduce indexed patches, few-shot JSON examples, `_parse_indexed_patches`, or any multi-pass feedback loop.
 - `response_format.json_schema` grammar-constrained decoding — 3–10× slowdown from per-token schema filtering (removed 2026-04-17). The new sentence-rewrite format doesn't need it.
@@ -387,7 +454,29 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-04-29 (latest)
+### 2026-05-02 (latest)
+- **Full application auto-updater (replaces llama.cpp update checker).** Removed `UpdateChecker` (checked `ggml-org/llama.cpp` releases), `_get_local_build_number()`, and `_check_llama_update()`. Replaced with `AppUpdateChecker(QThread)` that polls the `AmrZriek/TextCorrector` releases endpoint. On finding a newer version, updates the tray menu to "⬆️ TextCorrector vX.Y.Z available" and allows one-click download + install.
+- **`APP_VERSION = "3.1.1"` module-level constant** added as the single source of truth for version comparison. `build.py`'s `_get_version()` updated to read this constant instead of scanning the docstring.
+- **`_perform_update()` method added.** Downloads release ZIP → extracts to `_update_staging/` → writes `_apply_update.bat` + `_update_exclude.txt` → launches bat with `DETACHED_PROCESS` flag → calls `self._quit()`. Bat replaces app files (excluding config, models, llama binaries) and relaunches.
+- **3 bugs fixed during review:** (1) orphan `import tempfile` removed; (2) xcopy exclude patterns fixed to one-per-line for correct substring matching, added `_update_staging` to the exclude list; (3) `Popen(shell=True, list)` replaced with `Popen(str, creationflags=DETACHED_PROCESS)` — on Windows, `shell=True` with a list arg ignores the list.
+- **`update.py` completely rewritten** as a standalone app updater (`python update.py --app`). Old `--llama` flag and llama binary download logic removed. Preserves `--all` for dev pip upgrades.
+- **`build.py`**: `_get_version()` updated to match `APP_VERSION` constant; adds `VERSION` file to release folder.
+- **`release.ps1`**: version bumped to `3.2.0`, release notes updated.
+- **README updated to v3.2**: F9/F10 hotkey table, new "Automatic updates" section with llama.cpp warning, troubleshooting entry for "broken after manual llama update".
+- **Test suite expanded: 42 → 71 tests.** Added `test_update.py` (29 tests): APP_VERSION validation, semver parser correctness, API URL wiring, DETACHED_PROCESS usage, exclude file contents, update.py flag coverage, build.py version reading.
+- **Rule #33 added**: auto-updater design constraints and the llama.cpp independent-update dead-end.
+
+### 2026-04-30 (previous)
+- **Silent Correction (F10).** Added `_silent_hotkey_fired()` / `_silent_hotkey_worker()` / `SilentCorrectionOSD` for background correct-and-paste without popup. Shares `_hotkey_busy` lock with standard flow. Added `silent_hotkey` and `silent_strength` config keys. Added `_silent_osd_signal(str, str)` with three-state OSD (loading/success/warning). See Rule #30.
+- **Fixed: `QTimer.singleShot()` from background thread crash.** The silent worker ran `QTimer.singleShot(500, ...)` from a daemon thread, violating Qt thread safety and causing freeze/crash on Windows. Replaced with `time.sleep(0.5)` + direct call. See Rule #30.
+- **HotkeyEdit manual-edit mode.** Added ✏ pencil button with `enable_manual_edit()` / `_commit_manual_edit()` for typing hotkey strings directly. Enter commits, Escape cancels. See Rule #31.
+- **CORE_TEMPLATES promoted to module-level constant.** Previously duplicated inside `CorrectionWindow._refresh_templates()`. Now shared at module scope. See Rule #32.
+- **Fixed: `_chunk_text_by_sentences()` newline splitting.** Removed an aggressive early-exit optimization that bypassed regex splitting for short texts, preventing newline-based segmentation. Added `force_split` on newline separators so paragraph boundaries always create chunk boundaries regardless of word budget.
+- **Fixed: Settings UI overflow.** Applied `QSizePolicy(Expanding, Fixed)` and zero-margin `QHBoxLayout` to compound browse-row widgets to prevent infinite horizontal expansion.
+- **Bonus fixes:** removed unreachable `return True` in `_is_fewshot_echo()`, fixed corrupted startup log string, replaced `pyperclip.copy()` with `_clipboard_write_text()` in `CorrectionWindow._copy()`.
+- **Test suite expanded: 16 → 42 tests.** Added: `test_chunking_edge_cases.py` (8 edge cases), `test_silent_wiring.py` (6 wiring assertions including QTimer ban), `test_manual_edit.py` (5 manual edit mode tests), `test_constants_and_osd.py` (7 constant/OSD instantiation tests).
+
+### 2026-04-29
 - **Hotkey subsystem rewritten to global standard pattern.** Removed `suppress=True` (root cause of system-wide Ctrl block) and `trigger_on_release=True` (root cause of missed short presses). Removed `pynput.keyboard.Controller` entirely; `keyboard` library is now the only hotkey library. Hotkey callback emits `pyqtSignal` (`_hotkey_signal`) whose queued connection marshals to Qt main thread. Removed the QTimer + queue + suppress_until debounce — the re-entrancy `threading.Lock` already prevents overlap. Default hotkey changed to `f9` because without `suppress=True` a typeable trigger key would replace the user's selection. See Rule #21.
 - **Win32 `SendInput` for Ctrl+C / Ctrl+V (`_send_ctrl_chord`).** `keyboard.send('ctrl+c')` was dropping the synthetic Ctrl-up under WH_KEYBOARD_LL re-entry, leaving Ctrl held system-wide. Direct `ctypes` `SendInput` submits the four key events atomically. `keyboard.send` remains the non-Windows fallback. See Rule #21.
 - **Win32 `CF_UNICODETEXT` clipboard read/write (`_clipboard_read_text` / `_clipboard_write_text`).** `pyperclip` was failing silently on selections containing math symbols (Σ, Ω, π, …) and emoji. Direct `OpenClipboard` + `GetClipboardData(CF_UNICODETEXT)` round-trip via UTF-16-LE handles every code point including surrogate pairs. `pyperclip` remains the non-Windows fallback. See Rule #29.
@@ -493,6 +582,8 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 | Version | Summary |
 |---------|---------|
+| **v3.2** | Full app auto-updater (GitHub releases, one-click install), APP_VERSION constant, 71-test suite, README auto-update section, llama.cpp independent-update warning |
+| **v3.1.1** | Silent correction (F10), manual hotkey editing, OSD notifications, independent silent strength, CORE_TEMPLATES refactor, chunking newline fix, 42-test suite |
 | **v3.1** | CUDA DLL injection, `--reasoning off`, read-only output boxes, line break preservation in diff, single-server chat routing, build.py auto-detect |
 | **v2.10** | Patch-based autocorrect (JSON `{old,new}` patches), fallback to full-text |
 | **v2.9** | LanguageTool removed; LLM-only; dual model (AC eager + chat lazy); correction strength 0–4 |
