@@ -42,7 +42,7 @@ LOCKED ARCHITECTURE — DO NOT CHANGE WITHOUT USER APPROVAL
 - The app is single-file (text_corrector.py) — no Python package structure
 """
 
-import sys, os, shutil, subprocess, zipfile, argparse, platform, json
+import sys, os, shutil, subprocess, zipfile, argparse, platform, json, time
 from pathlib import Path
 from datetime import datetime
 
@@ -75,6 +75,7 @@ PLATFORM = {
 }.get(sys.platform, sys.platform)
 
 MAIN_SCRIPT = ROOT / "text_corrector.py"
+UPDATER_SCRIPT = ROOT / "update.py"
 ICON_ICO = ROOT / "logo.ico"
 ICON_PNG = ROOT / "logo.png"
 LICENSE_FILE = ROOT / "LICENSE"
@@ -91,6 +92,14 @@ def _get_version() -> str:
     except Exception:
         pass
     return datetime.now().strftime("%Y.%m.%d")
+
+
+def _windows_resource_version(version: str) -> str:
+    """Convert release labels like 3.2.0-test to a Windows version tuple."""
+    import re
+    parts = [p for p in re.split(r"\D+", version) if p]
+    parts = (parts + ["0", "0", "0", "0"])[:4]
+    return ".".join(parts)
 
 
 # ── Resolve llama-server directory ────────────────────────────────────────────
@@ -176,8 +185,41 @@ def banner(msg: str):
     print(f"{'-' * 60}")
 
 
+def _remove_tree(path: Path, retries: int = 8, delay: float = 1.0):
+    """Remove a tree, tolerating short-lived Windows AV/indexer locks."""
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+
+
+def _promote_nuitka_output(src: Path, dst: Path):
+    """Move Nuitka output into dist, with a copy fallback for locked EXEs."""
+    for attempt in range(8):
+        try:
+            src.rename(dst)
+            return
+        except PermissionError:
+            if attempt == 7:
+                break
+            time.sleep(1.0)
+
+    print("  Rename blocked by Windows; copying build output instead...")
+    if dst.exists():
+        _remove_tree(dst)
+    shutil.copytree(src, dst)
+    try:
+        _remove_tree(src)
+    except PermissionError:
+        print("  WARNING: build/text_corrector.dist is still locked; cleanup will retry at final cleanup.")
+
+
 # ── Nuitka build command ──────────────────────────────────────────────────────
-def _nuitka_cmd(icon_ico: Path, icon_png: Path) -> list:
+def _nuitka_cmd(icon_ico: Path, icon_png: Path, version: str) -> list:
     """Return the Nuitka CLI command for the current platform."""
     cmd = [
         sys.executable, "-m", "nuitka",
@@ -189,12 +231,45 @@ def _nuitka_cmd(icon_ico: Path, icon_png: Path) -> list:
         str(MAIN_SCRIPT),
     ]
     if PLATFORM == "Windows":
+        resource_version = _windows_resource_version(version)
         cmd.insert(3, "--windows-console-mode=disable")
         if icon_ico.exists():
             cmd.insert(3, f"--windows-icon-from-ico={icon_ico}")
+        cmd.extend([
+            "--company-name=TextCorrector",
+            "--product-name=TextCorrector",
+            f"--file-version={resource_version}",
+            f"--product-version={resource_version}",
+            "--file-description=TextCorrector desktop writing assistant",
+        ])
     elif PLATFORM == "macOS":
         if icon_png.exists():
             cmd.insert(3, f"--macos-app-icon={icon_png}")
+    return cmd
+
+
+def _updater_nuitka_cmd(icon_ico: Path, version: str) -> list:
+    """Return the Nuitka CLI command for the one-file updater helper."""
+    cmd = [
+        sys.executable, "-m", "nuitka",
+        "--onefile",
+        "--assume-yes-for-downloads",
+        f"--output-dir={BUILD}",
+        "--output-filename=TextCorrectorUpdater",
+    ]
+    if PLATFORM == "Windows":
+        resource_version = _windows_resource_version(version)
+        if icon_ico.exists():
+            cmd.append(f"--windows-icon-from-ico={icon_ico}")
+        cmd.extend([
+            "--windows-console-mode=force",
+            "--company-name=TextCorrector",
+            "--product-name=TextCorrector Updater",
+            f"--file-version={resource_version}",
+            f"--product-version={resource_version}",
+            "--file-description=TextCorrector release update helper",
+        ])
+    cmd.append(str(UPDATER_SCRIPT))
     return cmd
 
 
@@ -351,23 +426,34 @@ def build(version: str, make_zip: bool, keep_folder: bool):
     # ── Clean previous build ──────────────────────────────────────────────
     if out_dir.exists():
         print(f"  Removing old {out_dir.name}…")
-        shutil.rmtree(out_dir)
+        _remove_tree(out_dir)
     DIST.mkdir(parents=True, exist_ok=True)
     BUILD.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Nuitka ─────────────────────────────────────────────────────────
-    banner("Step 1 / 5 — Nuitka (compile Python → native binary)")
-    run(_nuitka_cmd(ICON_ICO, ICON_PNG))
+    # ── 1. Nuitka app ─────────────────────────────────────────────────────
+    banner("Step 1 / 6 — Nuitka app (compile Python → native binary)")
+    run(_nuitka_cmd(ICON_ICO, ICON_PNG, version))
 
     # Nuitka standalone output: <BUILD>/<script-stem>.dist/
     nuitka_out = BUILD / (MAIN_SCRIPT.stem + ".dist")
     if not nuitka_out.exists():
         print("ERROR: Nuitka output not found.")
         sys.exit(1)
-    nuitka_out.rename(out_dir)
+    _promote_nuitka_output(nuitka_out, out_dir)
 
-    # ── 2. Copy extras ────────────────────────────────────────────────────
-    banner("Step 2 / 5 — Copy extras")
+    # ── 2. Updater helper ─────────────────────────────────────────────────
+    banner("Step 2 / 6 — Nuitka updater helper")
+    run(_updater_nuitka_cmd(ICON_ICO, version))
+    updater_name = "TextCorrectorUpdater.exe" if PLATFORM == "Windows" else "TextCorrectorUpdater"
+    updater_exe = BUILD / updater_name
+    if not updater_exe.exists():
+        print("ERROR: TextCorrectorUpdater output not found.")
+        sys.exit(1)
+    shutil.copy2(updater_exe, out_dir / updater_name)
+    print(f"  Copied updater helper: {updater_name}")
+
+    # ── 3. Copy extras ────────────────────────────────────────────────────
+    banner("Step 3 / 6 — Copy extras")
 
     # llama-server binaries
     if llama_dir:
@@ -416,8 +502,8 @@ def build(version: str, make_zip: bool, keep_folder: bool):
             shutil.copy2(src, out_dir / asset)
             print(f"  Copied asset: {asset}")
 
-    # ── 3. Launcher scripts ───────────────────────────────────────────────
-    banner("Step 3 / 5 — Launcher scripts")
+    # ── 4. Launcher scripts ───────────────────────────────────────────────
+    banner("Step 4 / 6 — Launcher scripts")
     if PLATFORM == "Windows":
         (out_dir / "run.bat").write_text(RUN_BAT)
         (out_dir / "download_model.bat").write_text(DOWNLOAD_BAT)
@@ -433,7 +519,7 @@ def build(version: str, make_zip: bool, keep_folder: bool):
 
     # ── 4. ZIP ────────────────────────────────────────────────────────────
     if make_zip:
-        banner("Step 4 / 5 — Packaging ZIP")
+        banner("Step 5 / 6 — Packaging ZIP")
         zip_path = DIST / f"{release_name}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for f in sorted(out_dir.rglob("*")):
@@ -442,10 +528,10 @@ def build(version: str, make_zip: bool, keep_folder: bool):
         size_mb = zip_path.stat().st_size / 1_048_576
         print(f"  Created: {zip_path.name}  ({size_mb:.1f} MB)")
     else:
-        banner("Step 4 / 5 — Skipped ZIP (--no-zip)")
+        banner("Step 5 / 6 — Skipped ZIP (--no-zip)")
         print(f"  Output folder: {out_dir}")
 
-    # ── 5. Cleanup ────────────────────────────────────────────────────────
+    # ── 6. Cleanup ────────────────────────────────────────────────────────
     # Leave ONLY the ZIP in dist/ so non-technical users see a single artifact.
     # The PyInstaller scratch folder at build/TextCorrector/ is NOT a runnable
     # copy (it's missing python313.dll and assets) — if we leave it behind,
@@ -454,7 +540,7 @@ def build(version: str, make_zip: bool, keep_folder: bool):
     # redundant once the ZIP exists. --keep-folder / --no-zip skip cleanup
     # for local debugging.
     if make_zip and not keep_folder:
-        banner("Step 5 / 5 — Cleanup")
+        banner("Step 6 / 6 — Cleanup")
         if out_dir.exists():
             shutil.rmtree(out_dir, ignore_errors=True)
             print(f"  Removed: dist/{release_name}/")
@@ -462,7 +548,7 @@ def build(version: str, make_zip: bool, keep_folder: bool):
             shutil.rmtree(BUILD, ignore_errors=True)
             print(f"  Removed: build/ (PyInstaller scratch)")
     else:
-        banner("Step 5 / 5 — Skipped cleanup")
+        banner("Step 6 / 6 — Skipped cleanup")
         if keep_folder:
             print("  --keep-folder was set; dist/<release>/ and build/ preserved")
 

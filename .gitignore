@@ -36,6 +36,6 @@ graphify-out/
 *.spec
 *.zip
 
-# Tests
-tests/
+# Tests — tracked in git for TDD regression suite
 .pytest_cache/
+tests/temp_e2e_launch/

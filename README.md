@@ -1,8 +1,16 @@
-# TextCorrector v3.2
+# TextCorrector v3.2.1
 
 **Instant AI-powered text correction — select text anywhere, press a hotkey, done.**
 
 TextCorrector lives in the system tray. Select text in any app, press the hotkey, and a dark popup appears with corrections highlighted in blue. Accept to paste back, or chat with the LLM to rewrite, shorten, or change the tone.
+
+**New in v3.2.1:**
+- **Terminal-Safe IO**: Uses `Ctrl+Insert` / `Shift+Insert` to bypass `Ctrl+C` SIGINT issues in terminal emulators.
+- **Aggressive Cancellation**: Instantly aborts background AI processing when you type or reset, keeping the app snappy.
+- **Editable Templates**: Full UI to rename, tweak prompts, or delete all templates (including defaults).
+- **Multilingual Support**: Choose your target output language in Settings.
+- **Large Doc Guard**: Safety warning before processing massive selections (>1000 words).
+- **Improved Auto-Updater**: Zero-script, atomic file replacement with anti-virus safety.
 
 ---
 
@@ -130,14 +138,16 @@ On Windows, `build.py` automatically detects and bundles CUDA 12 runtime DLLs if
 
 Starting from v3.2, TextCorrector checks for new releases on GitHub automatically, 5 seconds after launch. When a newer version is available, the system tray menu changes to:
 
-> **⬆️ TextCorrector vX.Y.Z available — click to update**
+> **TextCorrector vX.Y.Z available - install update**
 
-Clicking the item downloads the release ZIP, extracts it over the current installation, and restarts the app — all in one step. **Your `config.json`, AI models, and `llama-server` binary are never touched.**
+Clicking the item asks for confirmation, closes TextCorrector, runs the packaged `TextCorrectorUpdater.exe`, applies the latest release ZIP, and restarts the app. The updater preserves `config.json`, model files (`.gguf` / `.onnx`), and logs while updating the app and bundled backend together.
+
+The updater is a separate one-file helper built into the release. It does not generate batch files, run `xcopy`, or use `shell=True`; this keeps the update path as close as possible to normal installer behavior and reduces antivirus false-positive risk.
 
 You can also update manually from the command line:
 
 ```bash
-python update.py --app   # download and apply the latest release
+python update.py --app   # download and apply the latest release from source/dev installs
 ```
 
 > [!WARNING]

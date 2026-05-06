@@ -170,18 +170,20 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - `shortcut_changed` signal fires on successful commit so callers can re-register.
 - `_manual_editing` flag prevents the keyPressEvent recorder from interfering with normal typing.
 
-### 33. Auto-updater — full app self-update, NOT llama.cpp update
+### 33. Update checks — external updater helper, not batch self-update
 - `AppUpdateChecker(QThread)` (replaces deleted `UpdateChecker`) polls `https://api.github.com/repos/AmrZriek/TextCorrector/releases/latest` on startup (5 s delay via `QTimer.singleShot`).
 - Semantic version comparison: `APP_VERSION = "3.1.1"` (module-level constant) vs GitHub `tag_name`. Comparison uses tuple of ints: `(3, 1, 1)` — handles `v3.2.0`, `Release_v3.1.0`, `3.1` tag formats.
-- When remote > local: tray menu item changes to `"⬆️  TextCorrector vX.Y.Z available — click to update"`. The action is re-wired to `_perform_update(url, tag)` via `triggered.disconnect() + connect()`.
-- `_perform_update()` flow: confirm dialog → download ZIP to `_update_staging/update.zip` → extract → locate `TextCorrector.exe` in extracted tree → write `_apply_update.bat` → write `_update_exclude.txt` (xcopy substring exclusions: `config.json`, `llama_cpp`, `llama-`, `.gguf`, `.onnx`, `_update_staging`) → launch bat with `DETACHED_PROCESS` (0x00000008, **not** `shell=True`) → `self._quit()`.
-- The bat script waits 3 s for the app to exit, runs `xcopy /E /Y /EXCLUDE:...`, cleans up, then relaunches `TextCorrector.exe`.
+- When remote > local and a ZIP asset exists: tray menu item changes to `"TextCorrector vX.Y.Z available - install update"`. The action is re-wired to `_start_app_update(asset_url, tag)` via `triggered.disconnect() + connect()`.
+- `_start_app_update()` only asks for confirmation, starts the external updater helper, and exits the GUI. It must not contain file-copy rules for models/llama/config, generated batch files, or shell-script update logic.
+- **Updater architecture:** `build.py` compiles `update.py` as a separate one-file `TextCorrectorUpdater.exe` and includes it next to `TextCorrector.exe`. The GUI copies that helper to `%TEMP%\TextCorrectorUpdate\TextCorrectorUpdater.exe`, starts it with `--app --install-dir <SCRIPT_DIR> --wait-pid <gui_pid> --restart`, then quits. Running the temp copy means the installed updater executable is not locked while the release files are replaced.
+- `update.py` owns the replacement logic: waits for the GUI PID to exit, fetches the latest GitHub release, downloads the matching OS ZIP to `%TEMP%`, safely extracts after path-traversal validation, atomically replaces files with `os.replace()`, preserves `config.json`, logs, and `.gguf` / `.onnx` model files, then restarts TextCorrector. Release-owned binaries, including the bundled llama-server folder, update together.
+- **Do not reintroduce the old high-risk updater mechanics.** The packaged Windows GUI/updater must not write `_apply_update.bat`, create `_update_exclude.txt`, run `xcopy`, use `shell=True`, use `DETACHED_PROCESS`, or update `llama-server` independently.
 - **NEVER update `llama-server` independently.** `llama.cpp` releases multiple times per day and frequently breaks CLI flags (`--reasoning-budget` → `--reasoning off`, `--parallel`, `--no-warmup`). Each TextCorrector release bundles a specific known-good build. Updating llama.cpp outside of a TextCorrector release will cause silent server startup failures or broken corrections with no error message.
-- `update.py --app` is the standalone equivalent (for dev/CI use).
+- `update.py --app` remains the same updater logic for source/dev installs; the compiled release runs it through `TextCorrectorUpdater.exe`.
 - `APP_VERSION` is the single source of truth. `build.py`'s `_get_version()` regex reads it: `r'APP_VERSION\s*=\s*[\'"]([0-9\.]+)[\'"]'`. `build.py` also writes a `VERSION` file into the release folder for fast external version reads.
 
-### 32. CORE_TEMPLATES is a module-level constant
-- `CORE_TEMPLATES` (list of `(name, prompt)` tuples) is defined once at module scope, shared between `CorrectionWindow._refresh_templates()` and any future consumers.
+### 32. DEFAULT_TEMPLATES is a module-level constant used for first-run
+- `DEFAULT_TEMPLATES` (list of `{"name": str, "prompt": str}` dicts) is defined once at module scope. It is ONLY used to populate `custom_templates` in `config.json` if it's empty. Afterwards, the app reads and writes templates purely from the config, allowing the user to edit and delete all templates, including defaults.
 - Do NOT define template lists inside class methods — it was duplicated before 2026-04-30.
 
 ### 22. Pass termination — DELETED (superseded by single-pass sentence rewrite, rule #12)
@@ -232,7 +234,7 @@ These decisions are final. Do not change, "improve," or refactor them unless the
 - **Dead-end:** Sequential patching. Latency for 1000+ words exceeds 60s. Use `ThreadPoolExecutor(max_workers=4)` + `--parallel 4` server flag.
 - **Dead-end:** Global edit-distance gates spanning the whole text. Apply `_hallucination_ratio` PER UNIT — short single-sentence units legitimately have high edit ratios (1 typo in 3-word sentence = 33%) and global gates falsely reject them.
 - **Dead-end:** Updating `llama-server` independently of the app. `llama.cpp` builds break CLI flag compatibility multiple times per week. Updating only the backend while keeping the old app code causes silent startup failures (wrong flags rejected → server refuses to start) or broken corrections. Always update the full TextCorrector release together. See Rule #33.
-- **Dead-end:** Using `subprocess.Popen([str(bat_path)], shell=True, ...)` to launch the updater bat. On Windows, `shell=True` with a list ignores the list and passes the path as a cmd.exe argument; the bat never executes. Use `Popen(str(bat_path), creationflags=DETACHED_PROCESS)` instead.
+- **Dead-end:** Reintroducing a GUI-embedded updater that writes batch files, runs `xcopy`, uses `shell=True`, or relaunches with `DETACHED_PROCESS`. That pattern can look like malware to Defender. Use the external one-file `TextCorrectorUpdater.exe` helper only.
 - **Instinct:** If corrections are slow on long text, verify the server log for `--parallel 4` and ensure `max_workers=4` is actually what the ThreadPoolExecutor is using. More workers just queues requests without speedup.
 - **Instinct:** If a sentence comes back looking "mostly original but one word changed" when it should be more, check whether the hallucination guard rejected a legitimate rewrite. Tune `_HALLUCINATION_THRESHOLD_SMARTFIX` up (toward 0.8) for heavy-edit expected inputs; DO NOT disable the guard.
 
@@ -454,16 +456,22 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 
 ## Session History
 
-### 2026-05-02 (latest)
-- **Full application auto-updater (replaces llama.cpp update checker).** Removed `UpdateChecker` (checked `ggml-org/llama.cpp` releases), `_get_local_build_number()`, and `_check_llama_update()`. Replaced with `AppUpdateChecker(QThread)` that polls the `AmrZriek/TextCorrector` releases endpoint. On finding a newer version, updates the tray menu to "⬆️ TextCorrector vX.Y.Z available" and allows one-click download + install.
+### 2026-05-03 (latest)
+- **Auto-installer reintroduced with lower-risk mechanics.** The tray update action now installs through `_start_app_update()` instead of opening the GitHub release page. The GUI confirms with the user, starts an external updater helper, then exits; it does not embed config/model/llama copy rules.
+- **Packaged updater helper added.** `build.py` now compiles `update.py` as one-file `TextCorrectorUpdater.exe` and includes it in the release ZIP. The GUI runs a temp copy of this helper so the installed updater can also be replaced.
+- **Updater safety hardening.** `update.py` now supports `--install-dir`, `--wait-pid`, and `--restart`; reads `VERSION` in built installs; waits for the GUI process to exit; downloads/extracts in `%TEMP%`; validates ZIP paths before extraction; atomically replaces files via `os.replace()`; preserves `config.json`, logs, and `.gguf` / `.onnx`; updates release-owned binaries together; and restarts TextCorrector.
+- **Context correction.** Rule #33 no longer bans all automatic updates. It bans the old high-risk mechanics: generated batch files, `xcopy`, `shell=True`, `DETACHED_PROCESS`, and independent llama-server updates.
+
+### 2026-05-02
+- **GitHub release update checker (replaces llama.cpp update checker).** Removed `UpdateChecker` (checked `ggml-org/llama.cpp` releases), `_get_local_build_number()`, and `_check_llama_update()`. Replaced with `AppUpdateChecker(QThread)` that polls the `AmrZriek/TextCorrector` releases endpoint. This was later reconnected to the safer external updater helper on 2026-05-03.
 - **`APP_VERSION = "3.1.1"` module-level constant** added as the single source of truth for version comparison. `build.py`'s `_get_version()` updated to read this constant instead of scanning the docstring.
-- **`_perform_update()` method added.** Downloads release ZIP → extracts to `_update_staging/` → writes `_apply_update.bat` + `_update_exclude.txt` → launches bat with `DETACHED_PROCESS` flag → calls `self._quit()`. Bat replaces app files (excluding config, models, llama binaries) and relaunches.
-- **3 bugs fixed during review:** (1) orphan `import tempfile` removed; (2) xcopy exclude patterns fixed to one-per-line for correct substring matching, added `_update_staging` to the exclude list; (3) `Popen(shell=True, list)` replaced with `Popen(str, creationflags=DETACHED_PROCESS)` — on Windows, `shell=True` with a list arg ignores the list.
+- **Old compiled self-updater removed before deployment.** `_perform_update()` was replaced because it wrote batch files and used `xcopy` / `DETACHED_PROCESS`. The replacement was later changed from release-page handoff to the safer external `TextCorrectorUpdater.exe` helper on 2026-05-03.
+- **Build hardening for Windows AV locks.** `build.py` now retries `shutil.rmtree()` and the Nuitka output folder promotion. If `Path.rename()` from `build/text_corrector.dist` to `dist/<release>` is blocked by Defender/indexing, it falls back to `copytree()` and later cleanup. Also adds Windows EXE resource metadata (`company`, `product`, `file/product version`, description).
 - **`update.py` completely rewritten** as a standalone app updater (`python update.py --app`). Old `--llama` flag and llama binary download logic removed. Preserves `--all` for dev pip upgrades.
 - **`build.py`**: `_get_version()` updated to match `APP_VERSION` constant; adds `VERSION` file to release folder.
 - **`release.ps1`**: version bumped to `3.2.0`, release notes updated.
 - **README updated to v3.2**: F9/F10 hotkey table, new "Automatic updates" section with llama.cpp warning, troubleshooting entry for "broken after manual llama update".
-- **Test suite expanded: 42 → 71 tests.** Added `test_update.py` (29 tests): APP_VERSION validation, semver parser correctness, API URL wiring, DETACHED_PROCESS usage, exclude file contents, update.py flag coverage, build.py version reading.
+- **Test suite expanded: 42 → 72 tests.** Added/updated `test_update.py`: APP_VERSION validation, semver parser correctness, API URL wiring, release-page handoff, ban on compiled self-update artifacts, update.py flag coverage, build.py version reading.
 - **Rule #33 added**: auto-updater design constraints and the llama.cpp independent-update dead-end.
 
 ### 2026-04-30 (previous)
@@ -592,3 +600,8 @@ No model files (`*.gguf`), no ONNX, no GECToR, no LanguageTool JARs, no PyTorch 
 | **v2.3.x** | GECToR DeBERTa-Large, ONNX idle timers |
 | **v2.1.x** | T5-first architecture, ONNX CoEdit-Large |
 | **v2.0** | Initial PyQt5 system-tray app, llama.cpp backend |
+ 
+ # # #   L e a r n e d   Q u i r k s   &   S o l u t i o n s  
+ -   * * T e r m i n a l - S a f e   H o t k e y s : * *   T o   s y n t h e s i z e   k e y b o a r d   c o p y / p a s t e   u n i v e r s a l l y   a c r o s s   W i n d o w s   w i t h o u t   t r i g g e r i n g   \ S I G I N T \   ( C t r l + C )   i n   t e r m i n a l s ,   u s e   \ V K _ I N S E R T \   c o m b i n e d   w i t h   m o d i f i e r s   ( \ C t r l + I n s e r t \   f o r   c o p y ,   \ S h i f t + I n s e r t \   f o r   p a s t e ) .  
+ -   * * A g g r e s s i v e   H T T P   T e a r d o w n : * *   P y t h o n ' s   b l o c k i n g   \  e q u e s t s . p o s t \   a n d   s t r e a m i n g   l o o p s   d o n ' t   a b o r t   i m m e d i a t e l y   o n   t h r e a d   c a n c e l l a t i o n .   T o   a g g r e s s i v e l y   i n t e r r u p t   a n   a c t i v e   s o c k e t / g e n e r a t i o n ,   w r a p   t h e   r e q u e s t   i n   a   \  e q u e s t s . S e s s i o n ( ) \   a n d   i n v o k e   \ s e s s i o n . c l o s e ( ) \   f r o m   a   s e p a r a t e   t h r e a d / e v e n t   w a t c h e r .   T h i s   f o r c e s   a   \ C o n n e c t i o n E r r o r \   a n d   k i l l s   t h e   s o c k e t   i n s t a n t l y .  
+ 
